@@ -192,6 +192,9 @@ config BES_IMAGE
 config BES_STUB
     bool
 
+config BES_AONCMU
+    bool
+
 config LED
     bool
 

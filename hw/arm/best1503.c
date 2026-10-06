@@ -22,6 +22,7 @@
 #include "hw/arm/machines-qom.h"
 #include "hw/misc/unimp.h"
 #include "hw/misc/bes_image.h"
+#include "hw/misc/bes_aoncmu.h"
 #include "system/address-spaces.h"
 #include "system/reset.h"
 #include "system/system.h"
@@ -40,6 +41,7 @@
 #define BEST1503_UART0_BASE      0x4000B000
 #define BEST1503_UART1_BASE      0x4000C000
 #define BEST1503_UART2_BASE      0x4000D000
+#define BEST1503_AON_CMU_BASE    0x40080000
 
 #define BEST1503_UART0_IRQ       17
 #define BEST1503_UART1_IRQ       18
@@ -50,6 +52,8 @@
  * 合并输出，故连子定时器 1 对应的号（近似，注释留存）。 */
 #define BEST1503_MCU_TIMER0_IRQ  13
 #define BEST1503_MCU_TIMER1_IRQ  28   /* MCU_TIMER11_IRQn（fast timer 同理） */
+#define BEST1503_AON_TIMER0_IRQ  45   /* AON_TIMER00_IRQn（best1503.h:110） */
+#define BEST1503_AON_TIMER0_BASE 0x40084000
 
 /* 外设窗口整体兜底（未建模区域侦察用） */
 #define BEST1503_PERIPH_BASE     0x40000000
@@ -74,6 +78,9 @@
 #define BEST1503_SYSCLK_FRQ      208000000ULL
 #define BEST1503_SLOW_TIMER_FRQ  16000
 #define BEST1503_FAST_TIMER_FRQ  6500000
+/* AON_TIMER0：AON 域 slow 档 32K（hal_cmu.h:71 HAL_CMU_FREQ_32K；
+ * 晶振精度 32768/32000 待实测校准，不影响延时推进） */
+#define BEST1503_AON_TIMER_FRQ   32768
 
 /* best1503.h:215 __NVIC_PRIO_BITS=3；:145 USER_IRQn_QTY=78 → 取整 80 */
 #define BEST1503_NUM_IRQ         80
@@ -192,11 +199,13 @@ static void best1503_init(MachineState *machine)
             uint32_t base;
             uint32_t freq;
             int irq;
-        } timers[2] = {
+        } timers[] = {
             { BEST1503_MCU_TIMER0_BASE, BEST1503_SLOW_TIMER_FRQ,
               BEST1503_MCU_TIMER0_IRQ },
             { BEST1503_MCU_TIMER1_BASE, BEST1503_FAST_TIMER_FRQ,
               BEST1503_MCU_TIMER1_IRQ },
+            { BEST1503_AON_TIMER0_BASE, BEST1503_AON_TIMER_FRQ,
+              BEST1503_AON_TIMER0_IRQ },
         };
         DeviceState *nvic = armv7m;   /* armv7m 容器的 gpio-in 即 NVIC 外部中断线 */
         int i;
@@ -213,7 +222,7 @@ static void best1503_init(MachineState *machine)
             sysbus_connect_irq(SYS_BUS_DEVICE(uart), 0,
                                qdev_get_gpio_in(nvic, uarts[i].irq));
         }
-        for (i = 0; i < 2; i++) {
+        for (i = 0; i < ARRAY_SIZE(timers); i++) {
             DeviceState *tmr = qdev_new("sp804");
             qdev_prop_set_uint32(tmr, "freq0", timers[i].freq);
             qdev_prop_set_uint32(tmr, "freq1", timers[i].freq);
@@ -227,6 +236,13 @@ static void best1503_init(MachineState *machine)
     /* ---- 外设窗口兜底：unimp 侦察日志 ---- */
     create_unimplemented_device("bes.periph", BEST1503_PERIPH_BASE,
                                 BEST1503_PERIPH_SIZE);
+
+    /* AON_CMU @0x40080000（后注册覆盖 unimp 窗口） */
+    {
+        DeviceState *aoncmu = qdev_new(TYPE_BES_AONCMU);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(aoncmu), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(aoncmu), 0, BEST1503_AON_CMU_BASE);
+    }
 }
 
 static void best1503_machine_init(MachineClass *mc)

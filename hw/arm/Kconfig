@@ -8,6 +8,7 @@ config BEST1503
     select ARM_TIMER
     select BES_IMAGE
     select BES_STUB
+    select BES_AONCMU
 
 config ARM_VIRT
     bool
