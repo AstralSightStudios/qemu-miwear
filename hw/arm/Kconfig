@@ -1,3 +1,14 @@
+config BEST1503
+    bool
+    default y
+    depends on TCG && ARM
+    select ARM_V7M
+    select UNIMP
+    select PL011
+    select ARM_TIMER
+    select BES_IMAGE
+    select BES_STUB
+
 config ARM_VIRT
     bool
     default y

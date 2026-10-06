@@ -1,3 +1,5 @@
+system_ss.add(when: 'CONFIG_BES_IMAGE', if_true: files('bes_image.c'))
+system_ss.add(when: 'CONFIG_BES_STUB', if_true: files('bes_stub.c'))
 system_ss.add(when: 'CONFIG_APPLESMC', if_true: files('applesmc.c'))
 system_ss.add(when: 'CONFIG_EDU', if_true: files('edu.c'))
 system_ss.add(when: 'CONFIG_FW_CFG_DMA', if_true: files('vmcoreinfo.c'))

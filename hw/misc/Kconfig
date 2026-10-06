@@ -186,6 +186,12 @@ config AUX
 config UNIMP
     bool
 
+config BES_IMAGE
+    bool
+
+config BES_STUB
+    bool
+
 config LED
     bool
 
