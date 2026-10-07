@@ -197,8 +197,8 @@ static void best1503_init(MachineState *machine)
      * 固件写入后端偏移 OTA_CODE_OFFSET（真机 flash 布局，解析自 boot
      * info）；若经 -M flash-image=<file> 提供完整 flash 镜像，则镜像
      * 文件即后端内容（含 BL2/AP/参数区），不再单独写入固件。 */
+    DeviceState *fc = qdev_new(TYPE_BES_FLASH);
     {
-        DeviceState *fc = qdev_new(TYPE_BES_FLASH);
         uint32_t flash_xip_start = g_img.xip_base - g_img.ota_code_offset;
         uint32_t flash_cached_start = g_img.cached_base - g_img.ota_code_offset;
         uint32_t flash_nc_start = g_img.nc_base - g_img.ota_code_offset;
@@ -237,6 +237,21 @@ static void best1503_init(MachineState *machine)
     memory_region_init_alias(&ramx, NULL, "best1503.ramx", &sram, 0,
                              BEST1503_SRAM_SIZE);
     memory_region_add_subregion(sysmem, BEST1503_RAMX_BASE, &ramx);
+
+    /* ---- .data 段预加载（模拟真机 BL2 的镜像加载） ----
+     * 真机 BL2 把 AP 镜像写入 flash 后跳转入库前已完成 .data 重定位；
+     * 固件 start 尾部的复制循环只是冗余保险（SDK startup_main.S 同一
+     * 流程）。缺了它，BootInit（sub_C0C0B48）里 early DSI init 的
+     * TR_INFO -> NuttX syslog -> circbuf UDIV(tail % size, size=0) 会在
+     * SCB_CCR.DIV_0_TRP（sub_C0C09CC 置位）下直接 HardFault。 */
+    {
+        uint32_t cached_start = g_img.cached_base - g_img.ota_code_offset;
+        memcpy(memory_region_get_ram_ptr(&sram) +
+               (g_img.data_start - BEST1503_SRAM_BASE),
+               bes_flash_data(BES_FLASH(fc)) +
+               (g_img.data_lma - cached_start),
+               g_img.data_end - g_img.data_start);
+    }
 
     /* ---- 伪 boot 向量表 @0x0（模拟 boot ROM 跳转，不碰固件） ---- */
     memory_region_init_ram(&g_bootvec, NULL, "best1503.bootvec", 0x1000,
