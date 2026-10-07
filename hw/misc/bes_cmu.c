@@ -103,6 +103,15 @@ static uint64_t bes_cmu_read(void *opaque, hwaddr offset, unsigned size)
                 v |= 1u << i;
             }
         }
+    } else if (offset == 0x8C) {
+        /* WAKEUP_CLK_CFG: firmware (sub_C0E2C74) tests bits[15:12] as
+         * the "active wakeup clock source" STATUS — on real hardware the
+         * written value is a configuration request while these status
+         * bits report the hardware state (no wakeup source active after
+         * cold boot). Reporting the raw written value makes the clock
+         * switch state machine believe a wakeup clock is active and it
+         * skips the frequency switch forever. */
+        v = s->regs[idx] & ~0xF000u;
     } else if (cmu_is_pulse(offset)) {
         v = 0;   /* self-clearing pulse */
     } else if ((p = cmu_find_pair(offset, &is_set))) {

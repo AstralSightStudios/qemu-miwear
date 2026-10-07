@@ -103,7 +103,7 @@
 #define FLASH_SR_WEL   (1 << 1)
 #define FLASH_SR2_QE   (1 << 1)
 
-#define FLASH_TXFIFO_DEPTH 32
+#define FLASH_TXFIFO_DEPTH 1024
 #define FLASH_RXFIFO_DEPTH 64
 
 /* register offsets (reg_norflaship_v2.h) */
@@ -142,6 +142,48 @@ static const uint8_t bes_flash_unique_id[18] = {
 static bool bes_flash_dual(BesFlashState *s)
 {
     return s->regs[FLASH_REG_204 / 4] & R204_DUAL_CHIP_MODE;
+}
+
+/* whether the command has a data-out phase that drains TX FIFO bytes.
+ * Command-only operations (WREN/erase/reads/mode changes) leave queued
+ * data in the FIFO for a following page-program (SDK norflash_write
+ * queues page data before issuing WREN + PAGE_PROGRAM). */
+static bool bes_flash_cmd_has_tx(uint8_t cmd)
+{
+    switch (cmd) {
+    case FLASH_CMD_WRITE_ENABLE:
+    case FLASH_CMD_WRITE_DISABLE:
+    case FLASH_CMD_SECTOR_ERASE:
+    case FLASH_CMD_BLOCK32_ERASE:
+    case FLASH_CMD_BLOCK64_ERASE:
+    case FLASH_CMD_CHIP_ERASE:
+    case FLASH_CMD_CHIP_ERASE2:
+    case FLASH_CMD_ID:
+    case FLASH_CMD_READ_SR:
+    case FLASH_CMD_READ_SR2:
+    case FLASH_CMD_READ:
+    case FLASH_CMD_FAST_READ:
+    case FLASH_CMD_DUAL_OUT_READ:
+    case FLASH_CMD_DUAL_IO_READ:
+    case FLASH_CMD_QUAD_OUT_READ:
+    case FLASH_CMD_QUAD_IO_READ:
+    case FLASH_CMD_DTR_QUAD_READ:
+    case FLASH_CMD_SECREG_READ:
+    case FLASH_CMD_DEEP_POWERDOWN:
+    case FLASH_CMD_RELEASE_DP:
+    case FLASH_CMD_ENABLE_QPI:
+    case FLASH_CMD_HIGH_PERF:
+    case FLASH_CMD_ENABLE_RESET:
+    case FLASH_CMD_RESET:
+    case FLASH_CMD_VOLATILE_SR_EN:
+    case FLASH_CMD_PE_SUSPEND:
+    case FLASH_CMD_PE_RESUME:
+    case FLASH_CMD_ENTER_4BYTE:
+    case FLASH_CMD_EXIT_4BYTE:
+        return false;
+    default:
+        return true;
+    }
 }
 
 static void bes_flash_rx_fill(BesFlashState *s, const uint8_t *data,
@@ -192,6 +234,11 @@ static void bes_flash_erase(BesFlashState *s, uint32_t addr, uint32_t size)
     uint32_t gran = bes_flash_dual(s) ? 2 * size : size;
     uint32_t base = addr & ~(gran - 1);
 
+    if (s->rom_map) {   /* read-only mmap backend (romfs) */
+        qemu_log_mask(LOG_UNIMP,
+                      "bes.flash: erase ignored on read-only backend\n");
+        return;
+    }
     if (!(s->sr & FLASH_SR_WEL)) {
         return;
     }
@@ -199,6 +246,36 @@ static void bes_flash_erase(BesFlashState *s, uint32_t addr, uint32_t size)
         memset(s->storage + base, 0xFF, MIN(gran, s->size - base));
     }
     s->sr &= ~FLASH_SR_WEL;
+}
+
+/* execute a pending page-program once the full page has been collected.
+ * Real hardware streams TX FIFO bytes over SPI while the CPU keeps
+ * refilling (norflash_drv.c:2668-2674), so the program command only
+ * completes after BLOCK_SIZE bytes. */
+static void bes_flash_do_program(BesFlashState *s)
+{
+    uint32_t n, i;
+
+    /* rom-image backends are read-only mmaps; programming them would
+     * segfault the process. Real firmware never programs the romfs
+     * partition. */
+    if (s->rom_map) {
+        qemu_log_mask(LOG_UNIMP,
+                      "bes.flash: program ignored on read-only backend\n");
+        s->pp_active = false;
+        s->tx_cnt = 0;
+        return;
+    }
+
+    if ((s->sr & FLASH_SR_WEL) && s->pp_addr < s->size) {
+        n = MIN(s->pp_total, s->size - s->pp_addr);
+        for (i = 0; i < n; i++) {
+            s->storage[s->pp_addr + i] &= s->txfifo[i];
+        }
+        s->sr &= ~FLASH_SR_WEL;
+    }
+    s->pp_active = false;
+    s->tx_cnt = 0;
 }
 
 static void bes_flash_exec(BesFlashState *s, uint32_t reg000)
@@ -232,9 +309,19 @@ static void bes_flash_exec(BesFlashState *s, uint32_t reg000)
         bes_flash_respond_reg(s, bes_flash_unique_id, n);
         break;
     }
-    case FLASH_CMD_READ_SR:
-        bes_flash_respond_reg(s, &s->sr, 1);
+    case FLASH_CMD_READ_SR: {
+        /* GD25Q32C 0x05 reads SR1 and, when more bytes are requested,
+         * continues with SR2 (sequential status read). Firmware issues
+         * rx_len=2 to fetch both in one command. */
+        uint8_t srbuf[2];
+        uint32_t n = rx_len ? MIN(rx_len / (bes_flash_dual(s) ? 2 : 1),
+                                  (uint32_t)sizeof(srbuf)) : 1;
+
+        srbuf[0] = s->sr;
+        srbuf[1] = s->sr2;
+        bes_flash_respond_reg(s, srbuf, n);
         break;
+    }
     case FLASH_CMD_READ_SR2:
         bes_flash_respond_reg(s, &s->sr2, 1);
         break;
@@ -273,17 +360,14 @@ static void bes_flash_exec(BesFlashState *s, uint32_t reg000)
     case FLASH_CMD_DUAL_PP:
     case FLASH_CMD_QUAD_PP:
     case FLASH_CMD_SECREG_PROGRAM:
-        /* NOR semantics: program can only clear bits (1 -> 0).
-         * TX FIFO holds the logical byte stream. */
-        if (cmd != FLASH_CMD_SECREG_PROGRAM &&
-                (s->sr & FLASH_SR_WEL) && addr < s->size) {
-            uint32_t n = MIN(tx_len, MIN(s->tx_cnt, s->size - addr));
-            uint32_t i;
-
-            for (i = 0; i < n; i++) {
-                s->storage[addr + i] &= s->txfifo[i];
-            }
-            s->sr &= ~FLASH_SR_WEL;
+        /* start collecting TX bytes; completes when BLOCK_SIZE bytes
+         * have been pushed (hardware streams them while the CPU refills,
+         * SDK norflash_drv.c:2668-2674 write_txfifo_cont loop) */
+        s->pp_addr = addr;
+        s->pp_total = (cmd == FLASH_CMD_SECREG_PROGRAM) ? 0 : tx_len;
+        s->pp_active = true;
+        if (s->tx_cnt >= s->pp_total) {
+            bes_flash_do_program(s);
         }
         break;
     case FLASH_CMD_SECTOR_ERASE:
@@ -297,19 +381,30 @@ static void bes_flash_exec(BesFlashState *s, uint32_t reg000)
         break;
     case FLASH_CMD_CHIP_ERASE:
     case FLASH_CMD_CHIP_ERASE2:
-        if (s->sr & FLASH_SR_WEL) {
+        if (s->rom_map) {
+            qemu_log_mask(LOG_UNIMP,
+                          "bes.flash: chip erase ignored on read-only backend\n");
+        } else if (s->sr & FLASH_SR_WEL) {
             memset(s->storage, 0xFF, s->size);
             s->sr &= ~FLASH_SR_WEL;
         }
         break;
     case FLASH_CMD_WRITE_SR:
+        /* 0x01 writes SR1 and, when two bytes are queued, SR2 as well
+         * (GD25Q32C sequential status write; drv_norflash_write_status
+         * sets QE in SR2 bit1 via a 2-byte write) */
         if (s->tx_cnt > 0) {
             s->sr = s->txfifo[0] & ~FLASH_SR_WIP;
+            if (s->tx_cnt > 1) {
+                s->sr2 = s->txfifo[1];
+            }
+            s->tx_cnt = 0;
         }
         break;
     case FLASH_CMD_WRITE_SR2:
         if (s->tx_cnt > 0) {
             s->sr2 = s->txfifo[0];
+            s->tx_cnt = 0;
         }
         break;
     case FLASH_CMD_DEEP_POWERDOWN:
@@ -348,10 +443,18 @@ static void bes_flash_exec(BesFlashState *s, uint32_t reg000)
         break;
     }
 
-    /* transaction completed: hardware drains the TX FIFO over SPI
-     * (SDK norflash_drv.c:956-959 back-to-back ext_tx_cmd sequences
-     * rely on the FIFO being consumed per transaction) */
-    s->tx_cnt = 0;
+    /* TX FIFO is NOT drained here: command-only transactions (WREN, erase,
+     * reads) leave queued data bytes for a following page-program, and a
+     * pending program keeps collecting until pp_total bytes arrive
+     * (bes_flash_do_program). */
+    if (bes_flash_cmd_has_tx(cmd) && !s->pp_active && tx_len) {
+        uint32_t consume = MIN(s->tx_cnt, tx_len);
+
+        if (consume) {
+            memmove(s->txfifo, s->txfifo + consume, s->tx_cnt - consume);
+            s->tx_cnt -= consume;
+        }
+    }
 }
 
 static uint32_t bes_flash_status(BesFlashState *s)
@@ -438,6 +541,10 @@ static void bes_flash_write(void *opaque, hwaddr offset, uint64_t value,
                 s->txfifo[s->tx_cnt++] = (value >> (n * 8)) & 0xFF;
             }
         }
+        /* a pending page-program completes once the full page arrived */
+        if (s->pp_active && s->tx_cnt >= s->pp_total) {
+            bes_flash_do_program(s);
+        }
         break;
     }
     case FLASH_REG_018:
@@ -506,16 +613,49 @@ static void bes_flash_realize(DeviceState *dev, Error **errp)
     BesFlashState *s = BES_FLASH(dev);
     FILE *fp;
 
-    if (s->size == 0) {
-        error_setg(errp, "bes.flash: size property is required");
-        return;
-    }
+    /* read-only mmap backend for huge ROMs (resource flash): demand
+     * paging, no physical memory cost */
+    if (s->rom_image) {
+        GMappedFile *mf;
+        g_autofree char *name =
+            g_strdup_printf("bes.flash.storage.%p", (void *)s);
+        uint64_t fsize;
 
-    /* storage backend, NOR erased state = 0xFF */
-    memory_region_init_ram(&s->storage_mr, OBJECT(dev), "bes.flash.storage",
-                           s->size, &error_fatal);
-    s->storage = memory_region_get_ram_ptr(&s->storage_mr);
-    memset(s->storage, 0xFF, s->size);
+        mf = g_mapped_file_new(s->rom_image, FALSE, NULL);
+        if (!mf) {
+            error_setg(errp, "bes.flash: cannot mmap rom image '%s'",
+                       s->rom_image);
+            return;
+        }
+        fsize = g_mapped_file_get_length(mf);
+        if (s->size == 0 || s->size > fsize) {
+            s->size = fsize;
+        }
+        s->rom_map = mf;
+        s->storage = (uint8_t *)g_mapped_file_get_contents(mf);
+        memory_region_init_ram_ptr(&s->storage_mr, OBJECT(dev), name,
+                                   s->size, s->storage);
+        memory_region_set_readonly(&s->storage_mr, true);
+        info_report("bes.flash: rom image '%s' mapped, 0x%x bytes",
+                    s->rom_image, s->size);
+    } else {
+        if (s->size == 0) {
+            error_setg(errp, "bes.flash: size property is required");
+            return;
+        }
+
+        /* storage backend, NOR erased state = 0xFF. RAMBlock name must be
+         * unique across instances (flash0/flash1 share this model). */
+        {
+            g_autofree char *name =
+                g_strdup_printf("bes.flash.storage.%p", (void *)s);
+
+            memory_region_init_ram(&s->storage_mr, OBJECT(dev), name,
+                                   s->size, &error_fatal);
+        }
+        s->storage = memory_region_get_ram_ptr(&s->storage_mr);
+        memset(s->storage, 0xFF, s->size);
+    }
 
     /* optional backing image: load content, write back on shutdown */
     if (s->image) {
@@ -547,6 +687,7 @@ static void bes_flash_reset(DeviceState *dev)
     s->tx_cnt = 0;
     s->rx_cnt = 0;
     s->rx_pos = 0;
+    s->pp_active = false;
     s->sr = 0;
     s->sr2 = 0;
 }
@@ -554,6 +695,7 @@ static void bes_flash_reset(DeviceState *dev)
 static const Property bes_flash_props[] = {
     DEFINE_PROP_UINT32("size", BesFlashState, size, 0),
     DEFINE_PROP_STRING("image", BesFlashState, image),
+    DEFINE_PROP_STRING("rom-image", BesFlashState, rom_image),
 };
 
 static void bes_flash_class_init(ObjectClass *klass, const void *data)

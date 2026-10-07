@@ -46,10 +46,15 @@
 #define BEST1503_UART2_BASE      0x4000D000
 #define BEST1503_AON_CMU_BASE    0x40080000
 /* flash0 控制器：SDK plat_addr_map_best1503.h:265 REAL_FLASH_CTRL_BASE；
- * flash1 控制器 :261 REAL_FLASH1_CTRL_BASE=0x40500000 —— AP 固件运行期间
- * 不访问 flash1（resource romfs 在独立大容量存储上，挂载方式待固件访问时
- * 经 unimp 日志识别后再建模），故暂不挂 flash1。 */
+ * flash1 控制器 :261 REAL_FLASH1_CTRL_BASE=0x40500000 —— resource romfs
+ * （vela_resource.bin, ~164MB）所在的第二颗大容量 flash（固件在挂载
+ * 文件系统前轮询 flash1 REG_00C）。 */
 #define BEST1503_FLASH_CTRL_BASE  0x40140000
+#define BEST1503_FLASH1_CTRL_BASE 0x40500000
+/* flash1 后端容量 256MB（romfs 164MB 只能放得下 NAND/大 NOR 级别芯片）；
+ * XIP 窗口 SDK :212 REAL_FLASH1X_BASE=0x14000000、:210 cached
+ * REAL_FLASH1_BASE=0x34000000（后者只映射到外设区之前的 192MB） */
+#define BEST1503_FLASH1_XIP_BASE  0x14000000
 /* PSRAM PHY：SDK plat_addr_map_best1503.h:284 候选值，经固件运行时行为
  * 证实（PHY 校准时序公式 0x60/0x64 在 48MHz 下逐位吻合，见 bes_psram.c） */
 #define BEST1503_PSRAM_PHY_BASE  0x40168000
@@ -282,6 +287,36 @@ static void best1503_init(MachineState *machine)
                              &psram, 0, BEST1503_PSRAM_SIZE);
     memory_region_add_subregion(sysmem, BEST1503_PSRAM_NC_BASE,
                                 &psram_nc);
+
+    /* ---- flash1：resource romfs 所在的大容量 flash ----
+     * 后端为 rom-image（mmap 只读、按需分页）：romfs 只读使用，
+     * 256MB 级 RAM 后端在 Windows 宿主上会导致严重的性能问题
+     * （实测 64MB 以上 RAMBlock 使 TCG 执行慢两个数量级）。
+     * flash1 的 JEDEC ID 沿用 flash0 同款（GD 系列，固件同一张 ID 表
+     * 匹配）；若固件对 flash1 有独立 ID 要求，按 unimp/调试证据再调。 */
+    DeviceState *fc1 = NULL;
+    {
+        static MemoryRegion flash1_xip;
+        static const char *resource_path = "miwear.watch.p67tc_v3.101.043_full_a4ce8564/vela_resource.bin";
+        uint32_t f1size;
+
+        fc1 = qdev_new(TYPE_BES_FLASH);
+        qdev_prop_set_string(fc1, "rom-image", resource_path);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(fc1), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(fc1), 0, BEST1503_FLASH1_CTRL_BASE);
+        f1size = BES_FLASH(fc1)->size;
+
+        memory_region_init_alias(&flash1_xip, NULL, "best1503.flash1_xip",
+                                 bes_flash_storage(BES_FLASH(fc1)), 0,
+                                 f1size);
+        memory_region_add_subregion(sysmem, BEST1503_FLASH1_XIP_BASE,
+                                    &flash1_xip);
+        /* cached 窗口（SDK REAL_FLASH1_BASE=0x34000000）不挂：
+         * 192MB 起步的映射会遮蔽 PSRAM cached（0x3C000000）。真机上
+         * flash1 的 cached 窗口与 PSRAM 不可能重叠，说明 romfs 访问
+         * 只走 XIP（0x14000000）；若固件访问 0x34000000，unimp 兜底
+         * 会记录，届时再按证据处理。 */
+    }
 
     /* ---- 伪 boot 向量表 @0x0（模拟 boot ROM 跳转，不碰固件） ---- */
     memory_region_init_ram(&g_bootvec, NULL, "best1503.bootvec", 0x1000,
