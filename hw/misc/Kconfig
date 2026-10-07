@@ -198,6 +198,12 @@ config BES_AONCMU
 config BES_FLASH
     bool
 
+config BES_DSI
+    bool
+
+config BES_CMU
+    bool
+
 config LED
     bool
 

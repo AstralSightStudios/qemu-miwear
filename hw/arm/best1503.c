@@ -24,6 +24,8 @@
 #include "hw/misc/bes_image.h"
 #include "hw/misc/bes_aoncmu.h"
 #include "hw/misc/bes_flash.h"
+#include "hw/misc/bes_dsi.h"
+#include "hw/misc/bes_cmu.h"
 #include "system/address-spaces.h"
 #include "system/reset.h"
 #include "system/system.h"
@@ -48,6 +50,15 @@
  * 不访问 flash1（resource romfs 在独立大容量存储上，挂载方式待固件访问时
  * 经 unimp 日志识别后再建模），故暂不挂 flash1。 */
 #define BEST1503_FLASH_CTRL_BASE  0x40140000
+/* DSI 控制器：SDK plat_addr_map_best1503.h:284 候选值，经固件运行时行为
+ * 证实（PHY 校准时序公式 0x60/0x64 在 48MHz 下逐位吻合，见 bes_dsi.c） */
+#define BEST1503_DSI_BASE        0x40168000
+/* DSI 命令引擎：固件逆向确认（与 DSI 驱动同函数群，sub_C0E5228 命令
+ * 触发/状态轮询；SDK 未命名此块） */
+#define BEST1503_DSI_CMD_BASE    0x40160000
+/* MCU_CMU：SDK plat_addr_map_best1503.h（CMU_BASE）；reg 布局
+ * reg_cmu_best1503.h:21-156 */
+#define BEST1503_CMU_BASE        0x40000000
 
 #define BEST1503_UART0_IRQ       17
 #define BEST1503_UART1_IRQ       18
@@ -292,6 +303,21 @@ static void best1503_init(MachineState *machine)
         DeviceState *aoncmu = qdev_new(TYPE_BES_AONCMU);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(aoncmu), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(aoncmu), 0, BEST1503_AON_CMU_BASE);
+    }
+
+    /* DSI 控制器 @0x40168000（PHY）+ @0x40160000（命令引擎） */
+    {
+        DeviceState *dsi = qdev_new(TYPE_BES_DSI);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dsi), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dsi), 0, BEST1503_DSI_BASE);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dsi), 1, BEST1503_DSI_CMD_BASE);
+    }
+
+    /* MCU_CMU @0x40000000（覆盖 unimp 窗口） */
+    {
+        DeviceState *cmu = qdev_new(TYPE_BES_CMU);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(cmu), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(cmu), 0, BEST1503_CMU_BASE);
     }
 }
 

@@ -10,6 +10,8 @@ config BEST1503
     select BES_STUB
     select BES_AONCMU
     select BES_FLASH
+    select BES_DSI
+    select BES_CMU
 
 config ARM_VIRT
     bool
