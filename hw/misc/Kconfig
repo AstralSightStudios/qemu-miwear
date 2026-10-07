@@ -198,7 +198,7 @@ config BES_AONCMU
 config BES_FLASH
     bool
 
-config BES_DSI
+config BES_PSRAM
     bool
 
 config BES_CMU

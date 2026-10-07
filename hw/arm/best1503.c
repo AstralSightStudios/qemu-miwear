@@ -24,7 +24,7 @@
 #include "hw/misc/bes_image.h"
 #include "hw/misc/bes_aoncmu.h"
 #include "hw/misc/bes_flash.h"
-#include "hw/misc/bes_dsi.h"
+#include "hw/misc/bes_psram.h"
 #include "hw/misc/bes_cmu.h"
 #include "system/address-spaces.h"
 #include "system/reset.h"
@@ -50,15 +50,24 @@
  * 不访问 flash1（resource romfs 在独立大容量存储上，挂载方式待固件访问时
  * 经 unimp 日志识别后再建模），故暂不挂 flash1。 */
 #define BEST1503_FLASH_CTRL_BASE  0x40140000
-/* DSI 控制器：SDK plat_addr_map_best1503.h:284 候选值，经固件运行时行为
- * 证实（PHY 校准时序公式 0x60/0x64 在 48MHz 下逐位吻合，见 bes_dsi.c） */
-#define BEST1503_DSI_BASE        0x40168000
-/* DSI 命令引擎：固件逆向确认（与 DSI 驱动同函数群，sub_C0E5228 命令
- * 触发/状态轮询；SDK 未命名此块） */
-#define BEST1503_DSI_CMD_BASE    0x40160000
+/* PSRAM PHY：SDK plat_addr_map_best1503.h:284 候选值，经固件运行时行为
+ * 证实（PHY 校准时序公式 0x60/0x64 在 48MHz 下逐位吻合，见 bes_psram.c） */
+#define BEST1503_PSRAM_PHY_BASE  0x40168000
+/* PSRAM MC（MGR 命令引擎）：固件逆向确认（sub_C0E5228 MR 写/
+ * sub_C0E5308 读，寄存器语义与 SDK reg_psram_mc_v4.h 吻合） */
+#define BEST1503_PSRAM_MC_BASE   0x40160000
 /* MCU_CMU：SDK plat_addr_map_best1503.h（CMU_BASE）；reg 布局
  * reg_cmu_best1503.h:21-156 */
 #define BEST1503_CMU_BASE        0x40000000
+/* PSRAM（SiP 封装 PSRAMUHS）：cached 0x3C000000 / NC 0x38000000 —— 固件
+ * sub_C0C0AC8 段复制目标（0x3C000000）与 sub_C0E5634 校准 pattern 地址
+ * （0x38000000/0x38100000）证实；SDK 里的 0x1C000000/0x18000000 占位值
+ * 都是错的。大小 32MB：固件 sub_C700128 堆检查引用堆顶标记
+ * MEMORY[0x3DFC0000]（= 0x3C000000 + 0x1FC0000），SDK 的 8MB 占位值
+ * 会让堆校验全部误判并引发日志洪峰。 */
+#define BEST1503_PSRAM_BASE      0x3C000000
+#define BEST1503_PSRAM_NC_BASE   0x38000000
+#define BEST1503_PSRAM_SIZE      0x02000000
 
 #define BEST1503_UART0_IRQ       17
 #define BEST1503_UART1_IRQ       18
@@ -153,7 +162,8 @@ static void best1503_bootvec_reset(void *opaque)
 static void best1503_init(MachineState *machine)
 {
     MemoryRegion *sysmem = get_system_memory();
-    static MemoryRegion flash, flash_cached, flash_nc, sram, ramx;
+    static MemoryRegion flash, flash_cached, flash_nc, flash_xnc, sram, ramx;
+    static MemoryRegion psram, psram_nc;
     Clock *sysclk;
     Error *err = NULL;
     DeviceState *armv7m;
@@ -227,6 +237,17 @@ static void best1503_init(MachineState *machine)
                                  bes_flash_storage(BES_FLASH(fc)), 0,
                                  g_img.flash_size);
         memory_region_add_subregion(sysmem, flash_nc_start, &flash_nc);
+
+        /* 第四窗口 FLASHX_NC：SDK plat_addr_map_best1503.h:207-208
+         * REAL_FLASHX_BASE(0x0C000000)/REAL_FLASHX_NC_BASE(0x08000000)
+         * 差 0x4000000（与 FLASH/FLASH_NC 对一致）。固件 sub_C0C2054
+         * 读此窗口 +0x2000 的启动标志位（BL2/参数区），缺失时读到 0
+         * 会被当作"首次启动"而走完整 early-init 路径。 */
+        memory_region_init_alias(&flash_xnc, NULL, "best1503.flash_xnc",
+                                 bes_flash_storage(BES_FLASH(fc)), 0,
+                                 g_img.flash_size);
+        memory_region_add_subregion(sysmem, flash_xip_start - 0x4000000,
+                                    &flash_xnc);
     }
 
     /* ---- SRAM：SDK 确认物理总量 1.4MB（不依赖固件布局计算） ---- */
@@ -252,6 +273,15 @@ static void best1503_init(MachineState *machine)
                (g_img.data_lma - cached_start),
                g_img.data_end - g_img.data_start);
     }
+
+    /* ---- PSRAM：cached 窗口 + NC 别名（固件 sub_C0C0AC8 段复制证实） ---- */
+    memory_region_init_ram(&psram, NULL, "best1503.psram",
+                           BEST1503_PSRAM_SIZE, &error_fatal);
+    memory_region_add_subregion(sysmem, BEST1503_PSRAM_BASE, &psram);
+    memory_region_init_alias(&psram_nc, NULL, "best1503.psram_nc",
+                             &psram, 0, BEST1503_PSRAM_SIZE);
+    memory_region_add_subregion(sysmem, BEST1503_PSRAM_NC_BASE,
+                                &psram_nc);
 
     /* ---- 伪 boot 向量表 @0x0（模拟 boot ROM 跳转，不碰固件） ---- */
     memory_region_init_ram(&g_bootvec, NULL, "best1503.bootvec", 0x1000,
@@ -320,12 +350,16 @@ static void best1503_init(MachineState *machine)
         sysbus_mmio_map(SYS_BUS_DEVICE(aoncmu), 0, BEST1503_AON_CMU_BASE);
     }
 
-    /* DSI 控制器 @0x40168000（PHY）+ @0x40160000（命令引擎） */
+    /* PSRAM 控制器对 @0x40168000（PHY）+ @0x40160000（MC/MGR 引擎） */
     {
-        DeviceState *dsi = qdev_new(TYPE_BES_DSI);
-        sysbus_realize_and_unref(SYS_BUS_DEVICE(dsi), &error_fatal);
-        sysbus_mmio_map(SYS_BUS_DEVICE(dsi), 0, BEST1503_DSI_BASE);
-        sysbus_mmio_map(SYS_BUS_DEVICE(dsi), 1, BEST1503_DSI_CMD_BASE);
+        DeviceState *psramc = qdev_new(TYPE_BES_PSRAM);
+        qdev_prop_set_uint64(psramc, "psram-ptr",
+                             (uint64_t)(uintptr_t)
+                             memory_region_get_ram_ptr(&psram));
+        qdev_prop_set_uint32(psramc, "psram-size", BEST1503_PSRAM_SIZE);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(psramc), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(psramc), 0, BEST1503_PSRAM_PHY_BASE);
+        sysbus_mmio_map(SYS_BUS_DEVICE(psramc), 1, BEST1503_PSRAM_MC_BASE);
     }
 
     /* MCU_CMU @0x40000000（覆盖 unimp 窗口） */
