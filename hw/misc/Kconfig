@@ -204,6 +204,9 @@ config BES_PSRAM
 config BES_CMU
     bool
 
+config BES_PMU
+    bool
+
 config LED
     bool
 

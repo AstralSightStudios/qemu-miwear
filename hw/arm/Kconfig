@@ -12,6 +12,7 @@ config BEST1503
     select BES_FLASH
     select BES_PSRAM
     select BES_CMU
+    select BES_PMU
 
 config ARM_VIRT
     bool

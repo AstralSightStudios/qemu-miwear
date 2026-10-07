@@ -37,6 +37,17 @@ struct BesFlashState {
     uint8_t sr;                 /* status register S0-S7 (WIP/WEL/BP) */
     uint8_t sr2;                /* status register S8-S15 (QE/CMP) */
 
+    /* ---- SPI NAND die (route addr==0x61, /dev/nand_data) ----
+     * GD5F1GQ5-class: 2048+64B pages, 64 pages/block, 1024 blocks
+     * (128MiB data + 4MiB OOB, 2112B per physical page). */
+    char *nand_image;           /* writable mmap backend file */
+    void *nand_map;             /* GMappedFile* (writable) */
+    uint32_t nand_size;         /* backend bytes (pages * 2112) */
+    uint8_t nand_sr[256];       /* feature registers by address (A0/B0/C0/D0) */
+    uint8_t nand_cache[2112];   /* page cache for read/program */
+    uint32_t nand_prog_col;
+    bool nand_cache_dirty;
+
     Notifier shutdown_notifier; /* image writeback on exit */
 };
 

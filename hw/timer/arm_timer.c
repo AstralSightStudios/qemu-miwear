@@ -202,6 +202,10 @@ struct SP804State {
     uint32_t freq0, freq1;
     int level[2];
     qemu_irq irq;
+    /* Optional second output: some SoCs (e.g. BES best1503) wire the two
+     * sub-timers to two separate NVIC lines instead of OR-ing them. */
+    qemu_irq irq2;
+    bool split_irq;
 };
 
 static const uint8_t sp804_ids[] = {
@@ -217,7 +221,11 @@ static void sp804_set_irq(void *opaque, int irq, int level)
     SP804State *s = (SP804State *)opaque;
 
     s->level[irq] = level;
-    qemu_set_irq(s->irq, s->level[0] || s->level[1]);
+    if (s->split_irq) {
+        qemu_set_irq(irq ? s->irq2 : s->irq, level);
+    } else {
+        qemu_set_irq(s->irq, s->level[0] || s->level[1]);
+    }
 }
 
 static uint64_t sp804_read(void *opaque, hwaddr offset,
@@ -294,6 +302,7 @@ static void sp804_init(Object *obj)
     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
 
     sysbus_init_irq(sbd, &s->irq);
+    sysbus_init_irq(sbd, &s->irq2);
     memory_region_init_io(&s->iomem, obj, &sp804_ops, s,
                           "sp804", 0x1000);
     sysbus_init_mmio(sbd, &s->iomem);
@@ -390,6 +399,7 @@ static const TypeInfo icp_pit_info = {
 static const Property sp804_properties[] = {
     DEFINE_PROP_UINT32("freq0", SP804State, freq0, 1000000),
     DEFINE_PROP_UINT32("freq1", SP804State, freq1, 1000000),
+    DEFINE_PROP_BOOL("split-irq", SP804State, split_irq, false),
 };
 
 static void sp804_class_init(ObjectClass *klass, const void *data)

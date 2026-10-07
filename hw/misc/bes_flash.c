@@ -54,6 +54,9 @@
 #include "system/runstate.h"
 #include "system/system.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/core/cpu.h"
+#include "target/arm/cpu.h"
+#include "system/address-spaces.h"
 #include "hw/misc/bes_flash.h"
 
 /* GD25Q32C-family command set (norflash_gd25q32c.h:57-96) */
@@ -130,6 +133,26 @@
 
 /* JEDEC ID of each GD25LQ64C die (SDK norflash_gd25lq32c.c:241) */
 static const uint8_t bes_flash_jedec_id[3] = { 0xC8, 0x60, 0x17 };
+
+/* SPI NAND (/dev/nand_data, GigaDevice 1Gbit): firmware NAND ID table
+ * entry 0x2CCD400C matches c8-81-c8 (GD5F1GQ5-class). Probe traffic on
+ * the same controller uses cmd=0x9f addr=0x61 rx_len=3 dual=0 (NOR uses
+ * addr=0xc1 dual=1); addr==0x61 routes to the NAND die. */
+static const uint8_t bes_nand_jedec_id[3] = { 0xC8, 0x81, 0xC8 };
+
+/* SPI NAND geometry (GD5F1GQ5-class) */
+#define BES_NAND_PAGE_BYTES     2112    /* 2048 data + 64 OOB */
+#define BES_NAND_PAGES_PER_BLK  64
+#define BES_NAND_BLOCKS         1024
+#define BES_NAND_TOTAL_BYTES    (BES_NAND_PAGE_BYTES * \
+                                 BES_NAND_PAGES_PER_BLK * BES_NAND_BLOCKS)
+/* feature register addresses (GD SPI NAND standard) */
+#define BES_NAND_SR_STAT        0xA0    /* OIP|WEL|BP|CMP */
+#define BES_NAND_SR_DRV         0xB0
+#define BES_NAND_SR_ECC         0xC0    /* ECC_EN|ECC status (0=no error) */
+#define BES_NAND_SR_PROT        0xD0
+#define BES_NAND_SR_OIP         (1 << 0)
+#define BES_NAND_SR_WEL         (1 << 1)
 
 /* Unique ID: GD dies report 18 bytes (SDK norflash_drv.c:56
  * GD_UNIQUE_ID_LEN). Per-unit values are not published; model a fixed
@@ -278,6 +301,124 @@ static void bes_flash_do_program(BesFlashState *s)
     s->tx_cnt = 0;
 }
 
+static void bes_flash_exec(BesFlashState *s, uint32_t reg000);
+
+/* ---- SPI NAND die (route addr==0x61) ---- */
+
+static uint8_t *bes_nand_backend(BesFlashState *s)
+{
+    return s->nand_map ? (uint8_t *)g_mapped_file_get_contents(
+               (GMappedFile *)s->nand_map) : NULL;
+}
+
+static void bes_nand_exec(BesFlashState *s, uint8_t cmd, uint32_t tx_len,
+                          uint32_t rx_len)
+{
+    uint8_t *be = bes_nand_backend(s);
+    uint32_t pos = 0;
+    uint32_t page, col;
+
+    qemu_log_mask(LOG_UNIMP, "bes.nand%c: cmd=0x%02x tx_len=%u rx_len=%u\n",
+                  s->rom_map ? '1' : '0', cmd, tx_len, rx_len);
+    switch (cmd) {
+    case 0x9F:                      /* READ ID */
+        bes_flash_respond_reg(s, bes_nand_jedec_id,
+                              rx_len ? MIN(rx_len, 3) : 3);
+        break;
+    case 0xFF:                      /* RESET */
+        memset(s->nand_sr, 0, sizeof(s->nand_sr));
+        s->nand_sr[BES_NAND_SR_ECC] = 1;    /* ECC_EN default on */
+        s->nand_cache_dirty = false;
+        break;
+    case 0x06:                      /* WREN */
+        s->nand_sr[BES_NAND_SR_STAT] |= BES_NAND_SR_WEL;
+        break;
+    case 0x04:                      /* WRDI */
+        s->nand_sr[BES_NAND_SR_STAT] &= ~BES_NAND_SR_WEL;
+        break;
+    case 0x0F: {                    /* GET FEATURE: TX 1B addr -> RX 1B */
+        uint8_t fa = s->tx_cnt ? s->txfifo[0] : 0;
+
+        bes_flash_respond_reg(s, &s->nand_sr[fa], 1);
+        break;
+    }
+    case 0x1F:                      /* SET FEATURE: TX addr+val */
+        if (s->tx_cnt >= 2) {
+            s->nand_sr[s->txfifo[0]] = s->txfifo[1];
+        }
+        break;
+    case 0x13:                      /* PAGE READ: TX 3B page addr -> cache */
+        if (s->tx_cnt >= 3) {
+            page = (s->txfifo[0] << 16) | (s->txfifo[1] << 8) | s->txfifo[2];
+            if (be && page * BES_NAND_PAGE_BYTES < s->nand_size) {
+                memcpy(s->nand_cache, be + page * BES_NAND_PAGE_BYTES,
+                       BES_NAND_PAGE_BYTES);
+            } else {
+                memset(s->nand_cache, 0xFF, BES_NAND_PAGE_BYTES);
+            }
+            s->nand_cache_dirty = false;
+            s->nand_sr[BES_NAND_SR_STAT] &= ~BES_NAND_SR_OIP;
+        }
+        break;
+    case 0x03:                      /* READ FROM CACHE: TX 2B col -> RX */
+    case 0x0B: {                    /* FAST READ FROM CACHE: col + 1 dummy */
+        col = s->tx_cnt >= 2 ? (s->txfifo[0] << 8) | s->txfifo[1] : 0;
+        if (rx_len && col < BES_NAND_PAGE_BYTES) {
+            bes_flash_rx_fill(s, s->nand_cache + col,
+                              MIN(rx_len, BES_NAND_PAGE_BYTES - col));
+        }
+        break;
+    }
+    case 0x02:                      /* PROGRAM LOAD: TX 2B col + data */
+    case 0x84:
+        if (s->tx_cnt >= 2) {
+            col = (s->txfifo[0] << 8) | s->txfifo[1];
+            uint32_t n = s->tx_cnt - 2;
+
+            if (col + n > BES_NAND_PAGE_BYTES) {
+                n = BES_NAND_PAGE_BYTES - col;
+            }
+            memcpy(s->nand_cache + col, s->txfifo + 2, n);
+            s->nand_cache_dirty = true;
+        }
+        break;
+    case 0x10:                      /* PROGRAM EXECUTE: TX 3B page addr */
+        if (s->tx_cnt >= 3 && (s->nand_sr[BES_NAND_SR_STAT] & BES_NAND_SR_WEL)) {
+            page = (s->txfifo[0] << 16) | (s->txfifo[1] << 8) | s->txfifo[2];
+            if (be && page * BES_NAND_PAGE_BYTES < s->nand_size) {
+                uint8_t *dst = be + page * BES_NAND_PAGE_BYTES;
+                uint32_t i;
+
+                for (i = 0; i < BES_NAND_PAGE_BYTES; i++) {
+                    dst[i] &= s->nand_cache[i];
+                }
+            }
+            s->nand_sr[BES_NAND_SR_STAT] &= ~BES_NAND_SR_WEL;
+            s->nand_cache_dirty = false;
+        }
+        s->nand_sr[BES_NAND_SR_STAT] &= ~BES_NAND_SR_OIP;
+        break;
+    case 0xD8:                      /* BLOCK ERASE: TX 3B page addr */
+        if (s->tx_cnt >= 3 && (s->nand_sr[BES_NAND_SR_STAT] & BES_NAND_SR_WEL)) {
+            page = (s->txfifo[0] << 16) | (s->txfifo[1] << 8) | s->txfifo[2];
+            page &= ~(BES_NAND_PAGES_PER_BLK - 1);
+            if (be && page * BES_NAND_PAGE_BYTES < s->nand_size) {
+                memset(be + page * BES_NAND_PAGE_BYTES, 0xFF,
+                       BES_NAND_PAGE_BYTES * BES_NAND_PAGES_PER_BLK);
+            }
+            s->nand_sr[BES_NAND_SR_STAT] &= ~BES_NAND_SR_WEL;
+        }
+        s->nand_sr[BES_NAND_SR_STAT] &= ~BES_NAND_SR_OIP;
+        break;
+    default:
+        qemu_log_mask(LOG_UNIMP, "bes.flash: unhandled NAND cmd 0x%02x\n",
+                      cmd);
+        break;
+    }
+    (void)pos;
+    s->tx_cnt = 0;   /* the whole TX phase belongs to this transaction */
+}
+
 static void bes_flash_exec(BesFlashState *s, uint32_t reg000)
 {
     uint8_t cmd = R000_CMD(reg000);
@@ -293,6 +434,12 @@ static void bes_flash_exec(BesFlashState *s, uint32_t reg000)
     qemu_log_mask(LOG_UNIMP, "bes.flash: cmd=0x%02x addr=0x%06x ext=%d "
                   "tx_len=%u rx_len=%u dual=%d\n",
                   cmd, addr, ext, tx_len, rx_len, bes_flash_dual(s));
+
+    /* SPI NAND die route: commands carrying addr==0x61 go to the NAND die */
+    if (addr == 0x61) {
+        bes_nand_exec(s, cmd, tx_len, rx_len);
+        return;
+    }
 
     switch (cmd) {
     case FLASH_CMD_ID: {
@@ -502,6 +649,25 @@ static uint64_t bes_flash_read(void *opaque, hwaddr offset, unsigned size)
         for (n = 0; n < width && s->rx_pos < s->rx_cnt; n++) {
             v |= (uint64_t)s->rxfifo[s->rx_pos++] << (n * 8);
         }
+        if (current_cpu) {   /* debug: who pops RX FIFO */
+            CPUARMState *env = &(ARM_CPU(current_cpu)->env);
+            uint32_t sp = env->regs[13];
+            uint32_t w0 = 0, w1 = 0, w2 = 0, w3 = 0;
+
+            address_space_read(&address_space_memory, sp,
+                               MEMTXATTRS_UNSPECIFIED, &w0, 4);
+            address_space_read(&address_space_memory, sp + 4,
+                               MEMTXATTRS_UNSPECIFIED, &w1, 4);
+            address_space_read(&address_space_memory, sp + 8,
+                               MEMTXATTRS_UNSPECIFIED, &w2, 4);
+            address_space_read(&address_space_memory, sp + 12,
+                               MEMTXATTRS_UNSPECIFIED, &w3, 4);
+            qemu_log_mask(LOG_UNIMP,
+                          "bes.flash: rxpop pc=0x%08x lr=0x%08x v=0x%02llx "
+                          "sp=0x%08x [%08x %08x %08x %08x]\n",
+                          env->regs[15], env->regs[14],
+                          (unsigned long long)v, sp, w0, w1, w2, w3);
+        }
         break;
     }
     case FLASH_REG_018:
@@ -530,6 +696,29 @@ static void bes_flash_write(void *opaque, hwaddr offset, uint64_t value,
     switch (offset) {
     case FLASH_REG_000:
         s->regs[0] = value;
+        if (current_cpu && (value & 0xFF) == 0x9F) {
+            CPUARMState *env = &(ARM_CPU(current_cpu)->env);
+            uint32_t sp = env->regs[13];
+            uint32_t w[16];
+            int i;
+
+            memset(w, 0, sizeof(w));
+            for (i = 0; i < 16; i++) {
+                if (address_space_read(&address_space_memory, sp + 4 * i,
+                                       MEMTXATTRS_UNSPECIFIED,
+                                       &w[i], 4) != MEMTX_OK) {
+                    break;
+                }
+            }
+            qemu_log_mask(LOG_UNIMP,
+                          "bes.flash: cmd9f pc=0x%08x lr=0x%08x sp=0x%08x\n"
+                          "  %08x %08x %08x %08x %08x %08x %08x %08x\n"
+                          "  %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                          env->regs[15], env->regs[14], sp,
+                          w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7],
+                          w[8], w[9], w[10], w[11], w[12], w[13], w[14],
+                          w[15]);
+        }
         bes_flash_exec(s, value);
         break;
     case FLASH_REG_008: {
@@ -674,6 +863,56 @@ static void bes_flash_realize(DeviceState *dev, Error **errp)
         qemu_register_shutdown_notifier(&s->shutdown_notifier);
     }
 
+    /* SPI NAND backend (writable mmap; created erased-0xFF if absent).
+     * Demand-paged like rom-image but writable, so no RAM cost for the
+     * 132MB NAND address space. */
+    if (s->nand_image) {
+        GMappedFile *mf = g_mapped_file_new(s->nand_image, TRUE, NULL);
+
+        if (!mf || g_mapped_file_get_length(mf) < BES_NAND_TOTAL_BYTES) {
+            uint8_t *ff;
+            FILE *nfp;
+
+            if (mf) {
+                g_mapped_file_unref(mf);
+                mf = NULL;
+            }
+            nfp = fopen(s->nand_image, "wb");
+            if (!nfp) {
+                error_setg(errp, "bes.flash: cannot create nand image '%s'",
+                           s->nand_image);
+                return;
+            }
+            ff = g_malloc(1024 * 1024);
+            memset(ff, 0xFF, 1024 * 1024);
+            for (uint32_t off = 0; off < BES_NAND_TOTAL_BYTES;
+                 off += 1024 * 1024) {
+                uint32_t n = MIN(1024 * 1024u,
+                                 BES_NAND_TOTAL_BYTES - off);
+                if (fwrite(ff, 1, n, nfp) != n) {
+                    g_free(ff);
+                    fclose(nfp);
+                    error_setg(errp,
+                               "bes.flash: short write creating '%s'",
+                               s->nand_image);
+                    return;
+                }
+            }
+            g_free(ff);
+            fclose(nfp);
+            mf = g_mapped_file_new(s->nand_image, TRUE, NULL);
+        }
+        if (!mf) {
+            error_setg(errp, "bes.flash: cannot mmap nand image '%s'",
+                       s->nand_image);
+            return;
+        }
+        s->nand_map = mf;
+        s->nand_size = g_mapped_file_get_length(mf);
+        info_report("bes.flash: nand image '%s' mapped, 0x%x bytes",
+                    s->nand_image, s->nand_size);
+    }
+
     memory_region_init_io(&s->iomem, OBJECT(dev), &bes_flash_ops, s,
                           "bes.flash", 0x400);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
@@ -690,12 +929,16 @@ static void bes_flash_reset(DeviceState *dev)
     s->pp_active = false;
     s->sr = 0;
     s->sr2 = 0;
+    memset(s->nand_sr, 0, sizeof(s->nand_sr));
+    s->nand_sr[BES_NAND_SR_ECC] = 1;
+    s->nand_cache_dirty = false;
 }
 
 static const Property bes_flash_props[] = {
     DEFINE_PROP_UINT32("size", BesFlashState, size, 0),
     DEFINE_PROP_STRING("image", BesFlashState, image),
     DEFINE_PROP_STRING("rom-image", BesFlashState, rom_image),
+    DEFINE_PROP_STRING("nand-image", BesFlashState, nand_image),
 };
 
 static void bes_flash_class_init(ObjectClass *klass, const void *data)

@@ -21,7 +21,9 @@
  *    self-clearing (read back 0).
  *  - WRITE_UNLOCK @0x20: bit0 = unlock control, bit1 = status
  *    (reg_aoncmu_best1503.h:220-221).
- *  - CHIP_ID @0x00: read-only, value 0 pending reverse engineering
+ *  - CHIP_ID @0x00: read-only, 0x1503 | (10<<16) — revision 10 maps to
+ *    metal id 6 (firmware hal_get_metal_id switch table); metal id 0-2
+ *    hits "1503 A don't support BTC PD" ASSERT in btdrv init.
  *    (no SDK constant; watch for firmware branches on it).
  *  - BOOTMODE @0x38: cold boot = 0 (hal_bootmode.c:32-36 bits are
  *    watchdog/global/rtc/charger reset flags, none set on cold boot).
@@ -84,7 +86,16 @@ static uint64_t bes_aoncmu_read(void *opaque, hwaddr offset, unsigned size)
     uint32_t v = 0;
 
     if (offset == AONCMU_OFF_CHIP_ID) {
-        v = 0;   /* pending RE; see file header */
+        /* CHIP_ID（reg_aoncmu_best1503.h:22,88-94，只读）：
+         *   bits[15:0]  CHIP_ID      bits[31:16] REVISION_ID
+         * 固件 hal_get_metal_id（sub_C0C0BF0）：rev=(CHIP_ID>>16)&0xF，
+         * 映射表 4→1, 8→2, 12→3, 13→4, 10→6, 11→7, 14→8, 15→9。
+         * btdrv_hci_set_poweron_reg（sub_C227A10）：metal id ∈{0,1,2}
+         * 时走 "1503 A don't support BTC PD" → ASSERT(0)；
+         * {3,4,5} 走分页备份路径；≥6 走主路径。量产 Mi Band 10
+         * （BES2700iMP）不可能是 A 版工程片，取 rev=10 → metal id 6
+         * （主路径最低档）。低 16 位芯片号填 0x1503（平台代号）。 */
+        v = 0x1503 | (10u << 16);
     } else if (offset == AONCMU_OFF_MEMSC_STATUS) {
         /* power-up completes instantly: aggregate MEMSC[i] bit0 */
         int i;
@@ -155,10 +166,19 @@ static const MemoryRegionOps bes_aoncmu_ops = {
 static void bes_aoncmu_reset(DeviceState *dev)
 {
     BesAoncmuState *s = BES_AONCMU(dev);
+    /* AON 域在 WDT/软复位下保持（always-on），仅上电清零。固件靠
+     * BOOTMODE @0x38 / SW_INFO @0xF8 跨复位传递启动信息
+     * （hal_bootmode.c、hal_cmu_save_subsys_metal_id）。
+     * 设备创建时内存零初始化即"上电态"；此处仅保留这两个信息
+     * 寄存器，其余按冷启动复位。 */
+    uint32_t bootmode = s->regs[0x38 >> 2];
+    uint32_t sw_info = s->regs[0xF8 >> 2];
     int i;
 
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->setclr_state, 0, sizeof(s->setclr_state));
+    s->regs[0x38 >> 2] = bootmode;
+    s->regs[0xF8 >> 2] = sw_info;
 
     /* 冷启动时所有 RAM bank 已供电：MEMSC[i]=1（hal_memsc.c:63-70
      * hal_memsc_aon_lock 等待非零即"已上电"，真机硬件默认上电）。

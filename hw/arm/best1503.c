@@ -12,6 +12,7 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
+#include "qemu/log.h"
 #include "qemu/units.h"
 #include "hw/core/boards.h"
 #include "hw/core/cpu.h"
@@ -26,6 +27,7 @@
 #include "hw/misc/bes_flash.h"
 #include "hw/misc/bes_psram.h"
 #include "hw/misc/bes_cmu.h"
+#include "hw/misc/bes_pmu.h"
 #include "system/address-spaces.h"
 #include "system/reset.h"
 #include "system/system.h"
@@ -77,13 +79,19 @@
 #define BEST1503_UART0_IRQ       17
 #define BEST1503_UART1_IRQ       18
 #define BEST1503_UART2_IRQ       26
-/* hal_sys_timer 走 slow timer（MCU_TIMER0）子定时器 1（SDK hal_timer.c:53-54
+/* BES 硬件把 dual-timer 两子定时器分接两个 NVIC 中断（best1503.h IRQn）：
+ *   MCU_TIMER00/01 = 12/13，MCU_TIMER10/11 = 27/28，AON_TIMER00/01 = 45/46。
+ * hal_sys_timer 走 slow timer（MCU_TIMER0）子定时器 1（SDK hal_timer.c:53-54
  * SLOW_TIMER_SUB_ID_WITH_IRQ=1）→ MCU_TIMER01_IRQn=13。
- * BES 硬件把 dual-timer 两子定时器分接两个 NVIC 中断；QEMU sp804 只有一路
- * 合并输出，故连子定时器 1 对应的号（近似，注释留存）。 */
-#define BEST1503_MCU_TIMER0_IRQ  13
-#define BEST1503_MCU_TIMER1_IRQ  28   /* MCU_TIMER11_IRQn（fast timer 同理） */
-#define BEST1503_AON_TIMER0_IRQ  45   /* AON_TIMER00_IRQn（best1503.h:110） */
+ * 实测（本固件 v3.101.043 调试）：OS tick 在 AON_TIMER0 子定时器 2
+ * （oneshot+INTEN），固件使能 AON_TIMER01_IRQn=46 等待唤醒；
+ * sp804 设 split-irq=true 后 irq0=子定时器1 线、irq1=子定时器2 线。 */
+#define BEST1503_MCU_TIMER00_IRQ 12
+#define BEST1503_MCU_TIMER01_IRQ 13
+#define BEST1503_MCU_TIMER10_IRQ 27
+#define BEST1503_MCU_TIMER11_IRQ 28
+#define BEST1503_AON_TIMER00_IRQ 45   /* AON_TIMER00_IRQn（best1503.h:110） */
+#define BEST1503_AON_TIMER01_IRQ 46
 #define BEST1503_AON_TIMER0_BASE 0x40084000
 
 /* 外设窗口整体兜底（未建模区域侦察用） */
@@ -219,6 +227,11 @@ static void best1503_init(MachineState *machine)
         uint32_t flash_nc_start = g_img.nc_base - g_img.ota_code_offset;
 
         qdev_prop_set_uint32(fc, "size", g_img.flash_size);
+        /* 同一控制器的 NAND die（addr==0x61 路由）：/dev/nand_data 的
+         * SPI NAND（yaffs /data）。实证：探测/事务命令全部落在
+         * flash0 控制器（bes.nand0 日志）。后端可写 mmap，不存在则
+         * 创建并填 0xFF（NAND 擦除态）。 */
+        qdev_prop_set_string(fc, "nand-image", "emu/nand_data.img");
         if (g_flash_image) {
             qdev_prop_set_string(fc, "image", g_flash_image);
         }
@@ -279,6 +292,40 @@ static void best1503_init(MachineState *machine)
                g_img.data_end - g_img.data_start);
     }
 
+    /* ---- boot ROM 驻留驱动段预加载 ----
+     * 真机 mask ROM 引导时把一组 norflash/ISPI 驱动函数与 libc 例程
+     * 驻留在 SRAM 低区（SDK hal_location.h：ROM_BUILD 的
+     * BOOT_TEXT_SRAM_LOC/SRAM_TEXT_LOC = .rom_ramx），AP 固件的
+     * thunk 表（0xC588xxx，LDR.W PC 绝对跳转）静态指向 RAMX
+     * 0x276660-0x2788FC ↔ VMA [0x20066660, 0x200688FC]。
+     * 实体只在芯片 mask ROM 中（实证：AP/BL2/OTA 镜像及真机
+     * 16MB flash dump 的 BL2 区均不含——dump 0xA2444 处为 BL2
+     * rodata 字符串而非代码，BL2 区无任何 LDR.W PC thunk）。
+     * 缺失时 NAND/flash 驱动经 thunk 跳入空区（0x0000 滑行、
+     * R0 不变），SPI NAND 读 ID 写不进驱动缓冲 →
+     * bes nandflash_init error → /dev/nand_data 挂载失败 →
+     * persist property 无法持久 → reboot 循环。
+     * 故以 SDK 语义（hal_norflaship_v2.c / norflash_drv.c）交叉
+     * 编译等价 helper（emu/romdrv），按 thunk 目标地址逐位摆放
+     * 入口跳板后预加载。 */
+    {
+        static const char *romdrv_path = "emu/romdrv/romdrv.bin";
+        FILE *rfp = fopen(romdrv_path, "rb");
+
+        if (rfp) {
+            /* romdrv.bin 链接基址为 RAMX 0x266600（== SRAM 0x20066600，
+             * 保证 b.w 相对跳转在 RAMX 执行时正确解析） */
+            size_t got = fread(memory_region_get_ram_ptr(&sram) + 0x66600,
+                               1, 0x20000, rfp);
+            fclose(rfp);
+            info_report("best1503: loaded %zu bytes romdrv helpers "
+                        "from '%s'", got, romdrv_path);
+        } else {
+            warn_report("best1503: romdrv helpers '%s' not found; "
+                        "mask-ROM driver area left empty", romdrv_path);
+        }
+    }
+
     /* ---- PSRAM：cached 窗口 + NC 别名（固件 sub_C0C0AC8 段复制证实） ---- */
     memory_region_init_ram(&psram, NULL, "best1503.psram",
                            BEST1503_PSRAM_SIZE, &error_fatal);
@@ -287,6 +334,24 @@ static void best1503_init(MachineState *machine)
                              &psram, 0, BEST1503_PSRAM_SIZE);
     memory_region_add_subregion(sysmem, BEST1503_PSRAM_NC_BASE,
                                 &psram_nc);
+
+    /* ---- BT 子系统共享 RAM（BT 核本体不模拟，只挂存储） ----
+     * SDK plat_addr_map_best1503.h:303-306：
+     *   BT_RAM_BASE      0xC0000000  64KB（AP↔BT 共享，bt_drv 的
+     *                    data_backup 指针表区 0xC0004xxx/0xC0008xxx/0xC0009xxx）
+     *   BT_EXCH_MEM_BASE 0xD0210000  64KB（mailbox 交换内存，固件 MPU
+     *                    配置日志含 0xD0200000 区域项）
+     * 不挂的后果（实测）：bakeup_init 写 [0xC0004070]=备份指针被总线丢弃，
+     * backup_write 读回 0 当指针用 → 空指针写入 → MemManage DACCVIOL
+     * （MMFAR=0）→ dump → board_reset(2) → 停机。BT 核不存在时该区域
+     * 仅作 AP 自写自读的存储，足够让 bt_drv 的备份机制闭环。 */
+    static MemoryRegion bt_ram, bt_exch;
+    memory_region_init_ram(&bt_ram, NULL, "best1503.bt_ram", 0x10000,
+                           &error_fatal);
+    memory_region_add_subregion(sysmem, 0xC0000000, &bt_ram);
+    memory_region_init_ram(&bt_exch, NULL, "best1503.bt_exch", 0x10000,
+                           &error_fatal);
+    memory_region_add_subregion(sysmem, 0xD0210000, &bt_exch);
 
     /* ---- flash1：resource romfs 所在的大容量 flash ----
      * 后端为 rom-image（mmap 只读、按需分页）：romfs 只读使用，
@@ -339,14 +404,15 @@ static void best1503_init(MachineState *machine)
         static const struct {
             uint32_t base;
             uint32_t freq;
-            int irq;
+            int irq0;   /* 子定时器 1 的 NVIC 线 */
+            int irq1;   /* 子定时器 2 的 NVIC 线 */
         } timers[] = {
             { BEST1503_MCU_TIMER0_BASE, BEST1503_SLOW_TIMER_FRQ,
-              BEST1503_MCU_TIMER0_IRQ },
+              BEST1503_MCU_TIMER00_IRQ, BEST1503_MCU_TIMER01_IRQ },
             { BEST1503_MCU_TIMER1_BASE, BEST1503_FAST_TIMER_FRQ,
-              BEST1503_MCU_TIMER1_IRQ },
+              BEST1503_MCU_TIMER10_IRQ, BEST1503_MCU_TIMER11_IRQ },
             { BEST1503_AON_TIMER0_BASE, BEST1503_AON_TIMER_FRQ,
-              BEST1503_AON_TIMER0_IRQ },
+              BEST1503_AON_TIMER00_IRQ, BEST1503_AON_TIMER01_IRQ },
         };
         DeviceState *nvic = armv7m;   /* armv7m 容器的 gpio-in 即 NVIC 外部中断线 */
         int i;
@@ -367,10 +433,14 @@ static void best1503_init(MachineState *machine)
             DeviceState *tmr = qdev_new("sp804");
             qdev_prop_set_uint32(tmr, "freq0", timers[i].freq);
             qdev_prop_set_uint32(tmr, "freq1", timers[i].freq);
+            /* BES 硬件两子定时器分接两路 NVIC，不做 OR 合并 */
+            qdev_prop_set_bit(tmr, "split-irq", true);
             sysbus_realize_and_unref(SYS_BUS_DEVICE(tmr), &error_fatal);
             sysbus_mmio_map(SYS_BUS_DEVICE(tmr), 0, timers[i].base);
             sysbus_connect_irq(SYS_BUS_DEVICE(tmr), 0,
-                               qdev_get_gpio_in(nvic, timers[i].irq));
+                               qdev_get_gpio_in(nvic, timers[i].irq0));
+            sysbus_connect_irq(SYS_BUS_DEVICE(tmr), 1,
+                               qdev_get_gpio_in(nvic, timers[i].irq1));
         }
     }
 
@@ -383,6 +453,14 @@ static void best1503_init(MachineState *machine)
         DeviceState *aoncmu = qdev_new(TYPE_BES_AONCMU);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(aoncmu), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(aoncmu), 0, BEST1503_AON_CMU_BASE);
+    }
+
+    /* PMU（模拟电源管理芯片）ISPI 窗口 @0x40009000：
+     * 固件 MMIO 指针表 0x200B08B8[0] 实证；SDK hal_analogif_best1503.c */
+    {
+        DeviceState *pmu = qdev_new(TYPE_BES_PMU);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(pmu), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(pmu), 0, 0x40009000);
     }
 
     /* PSRAM 控制器对 @0x40168000（PHY）+ @0x40160000（MC/MGR 引擎） */
@@ -400,8 +478,17 @@ static void best1503_init(MachineState *machine)
     /* MCU_CMU @0x40000000（覆盖 unimp 窗口） */
     {
         DeviceState *cmu = qdev_new(TYPE_BES_CMU);
+        int i;
+
         sysbus_realize_and_unref(SYS_BUS_DEVICE(cmu), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(cmu), 0, BEST1503_CMU_BASE);
+        /* intersys IPC（虚拟 BT 核）：tx0/tx1/rx0/rx1 → NVIC 32/33/34/35
+         * IRQ 号依据固件 hal_intersys 注册表（0x2CCDACC8 字节表
+         * 0x20/0x21/0x22/0x23，handler hal_intersys_tx/rx_irq_handler）。 */
+        for (i = 0; i < 4; i++) {
+            qdev_connect_gpio_out_named(cmu, "intersys-irq", i,
+                                        qdev_get_gpio_in(armv7m, 32 + i));
+        }
     }
 }
 
