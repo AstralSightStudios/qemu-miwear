@@ -1,5 +1,6 @@
 system_ss.add(when: 'CONFIG_BES_IMAGE', if_true: files('bes_image.c'))
 system_ss.add(when: 'CONFIG_BES_AONCMU', if_true: files('bes_aoncmu.c'))
+system_ss.add(when: 'CONFIG_BES_FLASH', if_true: files('bes_flash.c'))
 system_ss.add(when: 'CONFIG_BES_STUB', if_true: files('bes_stub.c'))
 system_ss.add(when: 'CONFIG_APPLESMC', if_true: files('applesmc.c'))
 system_ss.add(when: 'CONFIG_EDU', if_true: files('edu.c'))

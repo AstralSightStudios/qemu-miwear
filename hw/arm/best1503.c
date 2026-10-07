@@ -23,6 +23,7 @@
 #include "hw/misc/unimp.h"
 #include "hw/misc/bes_image.h"
 #include "hw/misc/bes_aoncmu.h"
+#include "hw/misc/bes_flash.h"
 #include "system/address-spaces.h"
 #include "system/reset.h"
 #include "system/system.h"
@@ -42,6 +43,11 @@
 #define BEST1503_UART1_BASE      0x4000C000
 #define BEST1503_UART2_BASE      0x4000D000
 #define BEST1503_AON_CMU_BASE    0x40080000
+/* flash0 控制器：SDK plat_addr_map_best1503.h:265 REAL_FLASH_CTRL_BASE；
+ * flash1 控制器 :261 REAL_FLASH1_CTRL_BASE=0x40500000 —— AP 固件运行期间
+ * 不访问 flash1（resource romfs 在独立大容量存储上，挂载方式待固件访问时
+ * 经 unimp 日志识别后再建模），故暂不挂 flash1。 */
+#define BEST1503_FLASH_CTRL_BASE  0x40140000
 
 #define BEST1503_UART0_IRQ       17
 #define BEST1503_UART1_IRQ       18
@@ -96,6 +102,23 @@
 static BesImage g_img;
 static MemoryRegion g_bootvec;
 static ARMCPU *g_cpu;
+
+/* -M best1503,flash-image=<file>：完整 16MB flash 镜像（含 BL2/AP/参数区），
+ * 作为 bes_flash 后端并在退出时写回；缺省则由 -kernel 固件按
+ * OTA_CODE_OFFSET 构造后端内容。 */
+static char *g_flash_image;
+
+static char *best1503_get_flash_image(Object *obj, Error **errp)
+{
+    return g_strdup(g_flash_image);
+}
+
+static void best1503_set_flash_image(Object *obj, const char *val,
+                                     Error **errp)
+{
+    g_free(g_flash_image);
+    g_flash_image = g_strdup(val);
+}
 
 /*
  * CPU 对象不随系统 reset 自动复位（hw/arm/boot.c:1186 注释），
@@ -156,17 +179,44 @@ static void best1503_init(MachineState *machine)
     sysbus_realize_and_unref(SYS_BUS_DEVICE(armv7m), &error_fatal);
     g_cpu = ARMV7M(armv7m)->cpu;
 
-    /* ---- flash：XIP ROM + cached/NC 别名，内容写入 ROM 后端 ---- */
-    memory_region_init_rom(&flash, NULL, "best1503.flash",
-                           g_img.size, &error_fatal);
-    memory_region_add_subregion(sysmem, g_img.xip_base, &flash);
-    memory_region_init_alias(&flash_cached, NULL, "best1503.flash_cached",
-                             &flash, 0, g_img.size);
-    memory_region_add_subregion(sysmem, g_img.cached_base, &flash_cached);
-    memory_region_init_alias(&flash_nc, NULL, "best1503.flash_nc",
-                             &flash, 0, g_img.size);
-    memory_region_add_subregion(sysmem, g_img.nc_base, &flash_nc);
-    memcpy(memory_region_get_ram_ptr(&flash), g_img.data, g_img.size);
+    /* ---- flash：bes_flash 设备持有存储后端，XIP/cached/NC 三别名共享 ----
+     * 真机同一物理 flash 有多个总线窗口（SDK plat_addr_map_best1503.h:
+     * 205-208：cached 0x2C/NC 0x28/XIP 0x0C/FLASHX_NC 0x08），固件经不同
+     * 窗口访问代码与数据，故按 bes_image 解析出的三基址挂三个别名。
+     * 固件写入后端偏移 OTA_CODE_OFFSET（真机 flash 布局，解析自 boot
+     * info）；若经 -M flash-image=<file> 提供完整 flash 镜像，则镜像
+     * 文件即后端内容（含 BL2/AP/参数区），不再单独写入固件。 */
+    {
+        DeviceState *fc = qdev_new(TYPE_BES_FLASH);
+        uint32_t flash_xip_start = g_img.xip_base - g_img.ota_code_offset;
+        uint32_t flash_cached_start = g_img.cached_base - g_img.ota_code_offset;
+        uint32_t flash_nc_start = g_img.nc_base - g_img.ota_code_offset;
+
+        qdev_prop_set_uint32(fc, "size", g_img.flash_size);
+        if (g_flash_image) {
+            qdev_prop_set_string(fc, "image", g_flash_image);
+        }
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(fc), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(fc), 0, BEST1503_FLASH_CTRL_BASE);
+
+        if (!g_flash_image) {
+            memcpy(bes_flash_data(BES_FLASH(fc)) + g_img.ota_code_offset,
+                   g_img.data, g_img.size);
+        }
+
+        memory_region_init_alias(&flash, NULL, "best1503.flash_xip",
+                                 bes_flash_storage(BES_FLASH(fc)), 0,
+                                 g_img.flash_size);
+        memory_region_add_subregion(sysmem, flash_xip_start, &flash);
+        memory_region_init_alias(&flash_cached, NULL, "best1503.flash_cached",
+                                 bes_flash_storage(BES_FLASH(fc)), 0,
+                                 g_img.flash_size);
+        memory_region_add_subregion(sysmem, flash_cached_start, &flash_cached);
+        memory_region_init_alias(&flash_nc, NULL, "best1503.flash_nc",
+                                 bes_flash_storage(BES_FLASH(fc)), 0,
+                                 g_img.flash_size);
+        memory_region_add_subregion(sysmem, flash_nc_start, &flash_nc);
+    }
 
     /* ---- SRAM：SDK 确认物理总量 1.4MB（不依赖固件布局计算） ---- */
     memory_region_init_ram(&sram, NULL, "best1503.sram", BEST1503_SRAM_SIZE,
@@ -257,6 +307,14 @@ static void best1503_machine_init(MachineClass *mc)
     mc->valid_cpu_types = valid_cpu_types;
     mc->default_cpu_type = ARM_CPU_TYPE_NAME("cortex-m33");
     mc->ignore_memory_transaction_failures = true;
+
+    object_class_property_add_str(OBJECT_CLASS(mc), "flash-image",
+                                  best1503_get_flash_image,
+                                  best1503_set_flash_image);
+    object_class_property_set_description(OBJECT_CLASS(mc), "flash-image",
+                                          "backing image file for the 16MB "
+                                          "boot flash (loaded at startup, "
+                                          "written back on exit)");
 }
 
 DEFINE_MACHINE_ARM("best1503", best1503_machine_init)

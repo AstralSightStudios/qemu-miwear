@@ -195,6 +195,9 @@ config BES_STUB
 config BES_AONCMU
     bool
 
+config BES_FLASH
+    bool
+
 config LED
     bool
 
