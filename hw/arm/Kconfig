@@ -14,6 +14,7 @@ config BEST1503
     select BES_CMU
     select BES_PMU
     select BES_I2C
+    select BES_LCDC
 
 config ARM_VIRT
     bool

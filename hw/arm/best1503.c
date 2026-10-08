@@ -29,6 +29,7 @@
 #include "hw/misc/bes_cmu.h"
 #include "hw/misc/bes_pmu.h"
 #include "hw/misc/bes_i2c.h"
+#include "hw/misc/bes_lcdc.h"
 #include "system/address-spaces.h"
 #include "system/reset.h"
 #include "system/system.h"
@@ -506,6 +507,15 @@ static void best1503_init(MachineState *machine)
             sysbus_connect_irq(SYS_BUS_DEVICE(i2c), 0,
                                qdev_get_gpio_in(nvic, i2cs[i].irq));
         }
+    }
+
+    /* LCDC @0x40200000（SDK plat_addr_map_best1503.h:283）：DBI/SPI 面板
+     * 命令通道 + 帧输出。固件当前用轮询（ISR bit18=tx-done），IRQ 号待
+     * 实证后接线。 */
+    {
+        DeviceState *lcdc = qdev_new(TYPE_BES_LCDC);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(lcdc), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(lcdc), 0, 0x40200000);
     }
 
     /* PSRAM 控制器对 @0x40168000（PHY）+ @0x40160000（MC/MGR 引擎） */

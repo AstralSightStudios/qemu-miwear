@@ -210,6 +210,9 @@ config BES_PMU
 config BES_I2C
     bool
 
+config BES_LCDC
+    bool
+
 config LED
     bool
 
