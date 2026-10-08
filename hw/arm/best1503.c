@@ -28,6 +28,7 @@
 #include "hw/misc/bes_psram.h"
 #include "hw/misc/bes_cmu.h"
 #include "hw/misc/bes_pmu.h"
+#include "hw/misc/bes_i2c.h"
 #include "system/address-spaces.h"
 #include "system/reset.h"
 #include "system/system.h"
@@ -79,6 +80,24 @@
 #define BEST1503_UART0_IRQ       17
 #define BEST1503_UART1_IRQ       18
 #define BEST1503_UART2_IRQ       26
+/* I2C 主控（DesignWare APB-I2C 兼容；SDK plat_addr_map_best1503.h:223-242
+ * 基址、cmsis/inc/best1503.h IRQn） */
+#define BEST1503_I2C0_BASE       0x40005000
+#define BEST1503_I2C1_BASE       0x40006000
+#define BEST1503_I2C2_BASE       0x40060000
+#define BEST1503_I2C3_BASE       0x40061000
+#define BEST1503_I2C4_BASE       0x40062000
+#define BEST1503_I2C5_BASE       0x40063000
+/* 0x40064000：SDK 头标 I2S2_BASE，但固件按 I2C id=6 使用（DW 寄存器布局，
+ * STATUS@+0x70 实证）；SDK 标错同 0x40168000=PSRAM 先例，以固件为准 */
+#define BEST1503_I2C6_BASE       0x40064000
+#define BEST1503_I2C0_IRQ        14
+#define BEST1503_I2C1_IRQ        29
+#define BEST1503_I2C2_IRQ        64
+#define BEST1503_I2C3_IRQ        65
+#define BEST1503_I2C4_IRQ        53
+#define BEST1503_I2C5_IRQ        54
+#define BEST1503_I2C6_IRQ        55
 /* BES 硬件把 dual-timer 两子定时器分接两个 NVIC 中断（best1503.h IRQn）：
  *   MCU_TIMER00/01 = 12/13，MCU_TIMER10/11 = 27/28，AON_TIMER00/01 = 45/46。
  * hal_sys_timer 走 slow timer（MCU_TIMER0）子定时器 1（SDK hal_timer.c:53-54
@@ -461,6 +480,32 @@ static void best1503_init(MachineState *machine)
         DeviceState *pmu = qdev_new(TYPE_BES_PMU);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(pmu), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(pmu), 0, 0x40009000);
+    }
+
+    /* I2C 主控 ×5（board init 注册 0/2/3/5 + I2C1；NVIC 见 SDK best1503.h） */
+    {
+        static const struct {
+            uint32_t base;
+            int irq;
+        } i2cs[] = {
+            { BEST1503_I2C0_BASE, BEST1503_I2C0_IRQ },
+            { BEST1503_I2C1_BASE, BEST1503_I2C1_IRQ },
+            { BEST1503_I2C2_BASE, BEST1503_I2C2_IRQ },
+            { BEST1503_I2C3_BASE, BEST1503_I2C3_IRQ },
+            { BEST1503_I2C4_BASE, BEST1503_I2C4_IRQ },
+            { BEST1503_I2C5_BASE, BEST1503_I2C5_IRQ },
+            { BEST1503_I2C6_BASE, BEST1503_I2C6_IRQ },
+        };
+        DeviceState *nvic = armv7m;
+        int i;
+
+        for (i = 0; i < ARRAY_SIZE(i2cs); i++) {
+            DeviceState *i2c = qdev_new(TYPE_BES_I2C);
+            sysbus_realize_and_unref(SYS_BUS_DEVICE(i2c), &error_fatal);
+            sysbus_mmio_map(SYS_BUS_DEVICE(i2c), 0, i2cs[i].base);
+            sysbus_connect_irq(SYS_BUS_DEVICE(i2c), 0,
+                               qdev_get_gpio_in(nvic, i2cs[i].irq));
+        }
     }
 
     /* PSRAM 控制器对 @0x40168000（PHY）+ @0x40160000（MC/MGR 引擎） */

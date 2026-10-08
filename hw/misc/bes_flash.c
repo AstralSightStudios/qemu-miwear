@@ -135,9 +135,10 @@
 static const uint8_t bes_flash_jedec_id[3] = { 0xC8, 0x60, 0x17 };
 
 /* SPI NAND (/dev/nand_data, GigaDevice 1Gbit): firmware NAND ID table
- * entry 0x2CCD400C matches c8-81-c8 (GD5F1GQ5-class). Probe traffic on
- * the same controller uses cmd=0x9f addr=0x61 rx_len=3 dual=0 (NOR uses
- * addr=0xc1 dual=1); addr==0x61 routes to the NAND die. */
+ * entry 0x2CCD400C matches c8-81-c8 (GD5F1GQ5-class). The chip-select
+ * scheme is NOT "addr==0x61" (that was a misread of the extended-command
+ * RX_LEN field); real NAND traffic has not been observed yet, so the die
+ * model below is parked until the routing is identified from traffic. */
 static const uint8_t bes_nand_jedec_id[3] = { 0xC8, 0x81, 0xC8 };
 
 /* SPI NAND geometry (GD5F1GQ5-class) */
@@ -435,11 +436,15 @@ static void bes_flash_exec(BesFlashState *s, uint32_t reg000)
                   "tx_len=%u rx_len=%u dual=%d\n",
                   cmd, addr, ext, tx_len, rx_len, bes_flash_dual(s));
 
-    /* SPI NAND die route: commands carrying addr==0x61 go to the NAND die */
-    if (addr == 0x61) {
-        bes_nand_exec(s, cmd, tx_len, rx_len);
-        return;
-    }
+/* SPI NAND die: NOT routed by REG_000 bits[31:8]. In extended-command
+ * mode (REG_004 NEW_CMD_EN) those bits are RX_EN|RX_LEN|TX_LINE|RX_LINE
+ * (reg_norflaship_v2.h:139-148), not an address -- e.g. the NOR RC
+ * calibration issues 0x9F with reg000=0x619f (RX_EN|rx_len=3), which a
+ * naive addr==0x61 check would misroute to NAND. Real NAND traffic has
+ * never been observed on this controller yet (NAND probe never runs this
+ * early); the route is reinstated once the actual chip-select scheme is
+ * identified from real command traffic. */
+    (void)bes_nand_exec;
 
     switch (cmd) {
     case FLASH_CMD_ID: {

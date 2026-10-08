@@ -261,7 +261,7 @@ static void bes_pmu_reset(DeviceState *dev)
     /* GPADC 通道默认码（初值待换算校准，目标是 vbat 通道 4
      * 换算后 ≥3.6VµV，见 PWONV sub_C20AEAC 关机阈值 3600000） */
     for (i = 0; i < 8; i++) {
-        s->gpadc[i] = 0x800;
+        s->gpadc[i] = 0xFFF;
     }
 }
 
