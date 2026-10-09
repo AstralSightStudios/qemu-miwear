@@ -27,6 +27,12 @@
  *    (no SDK constant; watch for firmware branches on it).
  *  - BOOTMODE @0x38: cold boot = 0 (hal_bootmode.c:32-36 bits are
  *    watchdog/global/rtc/charger reset flags, none set on cold boot).
+ *  - MCU_VTOR @0x78: bits [31:7] are the vector table the MCU core boots
+ *    from (INITSVTOR); the firmware stores SCB->VTOR there with bits
+ *    [6:0] preserved (RAM routine called from startup sub_C0C1B08 via
+ *    sub_C0C22B0).  That table's reset vector is the context-restore
+ *    routine, which is how the core resumes after PSC power gating
+ *    (bes_psc.c).  Reset value 0 = the boot ROM vectors at 0.
  *
  * Everything else: plain RW storage (RAM semantics).
  *
@@ -35,8 +41,10 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qapi/error.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/misc/bes_aoncmu.h"
+#include "target/arm/arm-powerctl.h"
 
 #define AONCMU_NREGS  (0x200 / 4)   /* cover through CAP_CLK_CFG @0x108 */
 
@@ -62,6 +70,19 @@ static const BesSetClrPair aoncmu_setclr[] = {
 #define AONCMU_OFF_MEMSC0       0x24
 #define AONCMU_OFF_MEMSC_STATUS 0x34
 #define AONCMU_OFF_GBL_RESET_PULSE 0xC4
+#define AONCMU_OFF_MCU_VTOR     0x78
+#define AONCMU_MCU_VTOR_MASK    0xFFFFFF80
+#define AONCMU_MCU_CPUID        0
+
+static void aoncmu_set_mcu_vtor(uint32_t vtor)
+{
+    Object *cpuobj = OBJECT(arm_get_cpu_by_id(AONCMU_MCU_CPUID));
+
+    if (cpuobj && object_property_find(cpuobj, "init-svtor")) {
+        object_property_set_uint(cpuobj, "init-svtor",
+                                 vtor & AONCMU_MCU_VTOR_MASK, &error_abort);
+    }
+}
 
 static const BesSetClrPair *aoncmu_find_pair(hwaddr offset, bool *is_set)
 {
@@ -151,6 +172,9 @@ static void bes_aoncmu_write(void *opaque, hwaddr offset, uint64_t value,
     if (idx < AONCMU_NREGS) {
         s->regs[idx] = value;
     }
+    if (offset == AONCMU_OFF_MCU_VTOR) {
+        aoncmu_set_mcu_vtor(value);
+    }
 }
 
 static const MemoryRegionOps bes_aoncmu_ops = {
@@ -179,6 +203,7 @@ static void bes_aoncmu_reset(DeviceState *dev)
     memset(s->setclr_state, 0, sizeof(s->setclr_state));
     s->regs[0x38 >> 2] = bootmode;
     s->regs[0xF8 >> 2] = sw_info;
+    aoncmu_set_mcu_vtor(0);
 
     /* 冷启动时所有 RAM bank 已供电：MEMSC[i]=1（hal_memsc.c:63-70
      * hal_memsc_aon_lock 等待非零即"已上电"，真机硬件默认上电）。

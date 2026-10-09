@@ -33,6 +33,7 @@
 #include "hw/misc/bes_dma.h"
 #include "hw/misc/bes_btss.h"
 #include "hw/misc/bes_gpio.h"
+#include "hw/misc/bes_psc.h"
 #include "hw/input/zinitix_ts.h"
 #include "hw/misc/vsi_vglite.h"
 #include "system/address-spaces.h"
@@ -99,6 +100,9 @@
 #define BEST1503_GPIO1_BASE       0x40089000
 #define BEST1503_GPIO2_BASE       0x4008A000
 #define BEST1503_PSC_GPIO_IRQ     0x40085080
+/* PSC（电源时序控制器；固件 hal_psc_* sub_C0C1970 等以此为基址）：
+ * MCU 掉电/唤醒见 bes_psc.c；+0x80 起的 GPIO 中断块由 bes_gpio 覆盖映射 */
+#define BEST1503_PSC_BASE         0x40085000
 #define BEST1503_GPIO_IRQ         44
 /* LCDC：NVIC 67（sub_C231DE4）；面板 TE 接 GPIO 47（板级：固件
  * LCD TE 引脚配置 sub_C0E3DF0 返回 47，经 sub_C232740 配成边沿中断）；
@@ -503,6 +507,13 @@ static void best1503_init(MachineState *machine)
         DeviceState *aoncmu = qdev_new(TYPE_BES_AONCMU);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(aoncmu), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(aoncmu), 0, BEST1503_AON_CMU_BASE);
+    }
+
+    /* PSC @0x40085000：优先级低于 bes_gpio 的 PSC GPIO 中断子块 */
+    {
+        DeviceState *psc = qdev_new(TYPE_BES_PSC);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(psc), &error_fatal);
+        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(psc), 0, BEST1503_PSC_BASE, -1);
     }
 
     /* PMU（模拟电源管理芯片）ISPI 窗口 @0x40009000：

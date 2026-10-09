@@ -223,6 +223,9 @@ config BES_BTSS
 config BES_GPIO
     bool
 
+config BES_PSC
+    bool
+
 config VSI_VGLITE
     bool
 
