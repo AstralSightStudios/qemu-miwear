@@ -97,6 +97,11 @@
 #define BEST1503_PSRAM_BASE      0x3C000000
 #define BEST1503_PSRAM_NC_BASE   0x38000000
 #define BEST1503_PSRAM_SIZE      0x02000000
+/* PSRAM 执行别名（同 flash 0x2C→0x0C、SRAM 0x20→0x00 的成对窗口）：
+ * startup sub_C0C0AC8 把代码段复制到 0x3C000000（0x80500 字节），
+ * 固件经 veneer 跳 0x1C000000+off 执行（如 sub_C588C30 → 0x1C058FAD）。
+ * 缺失时取指落空滑行进 SRAM 向量表 → NOCP UsageFault → pmu_shutdown。 */
+#define BEST1503_PSRAMX_BASE     0x1C000000
 
 #define BEST1503_UART0_IRQ       17
 #define BEST1503_UART1_IRQ       18
@@ -232,7 +237,7 @@ static void best1503_init(MachineState *machine)
 {
     MemoryRegion *sysmem = get_system_memory();
     static MemoryRegion flash, flash_cached, flash_nc, flash_xnc, sram, ramx;
-    static MemoryRegion psram, psram_nc;
+    static MemoryRegion psram, psram_nc, psramx;
     Clock *sysclk;
     Error *err = NULL;
     DeviceState *armv7m;
@@ -351,6 +356,9 @@ static void best1503_init(MachineState *machine)
                              &psram, 0, BEST1503_PSRAM_SIZE);
     memory_region_add_subregion(sysmem, BEST1503_PSRAM_NC_BASE,
                                 &psram_nc);
+    memory_region_init_alias(&psramx, NULL, "best1503.psramx",
+                             &psram, 0, BEST1503_PSRAM_SIZE);
+    memory_region_add_subregion(sysmem, BEST1503_PSRAMX_BASE, &psramx);
 
     /* ---- BT 子系统共享 RAM（BT 核本体不模拟，只挂存储） ----
      * SDK plat_addr_map_best1503.h:303-306：

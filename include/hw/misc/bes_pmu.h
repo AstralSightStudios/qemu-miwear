@@ -17,8 +17,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(BesPmuState, BES_PMU)
  * pmu read/write sub_C0E3EDC / sub_C0E3F8C) */
 #define BES_ISPI_DEVS           16
 #define BES_ISPI_PAGES          6
-#define BES_ISPI_DEV_PMU        0
-#define BES_ISPI_DEV_GPADC      3
+/* PMU (incl. GPADC and WDT): pmu_shutdown sub_C0E7FA0 / its WDT fallback
+ * sub_C0E7C00 program 0x3036/0x3037, hal_gpadc uses 0x3050/0x3056+ch */
+#define BES_ISPI_DEV_PMU        3
 
 /* PMU indirect register offsets (page 0), SDK reg_pmu_best1503.h */
 #define BES_PMU_REG_CHIP_ID     0x00    /* read-only chip id field */

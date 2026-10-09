@@ -29,9 +29,10 @@
  *     word is pending, BSY clear (transfers complete instantly)
  *   - SSPDR write executes one command word; read pops the RX word
  *   - per-device paged 16-bit register files
- *   - PMU (device 0): chip id at offset 0; WDT (0x36 period in ms, 0x37
- *     WDT_EN|WDT_RESET_EN) resets the system when it expires unfed
- *   - GPADC (device 3, hal_gpadc sub_C22EE84 / sub_C22EF38): 0x50 is the
+ *   - PMU (device 3): chip id at offset 0; WDT (0x36 period in ms, 0x37
+ *     WDT_EN|WDT_RESET_EN, programmed by pmu_shutdown's fallback
+ *     sub_C0E7C00) resets the system when it expires unfed
+ *   - GPADC (PMU page 0, hal_gpadc sub_C22EE84 / sub_C22EF38): 0x50 is the
  *     conversion-done bitmap, 0x51 its clear, 0x56 + ch the channel code.
  *     Conversions complete instantly. The code is produced from the
  *     channel's input voltage with the converter's typical transfer
@@ -113,9 +114,9 @@ static void bes_pmu_exec(BesPmuState *s, uint32_t cmd)
         /* read command: produce the RX word */
         if (dev == BES_ISPI_DEV_PMU && off == BES_PMU_REG_CHIP_ID) {
             val = BES_PMU_CHIP_ID_VAL;
-        } else if (dev == BES_ISPI_DEV_GPADC && page == 0 && off == 0x50) {
+        } else if (dev == BES_ISPI_DEV_PMU && page == 0 && off == 0x50) {
             val = 0xFF;     /* every channel has a finished conversion */
-        } else if (dev == BES_ISPI_DEV_GPADC && page == 0 &&
+        } else if (dev == BES_ISPI_DEV_PMU && page == 0 &&
                    off >= 0x56 && off <= 0x5D) {
             val = bes_gpadc_code(s->gpadc_mv[off - 0x56]);
         } else {
