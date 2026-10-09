@@ -208,9 +208,11 @@
 #define BEST1503_SYSCLK_FRQ      208000000ULL
 #define BEST1503_SLOW_TIMER_FRQ  16000
 #define BEST1503_FAST_TIMER_FRQ  6500000
-/* AON_TIMER0：AON 域 slow 档 32K（hal_cmu.h:71 HAL_CMU_FREQ_32K；
- * 晶振精度 32768/32000 待实测校准，不影响延时推进） */
-#define BEST1503_AON_TIMER_FRQ   32768
+/* AON_TIMER0：32.768K 晶振二分频 = 16384Hz。固件 NuttX 时基按此换算：
+ * bes_freerun.c（sub_C19D454 起）µs = ticks * 1000000 >> 14，
+ * bes_oneshot.c（sub_C19D25C）余量 / 16384000000。按 32768 计数时
+ * 系统时间走 2 倍速（实测墙钟 30s、uptime 走 62s）。 */
+#define BEST1503_AON_TIMER_FRQ   16384
 
 /* best1503.h:215 __NVIC_PRIO_BITS=3；:145 USER_IRQn_QTY=78 → 取整 80 */
 #define BEST1503_NUM_IRQ         80
