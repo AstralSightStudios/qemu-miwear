@@ -184,15 +184,22 @@ AONCMU/CMU 魔术值 → UART（console, qemu chardev 直通终端）→ TIMER/S
 - [x] SDK MMIO 布局初步分析
 - [x] QEMU 编译环境搭建（msys2 + v11.1.2，configure 通过）
 - [x] best1503 machine 骨架（hw/arm/best1503.c + Kconfig/meson 注册）
-- [ ] QEMU 编译通过（make 进行中）
-- [ ] machine 冒烟测试（启动固件，看 unimp 日志轨迹）
-- [ ] boot 到 NuttX shell（UART console 输出）
-- [ ] 显示链路（QSPI 命令流 → framebuffer → 窗口渲染）
-- [ ] 触摸注入（I2C 总线级模拟）
+- [x] QEMU 编译通过（macOS / Homebrew）
+- [x] machine 冒烟测试（启动固件，看 unimp 日志轨迹）
+- [x] boot 到 miwear 应用（NuttX 全部服务起来，LVGL UI 主循环运行）
+- [x] 显示链路（LCDC 帧路径 + TE + VGLite GPU 光栅化 → QEMU 图形控制台；开机向导"选择语言"页可见）
+- [ ] 触摸注入（I2C 总线级模拟，真机为 Zinitix ZTW662：chip id 0xE623 / HW id 0x4702 / fw 0x9.0x0.0x12）
 - [ ] 快应用环境验证
 
 ## 7. 最新变更
 
+- **2026-10-09 (2)（显示链路打通 + GPU 光栅化，commits c12a95ed1b..43b4d96717）**：
+  ㉗**GPIO v2 + PSC GPIO 中断（bes_gpio）、LCDC 帧路径与 TE、VGLite 前端**（c12a95ed1b）：见各文件头注释。TE = LCDC "te" 输出 → GPIO 47，60Hz。
+  ㉘**LCDC 帧完成必须带传输完成状态位**（a3317ce06a）：fb 驱动帧完成路径 sub_C2263C0 要求 ISR 同时有帧结束位（bit21，另一接口模式 bit22，sub_C232294）和一个完成状态位（bit31/27 sub_C2322AC 或 bit30/26 sub_C2322B8），bit29/25/16 视为配置错误（sub_C2322C4）。只给 bit21 时驱动的 tx-busy 标志（dword_200FE148）不清 → dpm 线程（sub_C224ECC）永远停在"发送中"(state 3)、pan 队列不出队 → miwear_fbdev 的 FBIO_WAITFORVSYNC 永远阻塞 → 整个 UI 只出 1 帧。现在帧完成置 bit21|bit27（哪个完成位对应哪个输出通路固件里看不出，选 bit27 已注明）。
+  ㉙**日志**：log_service 启动后 syslog 不再走 uart2，而是进 PSRAM 中的 RAM 环形缓冲。`emu/ramlog.py <qmp端口>` 经 QMP pmemsave 抓 PSRAM 并提取最长日志簇（找到完整开机日志）。
+  ㉚**VGLite 光栅化（vsi_vglite）**（43b4d96717）：GPU = GCNanoUltraV（0x265），状态语义来自 LVGL 9 内置的 VGLite 4.x 用户态驱动（vg_lite.c / vg_lite_path.c / vg_lite_image.c，MIT），并用固件实际命令流核对：屏幕渲染目标 = SRAM 0x20000000 BGR888 336x480（stride 寄存器为 stride/3*4），字形为 S16 轮廓、矩阵缩放 1/256，圆角卡片为 FP32 路径；颜色 0x0A02 为 ABGR8888（LVGL 传入时已预乘）。实现：矩形 clear/blit（坐标生成器含透视、最近邻/双线性、border/pad/repeat/reflect、normal/multiply/stencil/recolor、CLUT 索引格式），路径填充（s8/s16/s32/fp32、二次/三次曲线展平、非零/奇偶规则、4 子扫描线精确水平覆盖率抗锯齿），pattern 绘制，预乘空间混合（全部 VGLite blend）写入所有 8/16/24/32 位目标格式。效果：开机向导"选择语言"页（简体中文/繁體中文/English）正确显示。
+    预乘约定：0x0A00 bit28 时 PE 对输入色乘 alpha（与驱动变量名 in_premult 及 LVGL ThorVG 参考模拟器行为一致），0x0A25 bit24 对纹素预乘，输出按预乘存储（LVGL 把 GPU 画的 layer 标为预乘）。
+  ㉛**其他观察**：①`**crash:1` 只表示 /data/offlinelog/ 下存在 crash* 文件（之前 miwear 软看门狗 panic 留下的），两个分支都会走到 boot-screen_up-end，UI 不是卡死而是静态页面无重绘；②NFC eSE（alipay ese_read_kv）超时使 UI 初始化停约 42 秒（00:00:09→00:00:51），待建模 NFC 或忽略；③触摸：真机为 Zinitix（zinitix_*、ztw662），模拟器里 Hynitron 探测失败、Zinitix 驱动在通用 I2C 从机上"成功"（chipid 0x1），需要真正的 ZTW662 模型。
 - **2026-10-09（macOS 迁移 + NAND/DMA/PMU/PSRAMX/BT 子系统，commits 514b95ade1..d3ef54e19f）**：
   环境：macOS（Apple M4）+ Homebrew；`configure --target-list=arm-softmmu --disable-werror --enable-debug-info --disable-docs --disable-gtk --disable-vte --disable-gcrypt`（/usr/local 下有 x86_64 的 gtk/gcrypt 会被 pkg-config 误选导致链接失败）。运行脚本 `emu/run.sh <outdir> <秒> [qemu 参数]`（须在仓库根目录跑，机器里的相对路径 emu/nand.img）。调试辅助：`emu/hmp.py <qmp端口> <HMP命令>…`（配合 `-qmp tcp:127.0.0.1:端口,server,nowait`），`emu/sample_pc.py`。macOS 无 `timeout` 命令。
   **Apple Hypervisor 不可用**：HVF 只能跑 AArch64(EL1) 客户机，Cortex-M33 是 ARMv8-M（Thumb-only，M-profile 异常模型），Apple Silicon 不执行 AArch32/Thumb，只能 TCG。
