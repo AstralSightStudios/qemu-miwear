@@ -15,7 +15,7 @@
  *      HRESET/PRESET/ORESET SET/CLR   0x34/0x38, 0x3C/0x40, 0x44/0x48
  *      SYS_CLK_ENABLE/DISABLE         0x60/0x64
  *      CP2MCU_IRQ_SET/CLR             0x98/0x9C
- *      ISIRQ_SET/CLR                  0xA0/0xA4
+ *      ISIRQ_SET/CLR                  0xA0/0xA4 (mailbox, see below)
  *      MCU2CP_IRQ_SET/CLR             0xB8/0xBC
  *      DSI_CLK_ENABLE/DISABLE         0x100/0x104
  *      MCU2SENS_IRQ_SET/CLR           0x128/0x12C
@@ -25,6 +25,19 @@
  *    write-triggered pulse, self-clearing (read back 0).
  *  - BOOTMODE @0x50: cold boot = 0 (hal_bootmode.c reset-reason flags,
  *    none set on cold boot).
+ *
+ * ISIRQ (MCU <-> BT mailbox), bit layout from BES reg_cmu
+ * (best2003 SDK reg_0a0/reg_0a4, matching every best1503 firmware use):
+ *    0/1  BT2MCU_DATA(1)_DONE      2/3  MCU2BT_DATA(1)_IND (doorbell)
+ *   13/14 BT2MCU_DATA(1)_MSK      15/16 MCU2BT_DATA(1)_MSK
+ *   17/18 BT2MCU_DATA(1)_INTR     19/20 MCU2BT_DATA(1)_INTR  (raw)
+ *   21-24 the same four, masked -> NVIC 34/35 (RX) and 32/33 (TX done)
+ * Firmware use: hal_intersys_open sets both masks and clears bits 0/2;
+ * send sets IND; the TX-done handler (bit 23) acks with CLR bit 0; the RX
+ * handler (bit 21) masks with CLR bit 13, consumes, then reports done to
+ * the BT side and unmasks with SET bit 13. The BT side (bes.btss) drops
+ * IND and raises MCU2BT_DATA_INTR when it has taken the data, and drives
+ * BT2MCU_DATA_INTR while it has data published for the MCU.
  *
  * Everything else: plain RW storage (RAM semantics).
  *
@@ -61,6 +74,99 @@ static const BesSetClrPair cmu_setclr[] = {
 };
 
 #define CMU_OFF_MEMSC0        0xC0
+#define CMU_OFF_ISIRQ_SET     0xA0
+#define CMU_OFF_ISIRQ_CLR     0xA4
+
+#define ISIRQ_IND(ch)         (1u << (2 + (ch)))
+#define ISIRQ_DONE_CLR(ch)    (1u << (ch))
+#define ISIRQ_B2M_MSK(ch)     (1u << (13 + (ch)))
+#define ISIRQ_M2B_MSK(ch)     (1u << (15 + (ch)))
+#define ISIRQ_B2M_INTR(ch)    (1u << (17 + (ch)))
+#define ISIRQ_M2B_INTR(ch)    (1u << (19 + (ch)))
+#define ISIRQ_MANAGED         (0x3u << 2 | 0xFu << 13 | 0xFFu << 17)
+#define ISIRQ_MANAGED_IF(off) \
+    (((off) == CMU_OFF_ISIRQ_SET) ? ISIRQ_MANAGED : 0)
+
+static uint32_t cmu_isirq_value(BesCmuState *s)
+{
+    uint32_t v = s->isirq_ind | s->isirq_mask | s->isirq_raw;
+    int ch;
+
+    for (ch = 0; ch < 2; ch++) {
+        if ((s->isirq_raw & ISIRQ_B2M_INTR(ch)) &&
+            (s->isirq_mask & ISIRQ_B2M_MSK(ch))) {
+            v |= 1u << (21 + ch);
+        }
+        if ((s->isirq_raw & ISIRQ_M2B_INTR(ch)) &&
+            (s->isirq_mask & ISIRQ_M2B_MSK(ch))) {
+            v |= 1u << (23 + ch);
+        }
+    }
+    return v;
+}
+
+static void cmu_isirq_update(BesCmuState *s)
+{
+    uint32_t v = cmu_isirq_value(s);
+    int ch;
+
+    for (ch = 0; ch < 2; ch++) {
+        qemu_set_irq(s->intersys_irq[ch], (v >> (23 + ch)) & 1);
+        qemu_set_irq(s->intersys_irq[2 + ch], (v >> (21 + ch)) & 1);
+    }
+}
+
+/* BT side took the MCU2BT data of channel ch */
+static void cmu_bt_ind_ack(void *opaque, int ch, int level)
+{
+    BesCmuState *s = BES_CMU(opaque);
+
+    if (level) {
+        s->isirq_ind &= ~ISIRQ_IND(ch);
+        s->isirq_raw |= ISIRQ_M2B_INTR(ch);
+        cmu_isirq_update(s);
+    }
+}
+
+/* BT side has data published for the MCU on channel ch (level) */
+static void cmu_bt2mcu(void *opaque, int ch, int level)
+{
+    BesCmuState *s = BES_CMU(opaque);
+
+    if (level) {
+        s->isirq_raw |= ISIRQ_B2M_INTR(ch);
+    } else {
+        s->isirq_raw &= ~ISIRQ_B2M_INTR(ch);
+    }
+    cmu_isirq_update(s);
+}
+
+static void cmu_isirq_write(BesCmuState *s, bool set, uint32_t value)
+{
+    uint32_t newly;
+    int ch;
+
+    if (set) {
+        newly = value & ~s->isirq_ind & (ISIRQ_IND(0) | ISIRQ_IND(1));
+        s->isirq_ind |= value & (ISIRQ_IND(0) | ISIRQ_IND(1));
+        s->isirq_mask |= value & (0xFu << 13);
+        cmu_isirq_update(s);
+        for (ch = 0; ch < 2; ch++) {
+            if (newly & ISIRQ_IND(ch)) {
+                qemu_irq_pulse(s->bt_doorbell[ch]);
+            }
+        }
+    } else {
+        for (ch = 0; ch < 2; ch++) {
+            if (value & ISIRQ_DONE_CLR(ch)) {
+                s->isirq_raw &= ~ISIRQ_M2B_INTR(ch);
+            }
+        }
+        s->isirq_ind &= ~(value & (ISIRQ_IND(0) | ISIRQ_IND(1)));
+        s->isirq_mask &= ~(value & (0xFu << 13));
+        cmu_isirq_update(s);
+    }
+}
 #define CMU_OFF_MEMSC_STATUS  0xD0
 
 static bool cmu_is_pulse(hwaddr offset)
@@ -120,18 +226,8 @@ static uint64_t bes_cmu_read(void *opaque, hwaddr offset, unsigned size)
         v = 0;   /* self-clearing pulse */
     } else if ((p = cmu_find_pair(offset, &is_set))) {
         v = s->setclr_state[p->state_idx];
-        if (offset == 0xA0) {
-            /* ISIRQ_SET bit3：BT 核活动指示。bt_drv_reg_op 各 API
-             * （固件 sub_C2316CC/DC 封装）的等待循环
-             * "do { if (bt_rsp_flag) break; ...超时→crash_dump+ASSERT(0)...
-             *      } while (ISIRQ_SET & 8);"
-             * bit3=1 时无限等待 BT 核响应；bit3=0 走"BT 不在线，
-             * 跳过等待"容错路径。本模拟器不实现 BT 协处理器
-             * （DESIGN.md：只关注 AP 核），真机上 BT 核从未启动时
-             * 该位同样为 0，故 bit3 恒报 0，其余位正常回读。
-             * 实测：bit3=1 时 nsh_main 在 bt_drv_reg_op_data_bakeup_init
-             * 等 BT 响应 3ms×10 超时 → ASSERT(0) → board_reset(2)。 */
-            v &= ~8u;
+        if (offset == CMU_OFF_ISIRQ_SET || offset == CMU_OFF_ISIRQ_CLR) {
+            v = (v & ~ISIRQ_MANAGED) | cmu_isirq_value(s);
         }
     } else if (idx < ARRAY_SIZE(s->regs)) {
         v = s->regs[idx];
@@ -161,48 +257,12 @@ static void bes_cmu_write(void *opaque, hwaddr offset, uint64_t value,
     }
     if ((p = cmu_find_pair(offset, &is_set))) {
         if (is_set) {
-            s->setclr_state[p->state_idx] |= value;
-            if (offset == 0xA0) {
-                /* ISIRQ_SET：intersys IPC 门铃（BT 核虚拟化）。
-                 * AP 侧 hal_intersys_tx 把消息挂上 SRAM 链表后写
-                 * bit2(ch0)/bit3(ch1) 叩铃；真机上 BT 核取走消息后
-                 * 置 TX-done 挂起 bit23/24 并触发 AP 侧 INTERSYS_TX
-                 * 中断（NVIC 32/33）。虚拟 BT 核瞬时取走：
-                 * 置挂起 + 拉中断线。AP 的 hal_intersys_tx_irq_handler
-                 * 再写 ISIRQ_CLR bit0/1 确认（下方映射清除）。
-                 * 实测依据：handler sub_C231034 检测 0xA0&0x800000、
-                 * 清 0xA4=1/2；TX 完成回调唤醒等待任务。
-                 * 注意：bit3 只虚拟 ch0 —— 本固件 bt_drv_reg_op 把
-                 * bit3 用作"等待 BT"自我标记（sub_C2316CC 写 8），
-                 * 若对 bit3 也虚拟 TX-done 会产生幽灵 IRQ33 挂起；
-                 * 且固件 intersys 只注册了通道 0（sub_C2293CC a1=0）。 */
-                if (value & 4) {
-                    s->setclr_state[p->state_idx] |= 0x800000u;
-                    qemu_irq_raise(s->intersys_irq[0]);
-                }
-            }
+            s->setclr_state[p->state_idx] |= value & ~ISIRQ_MANAGED_IF(offset);
         } else {
             s->setclr_state[p->state_idx] &= ~value;
-            if (offset == 0xA4) {
-                /* ISIRQ_CLR：handler 确认。bit0/1 -> TX 挂起 23/24；
-                 * bit13/14 -> RX 挂起 21/22（RX 方向预留） */
-                if (value & 1) {
-                    s->setclr_state[p->state_idx] &= ~0x800000u;
-                    qemu_irq_lower(s->intersys_irq[0]);
-                }
-                if (value & 2) {
-                    s->setclr_state[p->state_idx] &= ~0x1000000u;
-                    qemu_irq_lower(s->intersys_irq[1]);
-                }
-                if (value & 0x2000) {
-                    s->setclr_state[p->state_idx] &= ~0x200000u;
-                    qemu_irq_lower(s->intersys_irq[2]);
-                }
-                if (value & 0x4000) {
-                    s->setclr_state[p->state_idx] &= ~0x400000u;
-                    qemu_irq_lower(s->intersys_irq[3]);
-                }
-            }
+        }
+        if (offset == CMU_OFF_ISIRQ_SET || offset == CMU_OFF_ISIRQ_CLR) {
+            cmu_isirq_write(s, is_set, value);
         }
         return;
     }
@@ -228,6 +288,9 @@ static void bes_cmu_reset(DeviceState *dev)
 
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->setclr_state, 0, sizeof(s->setclr_state));
+    s->isirq_ind = 0;
+    s->isirq_mask = 0;
+    s->isirq_raw = 0;
 
     /* cold boot: all RAM banks powered, MEMSC[i] reads 1
      * (hal_memsc.c:31-38 hal_memsc_lock waits for non-zero;
@@ -245,6 +308,9 @@ static void bes_cmu_realize(DeviceState *dev, Error **errp)
                           "bes.cmu", 0x400);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
     qdev_init_gpio_out_named(dev, s->intersys_irq, "intersys-irq", 4);
+    qdev_init_gpio_out_named(dev, s->bt_doorbell, "bt-doorbell", 2);
+    qdev_init_gpio_in_named(dev, cmu_bt_ind_ack, "bt-ind-ack", 2);
+    qdev_init_gpio_in_named(dev, cmu_bt2mcu, "bt2mcu", 2);
 }
 
 static void bes_cmu_class_init(ObjectClass *klass, const void *data)

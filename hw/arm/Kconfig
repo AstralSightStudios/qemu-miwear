@@ -16,6 +16,7 @@ config BEST1503
     select BES_I2C
     select BES_LCDC
     select BES_DMA
+    select BES_BTSS
 
 config ARM_VIRT
     bool

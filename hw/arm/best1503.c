@@ -31,6 +31,7 @@
 #include "hw/misc/bes_i2c.h"
 #include "hw/misc/bes_lcdc.h"
 #include "hw/misc/bes_dma.h"
+#include "hw/misc/bes_btss.h"
 #include "system/address-spaces.h"
 #include "system/reset.h"
 #include "system/system.h"
@@ -79,6 +80,15 @@
 #define BEST1503_DMA0_IRQ         3
 #define BEST1503_DMA1_IRQ         4
 #define BEST1503_FLASH1_DMA_REQ   6
+/* BT 子系统（BT 核本体不模拟，bes.btss 扮演邮箱对端 + 空闲 HCI 控制器）：
+ *   BT_CMU 0xD0330000（SDK；固件 RX 完成写 +0x54，sub_C2315BC）
+ *   邮箱指针表 0xC0004000（固件 hal_intersys 表 0x2CCDACC0/0x2CCDACC8）
+ *   BT 交换内存 0xD0210000/64KB（SDK BT_EXCH_MEM；AP 实测不写） */
+#define BEST1503_BT_CMU_BASE      0xD0330000
+#define BEST1503_BT_RAM_BASE      0xC0000000
+#define BEST1503_BT_MBOX_TABLE    0xC0004000
+#define BEST1503_BT_EXCH_BASE     0xD0210000
+#define BEST1503_BT_EXCH_SIZE     0x10000
 /* PSRAM PHY：SDK plat_addr_map_best1503.h:284 候选值，经固件运行时行为
  * 证实（PHY 校准时序公式 0x60/0x64 在 48MHz 下逐位吻合，见 bes_psram.c） */
 #define BEST1503_PSRAM_PHY_BASE  0x40168000
@@ -373,10 +383,10 @@ static void best1503_init(MachineState *machine)
     static MemoryRegion bt_ram, bt_exch;
     memory_region_init_ram(&bt_ram, NULL, "best1503.bt_ram", 0x10000,
                            &error_fatal);
-    memory_region_add_subregion(sysmem, 0xC0000000, &bt_ram);
-    memory_region_init_ram(&bt_exch, NULL, "best1503.bt_exch", 0x10000,
-                           &error_fatal);
-    memory_region_add_subregion(sysmem, 0xD0210000, &bt_exch);
+    memory_region_add_subregion(sysmem, BEST1503_BT_RAM_BASE, &bt_ram);
+    memory_region_init_ram(&bt_exch, NULL, "best1503.bt_exch",
+                           BEST1503_BT_EXCH_SIZE, &error_fatal);
+    memory_region_add_subregion(sysmem, BEST1503_BT_EXCH_BASE, &bt_exch);
 
     /* ---- flash1：SPI NAND（resource romfs + yaffs /data） ---- */
     DeviceState *fc1 = qdev_new(TYPE_BES_FLASH);
@@ -557,6 +567,25 @@ static void best1503_init(MachineState *machine)
         for (i = 0; i < 4; i++) {
             qdev_connect_gpio_out_named(cmu, "intersys-irq", i,
                                         qdev_get_gpio_in(armv7m, 32 + i));
+        }
+
+        /* BT 子系统：CMU ISIRQ 邮箱的对端 */
+        DeviceState *btss = qdev_new(TYPE_BES_BTSS);
+
+        object_property_set_link(OBJECT(btss), "downstream", OBJECT(sysmem),
+                                 &error_fatal);
+        qdev_prop_set_uint32(btss, "shared-table", BEST1503_BT_MBOX_TABLE);
+        qdev_prop_set_uint32(btss, "exch-base", BEST1503_BT_EXCH_BASE);
+        qdev_prop_set_uint32(btss, "exch-size", BEST1503_BT_EXCH_SIZE);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(btss), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(btss), 0, BEST1503_BT_CMU_BASE);
+        for (i = 0; i < 2; i++) {
+            qdev_connect_gpio_out_named(cmu, "bt-doorbell", i,
+                qdev_get_gpio_in_named(btss, "doorbell", i));
+            qdev_connect_gpio_out_named(btss, "ind-ack", i,
+                qdev_get_gpio_in_named(cmu, "bt-ind-ack", i));
+            qdev_connect_gpio_out_named(btss, "bt2mcu", i,
+                qdev_get_gpio_in_named(cmu, "bt2mcu", i));
         }
     }
 }

@@ -19,10 +19,15 @@ struct BesCmuState {
 
     uint32_t regs[0x400 / 4];
     uint32_t setclr_state[16];  /* shared state words of set/clr pairs */
-    /* intersys IPC interrupt lines (virtual BT core doorbell/ack):
+    /* ISIRQ (MCU <-> BT mailbox) state, BES reg_cmu bit layout */
+    uint32_t isirq_ind;         /* MCU2BT_DATA_IND (bits 2/3) */
+    uint32_t isirq_mask;        /* BT2MCU / MCU2BT data masks (bits 13-16) */
+    uint32_t isirq_raw;         /* BT2MCU_DATA_INTR 17/18, MCU2BT 19/20 */
+    /* intersys IPC interrupt lines:
      *   [0] tx0 -> NVIC 32   [1] tx1 -> NVIC 33
      *   [2] rx0 -> NVIC 34   [3] rx1 -> NVIC 35 */
     qemu_irq intersys_irq[4];
+    qemu_irq bt_doorbell[2];    /* MCU2BT_DATA_IND rising -> BT side */
 };
 
 #endif

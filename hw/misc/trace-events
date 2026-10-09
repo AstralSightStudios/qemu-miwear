@@ -459,3 +459,8 @@ bes_dma_item_done(int chan, uint32_t next, int irq) "chan=%d next=0x%08x irq=%d"
 bes_ispi_read(unsigned dev, unsigned page, unsigned off, uint16_t val) "dev=%u page=%u off=0x%02x -> 0x%04x"
 bes_ispi_write(unsigned dev, unsigned page, unsigned off, uint16_t val) "dev=%u page=%u off=0x%02x = 0x%04x"
 bes_pmu_wdt_expired(void) "system reset"
+
+# bes_btss.c
+bes_btss_rx(int ch, uint8_t mbx, uint32_t len, uint8_t type) "ch%d mbx=%u len=%u h4=0x%02x"
+bes_btss_hci_cmd(int ch, uint16_t opcode, uint8_t plen) "ch%d opcode=0x%04x plen=%u"
+bes_btss_publish(int ch, unsigned n) "ch%d %u message(s) to MCU"
