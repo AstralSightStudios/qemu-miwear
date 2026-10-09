@@ -952,7 +952,17 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 - (void) handleMouseEvent:(NSEvent *)event button:(InputButton)button down:(bool)down
 {
     if (!isMouseGrabbed) {
-        return;
+        /*
+         * The tracking area only reports enter/exit while the window is
+         * key, so with an absolute device a press can arrive ungrabbed:
+         * the click that activated the window, or any click while the
+         * pointer entered before that.  There is nothing to capture in
+         * absolute mode, so grab and deliver it.
+         */
+        if (!isAbsoluteEnabled || !down) {
+            return;
+        }
+        [self grabMouse];
     }
 
     with_bql(^{
@@ -983,6 +993,12 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 
         qemu_input_event_sync();
     });
+}
+
+- (BOOL) acceptsFirstMouse:(NSEvent *)event
+{
+    /* with an absolute device, the activating click is a real click */
+    return isAbsoluteEnabled;
 }
 
 - (void) mouseExited:(NSEvent *)event
