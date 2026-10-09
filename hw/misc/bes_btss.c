@@ -3,8 +3,10 @@
  *
  * The AP firmware talks to the Bluetooth core through the inter-core
  * mailbox ("intersys"). The BT core itself is not emulated; this device
- * plays its side of the mailbox protocol and answers HCI traffic like an
- * idle controller, so the AP's Bluetooth host can initialise.
+ * plays its side of the mailbox protocol and answers HCI traffic like a
+ * dual-mode controller. The over-the-air side (inquiry, paging, links,
+ * pairing, ACL) is modelled by bes_btss_link.c against one peer
+ * controller whose host attaches through a chardev.
  *
  * Mailbox protocol (AP firmware hal_intersys: open sub_C231128, send
  * sub_C2314DC, TX irq sub_C231034, RX irq sub_C2315E4, RX done
@@ -43,12 +45,12 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/log.h"
-#include "qemu/cutils.h"
 #include "crypto/aes.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/core/qdev-properties-system.h"
 #include "system/address-spaces.h"
-#include "hw/misc/bes_btss.h"
+#include "bes_btss_int.h"
 #include "trace.h"
 
 #define BTCMU_OFF_MCU_DATA_DONE 0x54    /* AP: bit (2 << ch) = RX consumed */
@@ -59,12 +61,6 @@
 #define EXCH_DESC_OFF           0x0010
 #define EXCH_DESC_SIZE          20
 #define EXCH_DATA_OFF           0x0400
-
-#define H4_CMD                  0x01
-#define H4_ACL                  0x02
-#define H4_EVT                  0x04
-#define HCI_EVT_CMD_COMPLETE    0x0E
-#define HCI_EVT_CMD_STATUS      0x0F
 
 static uint32_t btss_ldl(BesBtssState *s, uint32_t addr)
 {
@@ -151,6 +147,20 @@ static void btss_publish_timer(void *opaque)
     }
 }
 
+unsigned btss_band_queue_free(BesBtssState *s)
+{
+    return BES_BTSS_QUEUE_LEN - s->chan[s->hci_ch].q_count;
+}
+
+bool btss_band_acl(BesBtssState *s, const uint8_t *pkt, unsigned len)
+{
+    if (!btss_band_queue_free(s)) {
+        return false;
+    }
+    btss_queue(s, s->hci_ch, pkt, len);
+    return true;
+}
+
 static void btss_rx_done(BesBtssState *s, int ch)
 {
     BesBtssChan *c = &s->chan[ch];
@@ -164,38 +174,49 @@ static void btss_rx_done(BesBtssState *s, int ch)
     btss_stl(s, s->exch_base + ch * EXCH_CHAN_SPAN + EXCH_HEAD_OFF, 0);
     qemu_set_irq(s->bt2mcu[ch], 0);
     btss_publish(s, ch);
+    if (ch == s->hci_ch) {
+        btss_link_band_drained(s);
+    }
 }
 
 /* ---- HCI controller ---- */
 
-static void hci_event(BesBtssState *s, int ch, uint8_t code,
-                      const uint8_t *params, unsigned plen)
+/* an event to the host of controller "side" */
+void btss_event(BesBtssState *s, int side, uint8_t code,
+                const uint8_t *params, unsigned plen)
 {
     uint8_t pkt[3 + 255];
 
+    plen = MIN(plen, 255u);
     pkt[0] = H4_EVT;
     pkt[1] = code;
     pkt[2] = plen;
     memcpy(pkt + 3, params, plen);
-    btss_queue(s, ch, pkt, 3 + plen);
+    trace_bes_btss_event(side, code, plen);
+    if (side == BTSS_BAND) {
+        btss_queue(s, s->hci_ch, pkt, 3 + plen);
+    } else {
+        btss_link_peer_send(s, pkt, 3 + plen);
+    }
 }
 
-static void hci_cmd_complete(BesBtssState *s, int ch, uint16_t opcode,
-                             const uint8_t *rp, unsigned rp_len)
+void btss_cmd_complete(BesBtssState *s, int side, uint16_t opcode,
+                       const uint8_t *rp, unsigned rp_len)
 {
     uint8_t p[3 + 252];
 
     p[0] = 1;                       /* Num_HCI_Command_Packets */
     stw_le_p(p + 1, opcode);
     memcpy(p + 3, rp, MIN(rp_len, 252u));
-    hci_event(s, ch, HCI_EVT_CMD_COMPLETE, p, 3 + MIN(rp_len, 252u));
+    btss_event(s, side, HCI_EVT_CMD_COMPLETE, p, 3 + MIN(rp_len, 252u));
 }
 
-static void hci_cmd_status(BesBtssState *s, int ch, uint16_t opcode)
+void btss_cmd_status(BesBtssState *s, int side, uint16_t opcode,
+                     uint8_t status)
 {
-    uint8_t p[4] = { 0x00, 1, opcode & 0xFF, opcode >> 8 };
+    uint8_t p[4] = { status, 1, opcode & 0xFF, opcode >> 8 };
 
-    hci_event(s, ch, HCI_EVT_CMD_STATUS, p, sizeof(p));
+    btss_event(s, side, HCI_EVT_CMD_STATUS, p, sizeof(p));
 }
 
 /* commands whose completion is reported by a later event */
@@ -332,14 +353,40 @@ static const struct {
     { 0x2075, 5 },      /* LE Enhanced Read Transmit Power Level */
 };
 
+/* LMP feature pages 0 and 2 (page 1 holds the host's features) */
 static const uint8_t hci_lmp_features[8] = {
     0xBF, 0xFE, 0xCF, 0xFE, 0xDB, 0xFF, 0x7B, 0x87
 };
+static const uint8_t hci_lmp_features_p2[8] = {
+    0x00, 0x03,                     /* Secure Connections (Controller), Ping */
+};
+
+void btss_lmp_features(BesBtssState *s, int side, unsigned page,
+                       uint8_t *out)
+{
+    BesBtssHost *h = &s->host[side];
+
+    memset(out, 0, 8);
+    switch (page) {
+    case 0:
+        memcpy(out, hci_lmp_features, 8);
+        break;
+    case 1:
+        out[0] = (h->ssp ? 0x01 : 0) | (h->le ? 0x02 : 0) |
+                 (h->sc ? 0x08 : 0);
+        break;
+    case 2:
+        memcpy(out, hci_lmp_features_p2, 8);
+        break;
+    }
+}
 
 /* fill the interpreted return values (rp[0] is the status) */
-static void hci_fill_return(BesBtssState *s, uint16_t opcode,
+static void hci_fill_return(BesBtssState *s, int side, uint16_t opcode,
                             const uint8_t *cmd, unsigned len, uint8_t *rp)
 {
+    BesBtssHost *h = &s->host[side];
+
     /* commands carrying a connection handle echo it first */
     switch (opcode) {
     case 0x0809: case 0x080C: case 0x080D: case 0x0C08: case 0x0C27:
@@ -364,16 +411,12 @@ static void hci_fill_return(BesBtssState *s, uint16_t opcode,
         memset(rp + 1, 0xFF, 64);
         break;
     case 0x1003:                    /* Read Local Supported Features */
-        memcpy(rp + 1, hci_lmp_features, 8);
+        btss_lmp_features(s, side, 0, rp + 1);
         break;
     case 0x1004:                    /* Read Local Extended Features */
         rp[1] = len > 4 ? cmd[4] : 0;
         rp[2] = 2;                  /* max page */
-        if (rp[1] == 0) {
-            memcpy(rp + 3, hci_lmp_features, 8);
-        } else if (rp[1] == 1) {
-            rp[3] = 0x0F;           /* SSP, LE, simultaneous, SC host */
-        }
+        btss_lmp_features(s, side, rp[1], rp + 3);
         break;
     case 0x1005:                    /* Read Buffer Size */
         stw_le_p(rp + 1, 1021);
@@ -381,20 +424,44 @@ static void hci_fill_return(BesBtssState *s, uint16_t opcode,
         stw_le_p(rp + 4, 8);
         stw_le_p(rp + 6, 4);
         break;
+    case 0x100A:                    /* Read Data Block Size */
+        /* the ACL buffers of Read Buffer Size, as blocks of one packet */
+        stw_le_p(rp + 1, 1021);
+        stw_le_p(rp + 3, 1021);
+        stw_le_p(rp + 5, 8);
+        break;
     case 0x1009:                    /* Read BD_ADDR */
-        memcpy(rp + 1, s->bdaddr, 6);
+        memcpy(rp + 1, h->bdaddr, 6);
         break;
     case 0x100C:                    /* Read Local Simple Pairing Options */
         rp[2] = 16;                 /* max encryption key size */
         break;
     case 0x0C14:                    /* Read Local Name */
-        pstrcpy((char *)rp + 1, 248, "BES Virtual Controller");
+        memcpy(rp + 1, h->name, 248);
         break;
     case 0x0C15:                    /* Read Connection Accept Timeout */
         stw_le_p(rp + 1, 0x1F40);
         break;
     case 0x0C17:                    /* Read Page Timeout */
-        stw_le_p(rp + 1, 0x2000);
+        stw_le_p(rp + 1, h->page_timeout);
+        break;
+    case 0x0C19:                    /* Read Scan Enable */
+        rp[1] = h->scan_enable;
+        break;
+    case 0x0C23:                    /* Read Class of Device */
+        memcpy(rp + 1, h->cod, 3);
+        break;
+    case 0x0C44:                    /* Read Inquiry Mode */
+        rp[1] = h->inquiry_mode;
+        break;
+    case 0x0C51:                    /* Read Extended Inquiry Response */
+        memcpy(rp + 1, h->eir, 241);
+        break;
+    case 0x0C55:                    /* Read Simple Pairing Mode */
+        rp[1] = h->ssp;
+        break;
+    case 0x0C79:                    /* Read Secure Connections Host Support */
+        rp[1] = h->sc;
         break;
     case 0x0C1B:                    /* Read Page Scan Activity */
     case 0x0C1D:                    /* Read Inquiry Scan Activity */
@@ -414,13 +481,13 @@ static void hci_fill_return(BesBtssState *s, uint16_t opcode,
         rp[4] = 0x9E;
         break;
     case 0x0C6C:                    /* Read LE Host Support */
-        rp[1] = 1;
+        rp[1] = h->le;
         break;
     case 0x0C7B:                    /* Read Authenticated Payload Timeout */
         stw_le_p(rp + 3, 3000);
         break;
-    case 0x0C7E:                    /* Read Extended Page Timeout */
-    case 0x0C80:                    /* Read Extended Inquiry Length */
+    case 0x1408:                    /* Read Encryption Key Size */
+        rp[3] = 16;
         break;
     case 0x2002:                    /* LE Read Buffer Size v1 */
     case 0x2060:                    /* LE Read Buffer Size v2 (no ISO) */
@@ -502,8 +569,9 @@ static void hci_fill_return(BesBtssState *s, uint16_t opcode,
     }
 }
 
-static void hci_command(BesBtssState *s, int ch, const uint8_t *cmd,
-                        unsigned len)
+/* one H4 command packet from the host of controller "side" */
+void btss_hci_command(BesBtssState *s, int side, const uint8_t *cmd,
+                      unsigned len)
 {
     uint16_t opcode;
     uint8_t rp[252];
@@ -514,10 +582,22 @@ static void hci_command(BesBtssState *s, int ch, const uint8_t *cmd,
         return;
     }
     opcode = lduw_le_p(cmd + 1);
-    trace_bes_btss_hci_cmd(ch, opcode, cmd[3]);
+    trace_bes_btss_hci_cmd(side, opcode, cmd[3]);
+    if (trace_event_get_state_backends(TRACE_BES_BTSS_HCI_PARAMS)) {
+        g_autofree char *hex = g_malloc0(2 * (len - 4) + 1);
+        unsigned k;
 
+        for (k = 4; k < len; k++) {
+            sprintf(hex + 2 * (k - 4), "%02x", cmd[k]);
+        }
+        trace_bes_btss_hci_params(opcode, hex);
+    }
+
+    if (btss_link_command(s, side, opcode, cmd + 4, len - 4)) {
+        return;
+    }
     if (hci_uses_cmd_status(opcode)) {
-        hci_cmd_status(s, ch, opcode);
+        btss_cmd_status(s, side, opcode, 0x00);
         return;
     }
     memset(rp, 0, sizeof(rp));
@@ -527,8 +607,8 @@ static void hci_command(BesBtssState *s, int ch, const uint8_t *cmd,
             break;
         }
     }
-    hci_fill_return(s, opcode, cmd, len, rp);
-    hci_cmd_complete(s, ch, opcode, rp, n);
+    hci_fill_return(s, side, opcode, cmd, len, rp);
+    btss_cmd_complete(s, side, opcode, rp, n);
 }
 
 /* one MCU -> BT message */
@@ -542,10 +622,11 @@ static void btss_mcu_message(BesBtssState *s, int ch, uint8_t mbx,
     }
     switch (data[0]) {
     case H4_CMD:
-        hci_command(s, ch, data, len);
+        s->hci_ch = ch;
+        btss_hci_command(s, BTSS_BAND, data, len);
         break;
     case H4_ACL:
-        /* no links exist, so the host has nothing in flight */
+        btss_link_acl(s, BTSS_BAND, data, len);
         break;
     default:
         qemu_log_mask(LOG_UNIMP, "bes.btss: ch%d: H4 type 0x%02x "
@@ -629,6 +710,7 @@ static void bes_btss_reset(DeviceState *dev)
     memset(s->btcmu_regs, 0, sizeof(s->btcmu_regs));
     memset(s->chan, 0, sizeof(s->chan));
     timer_del(s->publish_timer);
+    btss_link_reset(s);
 }
 
 static void bes_btss_realize(DeviceState *dev, Error **errp)
@@ -646,12 +728,12 @@ static void bes_btss_realize(DeviceState *dev, Error **errp)
     address_space_init(&s->as, s->downstream, "bes.btss-as");
     s->publish_timer = timer_new_us(QEMU_CLOCK_VIRTUAL, btss_publish_timer,
                                     s);
+    btss_link_realize(s, errp);
 }
 
 static void bes_btss_init(Object *obj)
 {
     BesBtssState *s = BES_BTSS(obj);
-    static const uint8_t addr[6] = { 0x01, 0x03, 0x15, 0xEE, 0xFF, 0xC0 };
 
     memory_region_init_io(&s->btcmu, obj, &btss_btcmu_ops, s, "bes.bt-cmu",
                           0x400);
@@ -662,7 +744,6 @@ static void bes_btss_init(Object *obj)
                              BES_BTSS_CHANNELS);
     qdev_init_gpio_out_named(DEVICE(obj), s->bt2mcu, "bt2mcu",
                              BES_BTSS_CHANNELS);
-    memcpy(s->bdaddr, addr, sizeof(addr));
 }
 
 static const Property bes_btss_props[] = {
@@ -672,6 +753,9 @@ static const Property bes_btss_props[] = {
     DEFINE_PROP_UINT32("exch-base", BesBtssState, exch_base, 0),
     DEFINE_PROP_UINT32("exch-size", BesBtssState, exch_size, 0),
     DEFINE_PROP_UINT32("latency-us", BesBtssState, latency_us, 1000),
+    DEFINE_PROP_STRING("bdaddr", BesBtssState, bdaddr_str[BTSS_BAND]),
+    DEFINE_PROP_STRING("peer-bdaddr", BesBtssState, bdaddr_str[BTSS_PEER]),
+    DEFINE_PROP_CHR("chardev", BesBtssState, radio),
 };
 
 static void bes_btss_class_init(ObjectClass *klass, const void *data)

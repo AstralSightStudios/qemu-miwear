@@ -4,6 +4,7 @@
 #   seconds = 0 runs until QEMU exits.
 #   GUI=1 opens the panel in a window (the mouse is the finger);
 #   otherwise the run is headless.
+#   BT_PORT=<port> listens there for the peer Bluetooth host (H4 HCI).
 # Must be run from the repository root (machine paths are relative).
 OUT=$1; SECS=$2; shift 2
 FW=${FW:-miwear.watch.p67tc_v3.101.043_full_a4ce8564}
@@ -12,9 +13,13 @@ if [ -n "$GUI" ]; then
 else
     DISPLAY_ARGS="-nographic"
 fi
+if [ -n "$BT_PORT" ]; then
+    BT_ARGS="-chardev socket,id=bt,host=127.0.0.1,port=$BT_PORT,server=on,wait=off"
+    BT_ARGS="$BT_ARGS -global driver=bes.btss,property=chardev,value=bt"
+fi
 mkdir -p "$OUT"
 build/qemu-system-arm -M best1503 -kernel "$FW/vela_ap.bin" \
-    $DISPLAY_ARGS -monitor none \
+    $DISPLAY_ARGS $BT_ARGS -monitor none \
     -serial file:"$OUT/uart0.log" -serial file:"$OUT/uart1.log" \
     -serial file:"$OUT/uart2.log" \
     -D "$OUT/qemu.log" "$@" > "$OUT/stdout.log" 2>&1 &

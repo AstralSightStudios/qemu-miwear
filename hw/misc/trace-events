@@ -462,8 +462,15 @@ bes_pmu_wdt_expired(void) "system reset"
 
 # bes_btss.c
 bes_btss_rx(int ch, uint8_t mbx, uint32_t len, uint8_t type) "ch%d mbx=%u len=%u h4=0x%02x"
-bes_btss_hci_cmd(int ch, uint16_t opcode, uint8_t plen) "ch%d opcode=0x%04x plen=%u"
+bes_btss_hci_cmd(int side, uint16_t opcode, uint8_t plen) "side%d opcode=0x%04x plen=%u"
+bes_btss_hci_params(uint16_t opcode, const char *hex) "opcode=0x%04x params=%s"
 bes_btss_publish(int ch, unsigned n) "ch%d %u message(s) to MCU"
+bes_btss_event(int side, uint8_t code, unsigned plen) "side%d event 0x%02x plen=%u"
+
+# bes_btss_link.c
+bes_btss_link(const char *what) "%s"
+bes_btss_acl(int side, uint16_t hf, unsigned len) "side%d handle/flags=0x%04x len=%u"
+bes_btss_auth(int initiator, uint8_t status) "initiator side%d status=0x%02x"
 
 # bes_lcdc.c
 bes_lcdc_panel_cmd(uint8_t instr, uint8_t dcs, uint32_t param) "instr=0x%02x dcs=0x%02x param=0x%08x"
