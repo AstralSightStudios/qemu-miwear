@@ -157,7 +157,7 @@ bool bes_image_load(BesImage *img, const char *path, Error **errp)
     if (!(img->msplim < img->msp &&
           img->data_start < img->data_end &&
           img->data_end == img->bss_start &&
-          img->bss_start < img->bss_end)) {
+          img->bss_start <= img->bss_end)) {   /* bss 可为空（==） */
         error_setg(errp, "%s: RAM layout validation failed", path);
         goto fail;
     }

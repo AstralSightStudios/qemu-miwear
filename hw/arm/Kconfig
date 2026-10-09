@@ -22,6 +22,30 @@ config BEST1503
     select ZINITIX_TS
     select VSI_VGLITE
 
+config BEST1700
+    bool
+    default y
+    depends on TCG && ARM
+    select ARM_V7M
+    select UNIMP
+    select PL011
+    select ARM_TIMER
+    select BES_IMAGE
+    select BES_STUB
+    select BES_AONCMU
+    select BES_FLASH
+    select BES_PSRAM
+    select BES_CMU
+    select BES_PMU
+    select BES_I2C
+    select BES_LCDC
+    select BES_DMA
+    select BES_BTSS
+    select BES_GPIO
+    select BES_PSC
+    select ZINITIX_TS
+    select VSI_VGLITE
+
 config ARM_VIRT
     bool
     default y
