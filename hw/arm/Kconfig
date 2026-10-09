@@ -18,6 +18,7 @@ config BEST1503
     select BES_DMA
     select BES_BTSS
     select BES_GPIO
+    select ZINITIX_TS
     select VSI_VGLITE
 
 config ARM_VIRT

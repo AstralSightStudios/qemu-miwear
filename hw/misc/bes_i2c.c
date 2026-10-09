@@ -14,17 +14,17 @@
  *          finally wait (STATUS & (TFE|ACT)) == TFE.
  *   read:  push DATA_CMD=READ(|STOP), wait RFNE, pop DATA_CMD.
  *
- * Modelled behaviour: transfers complete instantly.
- *   - WRITE bytes collect in the TX fifo; a STOP (or a following READ
- *     phase) flushes them to the slave as one write segment (first byte
- *     is the slave register pointer).
- *   - READ performs the restart-read: pending TX bytes go out as the
- *     register address, then one byte is clocked in per READ entry.
+ * Modelled behaviour: transfers complete instantly on a QEMU I2C bus
+ * ("i2c"); board devices are I2CSlave models attached to it.
+ *   - The first WRITE after idle / STOP / RESTART addresses TAR for a
+ *     send, the first READ for a receive (repeated start); each queued
+ *     byte is clocked immediately, STOP ends the transfer.
  *   - STATUS: TFE|TFNF always set, RFNE while RX data pending, ACT=0.
  *
- * Slaves: generic per-address 256-byte register files. Every 7-bit
- * address ACKs (the watch carries charger/fuel-gauge/touch/etc. on the
- * same bus; unanswered probes would stall boot in retry loops).
+ * Addresses no modelled device answers fall back to a generic 256-byte
+ * register file (first written byte = register pointer) so the many
+ * on-board chips without a model yet (sensors, charger, NFC, ...) keep
+ * their probe-and-retry loops from stalling boot.
  *
  * This code is licensed under the GPL version 2 or later.
  */
@@ -34,6 +34,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/irq.h"
+#include "hw/i2c/i2c.h"
 #include "hw/misc/bes_i2c.h"
 
 /* DATA_CMD bits */
@@ -87,7 +88,9 @@ struct BesI2cState {
     uint8_t rxfifo[I2C_FIFO_DEPTH];
     uint32_t rx_r, rx_w, rx_cnt;    /* ring: rx_cnt = unread bytes (0..8) */
 
-    bool started;       /* a write segment has addressed a slave */
+    I2CBus *bus;
+    enum { XFER_IDLE, XFER_SEND, XFER_RECV } xfer;
+    bool fallback;      /* no device answered: generic register file */
     BesI2cSlave slaves[128];
 };
 
@@ -119,7 +122,6 @@ static void bes_i2c_flush_tx(BesI2cState *s)
         sl->regs[sl->ptr++] = s->txfifo[i];
     }
     s->tx_cnt = 0;
-    s->started = true;
 }
 
 static uint8_t bes_i2c_slave_read(BesI2cState *s)
@@ -145,28 +147,64 @@ static void bes_i2c_update_irq(BesI2cState *s)
     qemu_set_irq(s->irq, !!(s->raw_int & s->int_mask));
 }
 
+static void bes_i2c_end(BesI2cState *s)
+{
+    if (s->xfer != XFER_IDLE) {
+        if (s->fallback) {
+            bes_i2c_flush_tx(s);
+        } else {
+            i2c_end_transfer(s->bus);
+        }
+    }
+    s->xfer = XFER_IDLE;
+}
+
+/* (re)start addressing TAR; an unanswered address uses the fallback */
+static void bes_i2c_start(BesI2cState *s, bool recv)
+{
+    uint8_t addr = s->tar & 0x7F;
+
+    if (s->xfer == XFER_IDLE) {
+        s->fallback = i2c_start_transfer(s->bus, addr, recv) != 0;
+    } else if (s->fallback) {
+        bes_i2c_flush_tx(s);
+    } else if (i2c_start_transfer(s->bus, addr, recv)) {
+        i2c_end_transfer(s->bus);
+        s->fallback = true;
+    }
+    s->xfer = recv ? XFER_RECV : XFER_SEND;
+}
+
 static void bes_i2c_data_cmd_write(BesI2cState *s, uint32_t val)
 {
     if (val & DCMD_READ) {
-        /* read phase: flush any pending register-address segment first */
-        bes_i2c_flush_tx(s);
+        uint8_t b;
+
+        if (s->xfer != XFER_RECV || (val & DCMD_RESTART)) {
+            bes_i2c_start(s, true);
+        }
+        b = s->fallback ? bes_i2c_slave_read(s) : i2c_recv(s->bus);
         if (s->rx_cnt < I2C_FIFO_DEPTH) {
-            s->rxfifo[s->rx_w] = bes_i2c_slave_read(s);
+            s->rxfifo[s->rx_w] = b;
             s->rx_w = (s->rx_w + 1) % I2C_FIFO_DEPTH;
             s->rx_cnt++;
         } else {
             s->raw_int |= INTR_RX_OVER;
         }
     } else {
-        if (s->tx_cnt < I2C_FIFO_DEPTH) {
+        if (s->xfer != XFER_SEND || (val & DCMD_RESTART)) {
+            bes_i2c_start(s, false);
+        }
+        if (!s->fallback) {
+            i2c_send(s->bus, DCMD_DATA(val));
+        } else if (s->tx_cnt < I2C_FIFO_DEPTH) {
             s->txfifo[s->tx_cnt++] = DCMD_DATA(val);
         } else {
             s->raw_int |= INTR_TX_OVER;
         }
     }
     if (val & DCMD_STOP) {
-        bes_i2c_flush_tx(s);
-        s->started = false;
+        bes_i2c_end(s);
         s->raw_int |= INTR_STOP_DET;
     }
 }
@@ -241,8 +279,8 @@ static void bes_i2c_write(void *opaque, hwaddr offset, uint64_t val,
     case 0x00: s->con = val; break;
     case 0x04:
         if (s->tar != (val & 0x3FF)) {
+            bes_i2c_end(s);
             s->tar = val & 0x3FF;
-            s->started = false;
         }
         break;
     case 0x08: s->sar = val; break;
@@ -256,9 +294,9 @@ static void bes_i2c_write(void *opaque, hwaddr offset, uint64_t val,
     case 0x6C:
         s->enable = val & 1;
         if (!s->enable) {
+            bes_i2c_end(s);
             s->tx_cnt = 0;
             s->rx_r = s->rx_w = s->rx_cnt = 0;
-            s->started = false;
         }
         break;
     default:
@@ -289,7 +327,8 @@ static void bes_i2c_reset(DeviceState *dev)
     memset(s->scl_cfg, 0, sizeof(s->scl_cfg));
     s->tx_cnt = 0;
     s->rx_r = s->rx_w = s->rx_cnt = 0;
-    s->started = false;
+    s->xfer = XFER_IDLE;
+    s->fallback = false;
     memset(s->slaves, 0, sizeof(s->slaves));
 }
 
@@ -300,6 +339,7 @@ static void bes_i2c_init(Object *obj)
     memory_region_init_io(&s->iomem, obj, &bes_i2c_ops, s, "bes.i2c", 0x1000);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
+    s->bus = i2c_init_bus(DEVICE(obj), "i2c");
 }
 
 static void bes_i2c_class_init(ObjectClass *klass, const void *data)

@@ -209,6 +209,7 @@ config BES_PMU
 
 config BES_I2C
     bool
+    select I2C
 
 config BES_LCDC
     bool

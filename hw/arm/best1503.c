@@ -33,6 +33,7 @@
 #include "hw/misc/bes_dma.h"
 #include "hw/misc/bes_btss.h"
 #include "hw/misc/bes_gpio.h"
+#include "hw/input/zinitix_ts.h"
 #include "hw/misc/vsi_vglite.h"
 #include "system/address-spaces.h"
 #include "system/reset.h"
@@ -105,6 +106,13 @@
 #define BEST1503_LCDC_BASE        0x40200000
 #define BEST1503_LCDC_IRQ         67
 #define BEST1503_LCD_TE_GPIO      47
+
+/* 触摸：Zinitix ZTW662（真机日志 chip id 0xE623）。bes_ts_zinitix_setup
+ * (sub_C3F84CC) 打开 I2C 总线 5；板级配置 0x2CD0605C = {I2C 地址 0x20,
+ * 400kHz, INT pinset 0x1004C (GPIO 76), RESET pinset 0x1404E (GPIO 78)}。 */
+#define BEST1503_TP_I2C_BUS       5
+#define BEST1503_TP_I2C_ADDR      0x20
+#define BEST1503_TP_INT_GPIO      76
 #define BEST1503_PANEL_W          336
 #define BEST1503_PANEL_H          480
 /* 2D GPU（VeriSilicon VGLite，GCNanoUltraV 类）：寄存器 0x40220000
@@ -270,6 +278,7 @@ static void best1503_bootvec_reset(void *opaque)
 static void best1503_init(MachineState *machine)
 {
     MemoryRegion *sysmem = get_system_memory();
+    I2CBus *i2c_bus[7];
     static MemoryRegion flash, flash_cached, flash_nc, flash_xnc, sram, ramx;
     static MemoryRegion psram, psram_nc, psramx;
     Clock *sysclk;
@@ -528,6 +537,7 @@ static void best1503_init(MachineState *machine)
             sysbus_mmio_map(SYS_BUS_DEVICE(i2c), 0, i2cs[i].base);
             sysbus_connect_irq(SYS_BUS_DEVICE(i2c), 0,
                                qdev_get_gpio_in(nvic, i2cs[i].irq));
+            i2c_bus[i] = I2C_BUS(qdev_get_child_bus(i2c, "i2c"));
         }
     }
 
@@ -554,6 +564,19 @@ static void best1503_init(MachineState *machine)
         qdev_connect_gpio_out_named(lcdc, "te", 0,
                                     qdev_get_gpio_in(gpio,
                                                      BEST1503_LCD_TE_GPIO));
+
+        {
+            I2CSlave *tp = i2c_slave_new(TYPE_ZINITIX_TS,
+                                         BEST1503_TP_I2C_ADDR);
+
+            qdev_prop_set_uint32(DEVICE(tp), "width", BEST1503_PANEL_W);
+            qdev_prop_set_uint32(DEVICE(tp), "height", BEST1503_PANEL_H);
+            i2c_slave_realize_and_unref(tp, i2c_bus[BEST1503_TP_I2C_BUS],
+                                        &error_fatal);
+            qdev_connect_gpio_out_named(DEVICE(tp), "irq", 0,
+                                        qdev_get_gpio_in(gpio,
+                                                    BEST1503_TP_INT_GPIO));
+        }
     }
 
     /* 2D GPU */
