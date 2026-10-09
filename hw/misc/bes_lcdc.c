@@ -9,6 +9,15 @@
  *     writing 0 (sub_C232218 / sub_C232280)
  *   - IRQ enable +0x1C0: frame done bit 21 (bit 22 in the other interface
  *     mode), bit 23 (sub_C232224 / sub_C232258)
+ *   - ISR decoding in the frame-done path (sub_C2263C0): frame end is
+ *     bit 21 (bit 22 in the other mode, sub_C232294); the frame only counts
+ *     as transferred (driver clears its tx-busy flag, retires the panned
+ *     buffer and unblocks FBIO_WAITFORVSYNC) when a completion status bit
+ *     is also set: bit 31 / 27 (sub_C2322AC) or bit 30 / 26 (sub_C2322B8).
+ *     Bits 29 / 25 / 16 are reported as configuration errors
+ *     (sub_C2322C4). Which completion bit belongs to which output path is
+ *     not visible in the firmware; the model reports bit 27 for the panel
+ *     transfer.
  *   - frame start: +0x224 bit0 (sub_C232364)
  *   - SPU command channel: command word at +0x284 = instr << 24 |
  *     dcs << 8 (QSPI panel framing, instr 0x02 write / 0x03 read),
@@ -61,6 +70,7 @@
 
 #define LCDC_ISR_SPU_DONE   (1u << 18)
 #define LCDC_ISR_FRAME_DONE (3u << 21)
+#define LCDC_ISR_XFER_DONE  (1u << 27)
 
 #define DCS_SLPIN           0x10
 #define DCS_SLPOUT          0x11
@@ -315,7 +325,8 @@ static void bes_lcdc_frame_done(void *opaque)
 
     s->frame_busy = false;
     s->regs[LCDC_FRAME_START / 4] &= ~1u;
-    s->regs[LCDC_IRQ_ISR / 4] |= done ? done : (1u << 21);
+    s->regs[LCDC_IRQ_ISR / 4] |= (done ? done : (1u << 21)) |
+                                 LCDC_ISR_XFER_DONE;
     bes_lcdc_update_irq(s);
 }
 
