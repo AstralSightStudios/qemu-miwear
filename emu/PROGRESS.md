@@ -188,11 +188,19 @@ AONCMU/CMU 魔术值 → UART（console, qemu chardev 直通终端）→ TIMER/S
 - [x] machine 冒烟测试（启动固件，看 unimp 日志轨迹）
 - [x] boot 到 miwear 应用（NuttX 全部服务起来，LVGL UI 主循环运行）
 - [x] 显示链路（LCDC 帧路径 + TE + VGLite GPU 光栅化 → QEMU 图形控制台；开机向导"选择语言"页可见）
-- [ ] 触摸注入（I2C 总线级模拟，真机为 Zinitix ZTW662：chip id 0xE623 / HW id 0x4702 / fw 0x9.0x0.0x12）
+- [x] 触摸注入（Zinitix ZTW662 I2C 模型，I2C5@0x20，INT=GPIO76；宿主鼠标=手指，emu/touch.py 脚本注入）
+- [ ] 越过配对（未绑定 → 一直停在开机向导；见 7. ㉞）
 - [ ] 快应用环境验证
 
 ## 7. 最新变更
 
+- **2026-10-09 (3)（触摸 + I2C 总线化，commits ba1b73bd2e..）**：
+  ㉜**bes_i2c 改为真正的 QEMU I2C 总线主控**：首字节（空闲/STOP/RESTART 之后）发起 start_send/start_recv，逐字节 i2c_send/i2c_recv，STOP 结束；只有无模型应答的地址才退回通用 256B 寄存器文件（板上大量未建模芯片：传感器、充电、NFC……）。
+  ㉝**Zinitix ZTW6xx 触摸（hw/input/zinitix_ts.c）**：全部来自固件 ztx/zinitix.c：16 位小端寄存器协议，2 字节无数据写 = 命令（0x0003 清中断）；上电序列 0xC000=1/读 0xCC00/命令 0xC004/0xC002=1/0xC001=1；识别 0xCC00 芯片号（驱动只接受 0xE623/0xE631）、0x09D3=9 后 0x09D2 读 12 字节其 [8..9]=硬件 ID、0x0012/0x0121/0x0013 固件版本；**0x012C 必须 = 0x55AA 且 0x0014 = 硬件 ID**，否则驱动 34 秒重刷触摸固件（ts_check_need_upgrade sub_C3F78AC）；**0x001C 必须 = 0x5A49**，否则 ESD 看门狗每 ~5s 复位触摸（sub_C3F815C）；报点 0x0080 读 10 字节 {status,finger_mask,ts,x,y,width,sub_status}，INT 低有效。数值按真机日志：chip 0xE623、HW 0x4702、fw 0x9/0x0/0x12。板级：bes_ts_zinitix_setup(sub_C3F84CC) 开 I2C5，配置 0x2CD0605C = {地址 0x20, 400kHz, INT pin 76, RESET pin 78}；电源 GPIO 52。宿主绝对坐标指针 → 面板坐标，左键=手指；QMP input-send-event 可脚本化（emu/touch.py tap/swipe）。
+    验证：点"English" → 配对引导页；点击/上滑 → 二维码页（關於/系統操作）→ 系統操作（重啟/關機/恢復原廠設定）→ 关机确认框，全部正确渲染与响应。
+  `GUI=1 emu/run.sh <out> 0` 打开 cocoa 窗口（鼠标即手指），秒数 0 = 不限时。
+  ㉞**当前阻塞：配对**。未绑定设备只会停在开机向导（persist.setup_wizard 未置位，日志反复 "setupwizard_status is unbound"）。真机靠手机 App 经 BLE 绑定；AT 命令走蓝牙 lcproto，不是 UART；生产版 uart2 无 NSH 交互；system_cipher 只是用户锁屏密码页，不是隐藏入口。可选路线：①实现足够的 BT 控制器/主机侧以完成绑定协议（工作量大）；②在 emu/mknand.py 里生成"已出厂配置"的 /data（需要 yaffs2 + 属性库写入器，属于预置用户数据而非改固件）；③继续找设备侧合法入口。
+  ㉟**NFC**：真机为 TMS NFC（NCI over I2C：CORE_RESET 20 00 01 00 → 60 00 01 01 ff / 40 00 01 00 ff …）。未建模时支付宝 eSE ese_read_kv 超时使 UI 初始化停约 42 秒，待建 NCI 控制器模型。
 - **2026-10-09 (2)（显示链路打通 + GPU 光栅化，commits c12a95ed1b..43b4d96717）**：
   ㉗**GPIO v2 + PSC GPIO 中断（bes_gpio）、LCDC 帧路径与 TE、VGLite 前端**（c12a95ed1b）：见各文件头注释。TE = LCDC "te" 输出 → GPIO 47，60Hz。
   ㉘**LCDC 帧完成必须带传输完成状态位**（a3317ce06a）：fb 驱动帧完成路径 sub_C2263C0 要求 ISR 同时有帧结束位（bit21，另一接口模式 bit22，sub_C232294）和一个完成状态位（bit31/27 sub_C2322AC 或 bit30/26 sub_C2322B8），bit29/25/16 视为配置错误（sub_C2322C4）。只给 bit21 时驱动的 tx-busy 标志（dword_200FE148）不清 → dpm 线程（sub_C224ECC）永远停在"发送中"(state 3)、pan 队列不出队 → miwear_fbdev 的 FBIO_WAITFORVSYNC 永远阻塞 → 整个 UI 只出 1 帧。现在帧完成置 bit21|bit27（哪个完成位对应哪个输出通路固件里看不出，选 bit27 已注明）。
