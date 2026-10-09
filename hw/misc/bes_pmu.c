@@ -17,17 +17,27 @@
  *   offset 0 read returns the chip id (0x1530, "1503" in bits[15:4]).
  * (SDK hal_analogif_best1503.c with PADDING_CYCLES=2.)
  *
+ * Analog register address (firmware pmu read/write sub_C0E3EDC /
+ * sub_C0E3F8C): dev[15:12] | page[11:8] | offset[7:0]. The device number
+ * is the ISPI chip select, SSPCR1[10:7] (sub_C0E4820), so every analog
+ * block on the bus (PMU, GPADC, ...) has its own register space; a write
+ * of 0xA000 | page << 4 to offset 0 selects the page of the current
+ * device.
+ *
  * Modelled behaviour:
  *   - SSPSR: TFE|TNF always set (TX always accepted), RNE while an RX
  *     word is pending, BSY clear (transfers complete instantly)
  *   - SSPDR write executes one command word; read pops the RX word
- *   - paged 16-bit register file (5 pages x 256)
- *   - GPADC: 0x3010 reads all-channels-valid, 0x3056+ch returns the
- *     per-channel code (conversion completes instantly)
- *   - WDT: writing offset 0x37 (page 0) with WDT_EN|WDT_RESET_EN
- *     (0x180) both set requests an immediate system reset. Real hardware
- *     resets within tens of microseconds (firmware's "pmu wdt reboot
- *     failed!" error path only runs when the reset does NOT happen).
+ *   - per-device paged 16-bit register files
+ *   - PMU (device 0): chip id at offset 0; WDT (0x36 period in ms, 0x37
+ *     WDT_EN|WDT_RESET_EN) resets the system when it expires unfed
+ *   - GPADC (device 3, hal_gpadc sub_C22EE84 / sub_C22EF38): 0x50 is the
+ *     conversion-done bitmap, 0x51 its clear, 0x56 + ch the channel code.
+ *     Conversions complete instantly. The code is produced from the
+ *     channel's input voltage with the converter's typical transfer
+ *     curve, the one hal_gpadc_adc2volt_calib (sub_C22EB5C) assumes for
+ *     an uncalibrated part: 800 mV -> 15968, 1050 mV -> 20816.
+ *     Board-level channel inputs are properties (gpadc-chN-mv).
  *
  * This code is licensed under the GPL version 2 or later.
  */
@@ -36,11 +46,9 @@
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include "hw/core/qdev-properties.h"
-#include "hw/core/cpu.h"
-#include "target/arm/cpu.h"
-#include "system/address-spaces.h"
 #include "hw/misc/bes_pmu.h"
 #include "system/runstate.h"
+#include "trace.h"
 
 /* PL022 SSPSR bits */
 #define SSP_SR_TFE      (1 << 0)    /* TX FIFO empty */
@@ -56,14 +64,15 @@
  * watchdog during normal boot; an instantaneous reset would loop). */
 static void bes_pmu_wdt_expire(void *opaque)
 {
-    qemu_log_mask(LOG_UNIMP, "bes.pmu: WDT expired, system reset\n");
+    trace_bes_pmu_wdt_expired();
     qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
 }
 
 static void bes_pmu_wdt_reload(BesPmuState *s)
 {
-    uint16_t cfg = s->regs[0][BES_PMU_REG_WDT_CFG];
-    uint16_t period_ms = s->regs[0][BES_PMU_REG_WDT_RESET_TIMER];
+    uint16_t cfg = s->regs[BES_ISPI_DEV_PMU][0][BES_PMU_REG_WDT_CFG];
+    uint16_t period_ms =
+        s->regs[BES_ISPI_DEV_PMU][0][BES_PMU_REG_WDT_RESET_TIMER];
 
     if ((cfg & 0x180) == 0x180 && period_ms) {
         timer_mod(s->wdt_timer,
@@ -71,72 +80,73 @@ static void bes_pmu_wdt_reload(BesPmuState *s)
     } else {
         timer_del(s->wdt_timer);
     }
-    /* 调试插装：shutdown 序列（周期 ≤2ms 的 WDT 武装）起点定位 */
-    if ((cfg & 0x180) == 0x180 && period_ms <= 2 && current_cpu) {
-        CPUARMState *env = &(ARM_CPU(current_cpu)->env);
-        uint32_t sp = env->regs[13];
-        uint32_t words[12] = {0};
-        int i;
+}
 
-        for (i = 0; i < 12; i++) {
-            uint32_t addr = sp + 4 * i;
-            if (address_space_read(&address_space_memory, addr,
-                                   MEMTXATTRS_UNSPECIFIED,
-                                   &words[i], 4) != MEMTX_OK) {
-                break;
-            }
-        }
-        qemu_log_mask(LOG_UNIMP,
-                      "bes.pmu: WDT arm period=%ums pc=0x%08x lr=0x%08x sp=0x%08x\n",
-                      period_ms, env->regs[15], env->regs[14], sp);
-        qemu_log_mask(LOG_UNIMP,
-                      "  stk: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
-                      words[0], words[1], words[2], words[3],
-                      words[4], words[5], words[6], words[7],
-                      words[8], words[9], words[10], words[11]);
-    }
+/* GPADC typical transfer curve (hal_gpadc_adc2volt_calib defaults) */
+#define GPADC_LV_MV     800
+#define GPADC_LV_CODE   15968
+#define GPADC_HV_MV     1050
+#define GPADC_HV_CODE   20816
+
+static uint16_t bes_gpadc_code(uint32_t mv)
+{
+    int64_t code = GPADC_LV_CODE +
+        ((int64_t)mv - GPADC_LV_MV) * (GPADC_HV_CODE - GPADC_LV_CODE) /
+        (GPADC_HV_MV - GPADC_LV_MV);
+
+    return MIN(MAX(code, 0), 0xFFFF);
+}
+
+static unsigned bes_pmu_dev(BesPmuState *s)
+{
+    return extract32(s->sspcr1, 7, 4);
 }
 
 static void bes_pmu_exec(BesPmuState *s, uint32_t cmd)
 {
-    unsigned int off = (cmd >> 18) & 0xFF;
+    unsigned dev = bes_pmu_dev(s);
+    unsigned page = s->cur_page[dev];
+    unsigned off = (cmd >> 18) & 0xFF;
+    uint16_t val;
 
     if (cmd & (1u << 26)) {
         /* read command: produce the RX word */
-        if (off == BES_PMU_REG_CHIP_ID) {
-            s->ispi_rx = BES_PMU_CHIP_ID_VAL << 2;
-        } else if (s->cur_page == 0 && off == 0x10) {
-            /* GPADC data-valid bitmap（固件 sub_C22EE84：读 0x3010 等
-             * 通道位、写 0x3011 清位、随即读通道值）。转换瞬时完成，
-             * 全通道恒 valid；0x3011 的写不影响此读值。 */
-            s->ispi_rx = 0xFFFFu << 2;
-        } else if (s->cur_page == 0 && off >= 0x56 && off <= 0x5D) {
-            /* GPADC 通道结果（0x3056+ch，固件 sub_C22EE84） */
-            s->ispi_rx = s->gpadc[off - 0x56] << 2;
+        if (dev == BES_ISPI_DEV_PMU && off == BES_PMU_REG_CHIP_ID) {
+            val = BES_PMU_CHIP_ID_VAL;
+        } else if (dev == BES_ISPI_DEV_GPADC && page == 0 && off == 0x50) {
+            val = 0xFF;     /* every channel has a finished conversion */
+        } else if (dev == BES_ISPI_DEV_GPADC && page == 0 &&
+                   off >= 0x56 && off <= 0x5D) {
+            val = bes_gpadc_code(s->gpadc_mv[off - 0x56]);
         } else {
-            s->ispi_rx = s->regs[s->cur_page][off] << 2;
+            val = s->regs[dev][page][off];
         }
+        trace_bes_ispi_read(dev, page, off, val);
+        s->ispi_rx = val << 2;
         s->ispi_rx_valid = true;
         return;
     }
 
     /* write command */
-    uint16_t val = (cmd >> 2) & 0xFFFF;
-
-    if (off == BES_PMU_REG_CHIP_ID) {
-        /* offset 0 write = page select (0xA000|(page<<4)) */
+    val = (cmd >> 2) & 0xFFFF;
+    trace_bes_ispi_write(dev, page, off, val);
+    if (off == 0) {
+        /* offset 0 write = page select (0xA000 | page << 4) */
         if ((val & 0xFF0F) == 0xA000) {
-            s->cur_page = (val >> 4) & 0xF;
-            if (s->cur_page > 4) {
-                s->cur_page = 0;
+            s->cur_page[dev] = (val >> 4) & 0xF;
+            if (s->cur_page[dev] >= BES_ISPI_PAGES) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "bes.pmu: dev %u: bad page %u\n", dev,
+                              s->cur_page[dev]);
+                s->cur_page[dev] = 0;
             }
         }
         return;
     }
-    s->regs[s->cur_page][off] = val;
+    s->regs[dev][page][off] = val;
 
-    if (off == BES_PMU_REG_WDT_RESET_TIMER ||
-        off == BES_PMU_REG_WDT_CFG) {
+    if (dev == BES_ISPI_DEV_PMU && page == 0 &&
+        (off == BES_PMU_REG_WDT_RESET_TIMER || off == BES_PMU_REG_WDT_CFG)) {
         bes_pmu_wdt_reload(s);
     }
 }
@@ -188,8 +198,6 @@ static uint64_t bes_pmu_read(void *opaque, hwaddr offset, unsigned size)
     default:
         break;
     }
-    qemu_log_mask(LOG_UNIMP, "bes.pmu: read  off=0x%03x -> 0x%08x\n",
-                  (unsigned)offset, v);
     return v;
 }
 
@@ -198,8 +206,6 @@ static void bes_pmu_write(void *opaque, hwaddr offset, uint64_t value,
 {
     BesPmuState *s = BES_PMU(opaque);
 
-    qemu_log_mask(LOG_UNIMP, "bes.pmu: write off=0x%03x = 0x%08x\n",
-                  (unsigned)offset, (unsigned)value);
     switch (offset) {
     case 0x00:
         s->sspcr0 = (uint32_t)value;
@@ -248,21 +254,14 @@ static const MemoryRegionOps bes_pmu_ops = {
 static void bes_pmu_reset(DeviceState *dev)
 {
     BesPmuState *s = BES_PMU(dev);
-    int i;
-
     s->sspcr0 = 0;
     s->sspcr1 = 0;
     memset(s->ssp_misc, 0, sizeof(s->ssp_misc));
     s->ispi_rx = 0;
     s->ispi_rx_valid = false;
-    s->cur_page = 0;
+    memset(s->cur_page, 0, sizeof(s->cur_page));
     memset(s->regs, 0, sizeof(s->regs));
     timer_del(s->wdt_timer);
-    /* GPADC 通道默认码（初值待换算校准，目标是 vbat 通道 4
-     * 换算后 ≥3.6VµV，见 PWONV sub_C20AEAC 关机阈值 3600000） */
-    for (i = 0; i < 8; i++) {
-        s->gpadc[i] = 0xFFF;
-    }
 }
 
 static void bes_pmu_realize(DeviceState *dev, Error **errp)
@@ -275,11 +274,28 @@ static void bes_pmu_realize(DeviceState *dev, Error **errp)
     s->wdt_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, bes_pmu_wdt_expire, s);
 }
 
+/* GPADC channel inputs (mV at the converter pin). Board wiring per the
+ * firmware's consumers: ch2 shell NTC and ch5 skin NTC (sub_C3DBCFC /
+ * sub_C3DBE40), ch3 VBUS (sub_C3DC740), ch4 VBAT through a 1/4.9 divider
+ * (sub_C3DC1B8). Defaults: NTCs at 250 mV (25 C on this board's divider),
+ * no charger, battery at 4.0 V. */
+static const Property bes_pmu_props[] = {
+    DEFINE_PROP_UINT32("gpadc-ch0-mv", BesPmuState, gpadc_mv[0], 0),
+    DEFINE_PROP_UINT32("gpadc-ch1-mv", BesPmuState, gpadc_mv[1], 0),
+    DEFINE_PROP_UINT32("gpadc-ch2-mv", BesPmuState, gpadc_mv[2], 250),
+    DEFINE_PROP_UINT32("gpadc-ch3-mv", BesPmuState, gpadc_mv[3], 0),
+    DEFINE_PROP_UINT32("gpadc-ch4-mv", BesPmuState, gpadc_mv[4], 816),
+    DEFINE_PROP_UINT32("gpadc-ch5-mv", BesPmuState, gpadc_mv[5], 250),
+    DEFINE_PROP_UINT32("gpadc-ch6-mv", BesPmuState, gpadc_mv[6], 0),
+    DEFINE_PROP_UINT32("gpadc-ch7-mv", BesPmuState, gpadc_mv[7], 0),
+};
+
 static void bes_pmu_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = bes_pmu_realize;
+    device_class_set_props(dc, bes_pmu_props);
     device_class_set_legacy_reset(dc, bes_pmu_reset);
 }
 

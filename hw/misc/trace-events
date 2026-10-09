@@ -454,3 +454,8 @@ bes_nand_erase(uint32_t row) "row=0x%06x"
 # bes_dma.c
 bes_dma_write(uint32_t off, uint32_t val) "off=0x%03x = 0x%08x"
 bes_dma_item_done(int chan, uint32_t next, int irq) "chan=%d next=0x%08x irq=%d"
+
+# bes_pmu.c
+bes_ispi_read(unsigned dev, unsigned page, unsigned off, uint16_t val) "dev=%u page=%u off=0x%02x -> 0x%04x"
+bes_ispi_write(unsigned dev, unsigned page, unsigned off, uint16_t val) "dev=%u page=%u off=0x%02x = 0x%04x"
+bes_pmu_wdt_expired(void) "system reset"

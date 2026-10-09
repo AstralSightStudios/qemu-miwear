@@ -12,6 +12,14 @@
 #define TYPE_BES_PMU "bes.pmu"
 OBJECT_DECLARE_SIMPLE_TYPE(BesPmuState, BES_PMU)
 
+/* ISPI device numbers (SSPCR1[10:7] chip select, firmware sub_C0E4820;
+ * analog register address = dev << 12 | page << 8 | offset, firmware
+ * pmu read/write sub_C0E3EDC / sub_C0E3F8C) */
+#define BES_ISPI_DEVS           16
+#define BES_ISPI_PAGES          6
+#define BES_ISPI_DEV_PMU        0
+#define BES_ISPI_DEV_GPADC      3
+
 /* PMU indirect register offsets (page 0), SDK reg_pmu_best1503.h */
 #define BES_PMU_REG_CHIP_ID     0x00    /* read-only chip id field */
 #define BES_PMU_REG_WDT_RESET_TIMER 0x36 /* reset period (ms); write = feed */
@@ -28,9 +36,9 @@ struct BesPmuState {
     uint32_t ssp_misc[6];       /* +0x10/+0x14/+0x24/+0x28/+0x2C/+0x88 */
     uint32_t ispi_rx;           /* RX word (last read result << 2) */
     bool     ispi_rx_valid;
-    uint8_t  cur_page;          /* selected register page (0..4) */
-    uint16_t regs[5][256];      /* paged 16-bit register file */
-    uint16_t gpadc[8];          /* GPADC channel codes (offsets 0x56..0x5D) */
+    uint8_t  cur_page[BES_ISPI_DEVS];   /* selected page per device */
+    uint16_t regs[BES_ISPI_DEVS][BES_ISPI_PAGES][256];
+    uint32_t gpadc_mv[8];       /* GPADC channel input voltages (mV) */
     QEMUTimer *wdt_timer;       /* PMU watchdog (0x36 ms period) */
 };
 
