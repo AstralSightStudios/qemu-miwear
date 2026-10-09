@@ -464,3 +464,12 @@ bes_pmu_wdt_expired(void) "system reset"
 bes_btss_rx(int ch, uint8_t mbx, uint32_t len, uint8_t type) "ch%d mbx=%u len=%u h4=0x%02x"
 bes_btss_hci_cmd(int ch, uint16_t opcode, uint8_t plen) "ch%d opcode=0x%04x plen=%u"
 bes_btss_publish(int ch, unsigned n) "ch%d %u message(s) to MCU"
+
+# bes_lcdc.c
+bes_lcdc_panel_cmd(uint8_t instr, uint8_t dcs, uint32_t param) "instr=0x%02x dcs=0x%02x param=0x%08x"
+bes_lcdc_frame(unsigned x, unsigned y, unsigned w, unsigned h) "frame %ux%u at %u,%u"
+
+# vsi_vglite.c
+vsi_vglite_submit(uint32_t addr, uint32_t size) "cmdbuf 0x%08x size %u"
+vsi_vglite_rect(uint32_t ctrl, uint32_t tcfg, uint32_t taddr, uint32_t icfg, uint32_t iaddr, unsigned x, unsigned y, unsigned w, unsigned h) "ctrl=0x%08x target=0x%08x@0x%08x image=0x%08x@0x%08x rect %u,%u %ux%u"
+vsi_vglite_path(uint32_t ctrl, uint32_t pctrl, uint32_t taddr, uint64_t data, uint32_t bytes) "ctrl=0x%08x path=0x%08x target=0x%08x data=0x%"PRIx64" %u bytes"

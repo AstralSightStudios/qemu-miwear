@@ -219,6 +219,12 @@ config BES_DMA
 config BES_BTSS
     bool
 
+config BES_GPIO
+    bool
+
+config VSI_VGLITE
+    bool
+
 config LED
     bool
 

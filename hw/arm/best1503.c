@@ -32,6 +32,8 @@
 #include "hw/misc/bes_lcdc.h"
 #include "hw/misc/bes_dma.h"
 #include "hw/misc/bes_btss.h"
+#include "hw/misc/bes_gpio.h"
+#include "hw/misc/vsi_vglite.h"
 #include "system/address-spaces.h"
 #include "system/reset.h"
 #include "system/system.h"
@@ -89,6 +91,28 @@
 #define BEST1503_BT_MBOX_TABLE    0xC0004000
 #define BEST1503_BT_EXCH_BASE     0xD0210000
 #define BEST1503_BT_EXCH_SIZE     0x10000
+/* GPIO v2 ×3 bank（固件 bank 表 0x2CCDAB08）+ PSC GPIO 中断块
+ * （hal_psc_gpio_irq_enable/get_status：PSC 0x40085080..0x40085094），
+ * 共用 GPIO_IRQn=44（hal_gpio_setup_irq sub_C22F580）。 */
+#define BEST1503_GPIO0_BASE       0x40081000
+#define BEST1503_GPIO1_BASE       0x40089000
+#define BEST1503_GPIO2_BASE       0x4008A000
+#define BEST1503_PSC_GPIO_IRQ     0x40085080
+#define BEST1503_GPIO_IRQ         44
+/* LCDC：NVIC 67（sub_C231DE4）；面板 TE 接 GPIO 47（板级：固件
+ * LCD TE 引脚配置 sub_C0E3DF0 返回 47，经 sub_C232740 配成边沿中断）；
+ * 面板 336x480（固件 LCDC 初始化 sub_C225BA4 的层/输出尺寸）。 */
+#define BEST1503_LCDC_BASE        0x40200000
+#define BEST1503_LCDC_IRQ         67
+#define BEST1503_LCD_TE_GPIO      47
+#define BEST1503_PANEL_W          336
+#define BEST1503_PANEL_H          480
+/* 2D GPU（VeriSilicon VGLite，GCNanoUltraV 类）：寄存器 0x40220000
+ * （固件 VGLite HAL 基址 0x200C8C30 初值），NVIC 70（ISR 0xC224C28 装在
+ * 向量偏移 0x158）。芯片标识是驱动 vg_lite_options 要求的值
+ * （sub_C0FDA48：0x265 / 0x2002 / 0x424 / eco 0）。 */
+#define BEST1503_GPU_BASE         0x40220000
+#define BEST1503_GPU_IRQ          70
 /* PSRAM PHY：SDK plat_addr_map_best1503.h:284 候选值，经固件运行时行为
  * 证实（PHY 校准时序公式 0x60/0x64 在 48MHz 下逐位吻合，见 bes_psram.c） */
 #define BEST1503_PSRAM_PHY_BASE  0x40168000
@@ -507,13 +531,41 @@ static void best1503_init(MachineState *machine)
         }
     }
 
-    /* LCDC @0x40200000（SDK plat_addr_map_best1503.h:283）：DBI/SPI 面板
-     * 命令通道 + 帧输出。固件当前用轮询（ISR bit18=tx-done），IRQ 号待
-     * 实证后接线。 */
+    /* GPIO + LCDC @0x40200000（SDK plat_addr_map_best1503.h:283）：QSPI
+     * 面板命令通道、TE、帧合成输出到图形控制台、帧完成中断。 */
     {
+        DeviceState *gpio = qdev_new(TYPE_BES_GPIO);
         DeviceState *lcdc = qdev_new(TYPE_BES_LCDC);
+
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(gpio), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(gpio), 0, BEST1503_GPIO0_BASE);
+        sysbus_mmio_map(SYS_BUS_DEVICE(gpio), 1, BEST1503_GPIO1_BASE);
+        sysbus_mmio_map(SYS_BUS_DEVICE(gpio), 2, BEST1503_GPIO2_BASE);
+        sysbus_mmio_map(SYS_BUS_DEVICE(gpio), 3, BEST1503_PSC_GPIO_IRQ);
+        sysbus_connect_irq(SYS_BUS_DEVICE(gpio), 0,
+                           qdev_get_gpio_in(armv7m, BEST1503_GPIO_IRQ));
+
+        qdev_prop_set_uint32(lcdc, "panel-width", BEST1503_PANEL_W);
+        qdev_prop_set_uint32(lcdc, "panel-height", BEST1503_PANEL_H);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(lcdc), &error_fatal);
-        sysbus_mmio_map(SYS_BUS_DEVICE(lcdc), 0, 0x40200000);
+        sysbus_mmio_map(SYS_BUS_DEVICE(lcdc), 0, BEST1503_LCDC_BASE);
+        sysbus_connect_irq(SYS_BUS_DEVICE(lcdc), 0,
+                           qdev_get_gpio_in(armv7m, BEST1503_LCDC_IRQ));
+        qdev_connect_gpio_out_named(lcdc, "te", 0,
+                                    qdev_get_gpio_in(gpio,
+                                                     BEST1503_LCD_TE_GPIO));
+    }
+
+    /* 2D GPU */
+    {
+        DeviceState *gpu = qdev_new(TYPE_VSI_VGLITE);
+
+        object_property_set_link(OBJECT(gpu), "downstream", OBJECT(sysmem),
+                                 &error_fatal);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(gpu), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(gpu), 0, BEST1503_GPU_BASE);
+        sysbus_connect_irq(SYS_BUS_DEVICE(gpu), 0,
+                           qdev_get_gpio_in(armv7m, BEST1503_GPU_IRQ));
     }
 
     /* 通用 DMA ×2（PL080 兼容 + BES 2D 扩展，见 bes_dma.c） */
