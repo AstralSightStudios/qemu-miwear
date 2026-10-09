@@ -1,5 +1,5 @@
 /*
- * BES NOR flash controller (best1503, flash ctrl v7)
+ * BES serial flash controller (best1503, norflaship v2 / CTRL_VER >= 7)
  *
  * This code is licensed under the GPL version 2 or later.
  */
@@ -12,46 +12,55 @@
 #define TYPE_BES_FLASH "bes.flash"
 OBJECT_DECLARE_SIMPLE_TYPE(BesFlashState, BES_FLASH)
 
+#define BES_FLASH_TXFIFO_DEPTH  1024
+/* one transaction's RX stream: RX length fields are 13 bits wide */
+#define BES_FLASH_RX_MAX        8192
+#define BES_NAND_MAX_PAGE       (4096 + 256)
+
 struct BesFlashState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;         /* register window (0x400) */
-    MemoryRegion storage_mr;    /* flash data backend (shared with XIP) */
-    uint8_t *storage;           /* == storage_mr ram ptr */
-    uint32_t size;              /* logical size in bytes (dual-chip view) */
-    char *image;                /* optional backing image file (RW) */
-    char *rom_image;            /* optional read-only mmap image (big ROMs) */
-    void *rom_map;              /* GMappedFile* when rom_image is used */
+    MemoryRegion storage_mr;    /* NOR: data backend shared with XIP */
+    MemoryRegion window;        /* NAND: memory-mapped cache read window */
+    uint8_t *storage;           /* NOR: == storage_mr ram ptr */
+    uint32_t size;              /* NOR: logical size (dual-chip view) */
+    char *image;                /* NOR: optional backing image (RW) */
+    qemu_irq dma_req;           /* DMA request line (level) */
 
     uint32_t regs[0x400 / 4];
 
-    uint8_t txfifo[1024];       /* covers one page (256B x dual 2) plus slack */
+    uint8_t txfifo[BES_FLASH_TXFIFO_DEPTH];
     uint32_t tx_cnt;
-    uint8_t rxfifo[64];
+    uint8_t rxbuf[BES_FLASH_RX_MAX];
     uint32_t rx_cnt;
     uint32_t rx_pos;
 
+    /* ---- NOR die model ---- */
     bool pp_active;             /* page-program transaction collecting data */
     uint32_t pp_addr;
     uint32_t pp_total;
-
     uint8_t sr;                 /* status register S0-S7 (WIP/WEL/BP) */
     uint8_t sr2;                /* status register S8-S15 (QE/CMP) */
 
-    /* ---- SPI NAND die (route addr==0x61, /dev/nand_data) ----
-     * GD5F1GQ5-class: 2048+64B pages, 64 pages/block, 1024 blocks
-     * (128MiB data + 4MiB OOB, 2112B per physical page). */
-    char *nand_image;           /* writable mmap backend file */
-    void *nand_map;             /* GMappedFile* (writable) */
-    uint32_t nand_size;         /* backend bytes (pages * 2112) */
-    uint8_t nand_sr[256];       /* feature registers by address (A0/B0/C0/D0) */
-    uint8_t nand_cache[2112];   /* page cache for read/program */
-    uint32_t nand_prog_col;
-    bool nand_cache_dirty;
+    /* ---- SPI NAND chip model (enabled by nand-image) ---- */
+    char *nand_image;           /* backing file, (page + oob) per page */
+    FILE *nand_fp;
+    uint32_t nand_id;           /* 3 ID bytes, MSB first on the wire */
+    uint32_t nand_page;         /* data bytes per page */
+    uint32_t nand_oob;          /* spare bytes per page */
+    uint32_t nand_ppb;          /* pages per block */
+    uint32_t nand_blocks;
+    uint8_t nand_feat[256];     /* feature registers by address */
+    uint8_t nand_cache[BES_NAND_MAX_PAGE];
+    bool nand_load_active;      /* PROGRAM LOAD streaming TX into cache */
+    uint32_t nand_load_col;
+    uint32_t nand_load_left;
+    bool nand_dpd;              /* deep power-down */
 
-    Notifier shutdown_notifier; /* image writeback on exit */
+    Notifier shutdown_notifier; /* NOR image writeback on exit */
 };
 
-/* storage backend for XIP mapping in the machine */
+/* storage backend for XIP mapping in the machine (NOR) */
 MemoryRegion *bes_flash_storage(BesFlashState *s);
 uint8_t *bes_flash_data(BesFlashState *s);
 

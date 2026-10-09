@@ -1,5 +1,5 @@
 /*
- * BES NOR flash controller (best1503, CHIP_FLASH_CTRL_VER >= 7)
+ * BES serial flash controller (best1503, CHIP_FLASH_CTRL_VER >= 7)
  *
  * Register layout: SDK platform/hal/reg_norflaship_v2.h:21-129
  * Transaction model: SDK platform/hal/hal_norflaship_v2.c:202-295
@@ -15,7 +15,24 @@
  *     RXFIFO_COUNT[8:4], TXFIFO_EMPCNT[13:9]
  *   - REG_018 bit0/bit1: RX/TX FIFO clear (self-clearing)
  *
- * Dual-chip mode (REG_204 bit19, best1503 Mi Band 10: two 8MB dies
+ * Firmware-verified controller details (vela_ap.bin v3.101.043; the
+ * norflaship helpers live in the boot RAM-text section that startup
+ * sub_C0C0A1C copies from flash 0x2C0C23A4 to SRAM 0x200765C0, reached
+ * through the veneers at 0xC588xxx):
+ *   - controller table 0x2009D8F0: id0 = 0x40140000, id1 = 0x40500000
+ *   - REG_01C bit1 / bit2: TX / RX DMA enable (sub_C0C4498 / sub_C0C44B4,
+ *     set around nandflash_start_tx_dma / nandflash_start_rx_dma and
+ *     cleared again by sub_C221270)
+ *   - REG_01C[17:16]: RX FIFO access width for DMA, 0 = 1 byte,
+ *     1 = 2 bytes, 2 = 4 bytes (sub_C0C44F8; set to 4 bytes before the
+ *     DMA page read, back to 1 byte afterwards)
+ *   - DMA data port is REG_008 in both directions: the DMA periph address
+ *     table (0x2CCDA934, request 28 -> 0x40500008) is used as source for
+ *     the RX descriptor and as destination for the TX descriptor
+ *
+ * Two chip personalities share this controller model:
+ *
+ * NOR (flash0, code flash). Dual-chip mode (REG_204 bit19, two 8MB dies
  * interleaved into one 16MB logical device, firmware boot info
  * FLASH_DUAL_CHIP=1 / FLASH_SIZE=0x1000000):
  *   - 1x-wire register reads (0x9F/0x05/0x35/0x4B...): both dies shift
@@ -33,16 +50,36 @@
  *     SDK norflash_drv.c:996-1037)
  *   - TX_DATA_COPY (REG_204 bit21) duplicates TX bytes to both dies
  *     (register writes); no effect on the logical-view model
+ *   Die model: GigaDevice GD25LQ64C (8MB per die), JEDEC ID c8-60-17
+ *   (SDK norflash_gd25lq32c.c:240-241). Command set: SDK
+ *   platform/drivers/norflash/norflash_gd25q32c.h:57-96. Storage backend:
+ *   RAM with NOR semantics, optionally loaded from / written back to an
+ *   image file (property "image"); shared with the XIP windows.
  *
- * Flash die model: GigaDevice GD25LQ64C (8MB per die),
- * JEDEC ID c8-60-17 (SDK norflash_gd25lq32c.c:240-241; two dies give
- * the 16MB logical size from the firmware boot info).
- * Command set: SDK platform/drivers/norflash/norflash_gd25q32c.h:57-96
- *
- * Storage backend: RAM, NOR semantics (program 1->0 only, erase -> 0xFF),
- * optionally loaded from / written back to an image file (property
- * "image"). The backend MemoryRegion is shared with the XIP/cached/NC
- * windows so flash writes are immediately visible to XIP.
+ * SPI NAND (flash1, /dev/resource + /dev/nand_data), firmware
+ * nandflash_drv (sub_C221F4C nandflash_init, controller id 1):
+ *   - READ ID: ext cmd 0x9F, 1 TX dummy byte, 3 RX bytes compared with
+ *     the firmware ID table 0x2CCD4134 (sub_C221460)
+ *   - GET/SET FEATURE 0x0F/0x1F (ext, TX feature address [+ value]);
+ *     A0 protection, B0 configuration, C0 status: OIP bit0, WEL bit1,
+ *     E_FAIL bit2, P_FAIL bit3, ECC status [6:4] (sub_C2214CC/A8,
+ *     sub_C22187E, sub_C221594 / sub_C221500 / sub_C221818)
+ *   - PAGE READ 0x13, PROGRAM EXECUTE 0x10, BLOCK ERASE 0xD8, WREN 0x06:
+ *     normal-mode commands, row address in REG_000[31:8]
+ *     (sub_C221594, sub_C221500, sub_C221818)
+ *   - READ FROM CACHE 0x03/0x0B/0x3B/0x6B/0xBB/0xEB: normal mode, column
+ *     in REG_000[31:8], length REG_004.BLOCK_SIZE (sub_C221680)
+ *   - PROGRAM LOAD 0x02/0x32: normal mode, column in REG_000[31:8], the
+ *     BLOCK_SIZE data bytes stream through the TX FIFO while software
+ *     (or DMA) keeps refilling it (sub_C2212C4)
+ *   - DIE SELECT 0xC2 (ext, 1 TX byte), DPD 0xB9 / release 0xAB (ext),
+ *     RESET 0xFF (ext) (sub_C2211E4, sub_C221A60, sub_C221AC8)
+ *   - memory-mapped cache reads: the controller's NC window returns the
+ *     page cache at column = window offset; the driver reads the
+ *     bad-block markers and unaligned tails through 0x30000000 + column
+ *     (sub_C2215FC, sub_C221680)
+ *   Backing store: a file of (page + oob)-byte pages, page-major; erased
+ *   state 0xFF. Chip geometry and ID come from properties.
  *
  * This code is licensed under the GPL version 2 or later.
  */
@@ -53,11 +90,10 @@
 #include "qemu/error-report.h"
 #include "system/runstate.h"
 #include "system/system.h"
+#include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
-#include "hw/core/cpu.h"
-#include "target/arm/cpu.h"
-#include "system/address-spaces.h"
 #include "hw/misc/bes_flash.h"
+#include "trace.h"
 
 /* GD25Q32C-family command set (norflash_gd25q32c.h:57-96) */
 #define FLASH_CMD_ID              0x9F
@@ -101,21 +137,57 @@
 #define FLASH_CMD_ENTER_4BYTE     0xB7
 #define FLASH_CMD_EXIT_4BYTE      0xE9
 
+/* SPI NAND command set (firmware nandflash_drv, see header comment) */
+#define NAND_CMD_RESET            0xFF
+#define NAND_CMD_READ_ID          0x9F
+#define NAND_CMD_GET_FEATURE      0x0F
+#define NAND_CMD_SET_FEATURE      0x1F
+#define NAND_CMD_WRITE_ENABLE     0x06
+#define NAND_CMD_WRITE_DISABLE    0x04
+#define NAND_CMD_PAGE_READ        0x13
+#define NAND_CMD_READ_CACHE       0x03
+#define NAND_CMD_FAST_READ_CACHE  0x0B
+#define NAND_CMD_READ_CACHE_X2    0x3B
+#define NAND_CMD_READ_CACHE_X4    0x6B
+#define NAND_CMD_READ_CACHE_DIO   0xBB
+#define NAND_CMD_READ_CACHE_QIO   0xEB
+#define NAND_CMD_PROGRAM_LOAD     0x02
+#define NAND_CMD_PROGRAM_LOAD_X4  0x32
+#define NAND_CMD_RND_LOAD         0x84
+#define NAND_CMD_RND_LOAD_X4      0x34
+#define NAND_CMD_PROGRAM_EXEC     0x10
+#define NAND_CMD_BLOCK_ERASE      0xD8
+#define NAND_CMD_DIE_SELECT       0xC2
+#define NAND_CMD_DEEP_POWERDOWN   0xB9
+#define NAND_CMD_RELEASE_DP       0xAB
+
+#define NAND_FEAT_PROT            0xA0
+#define NAND_FEAT_CFG             0xB0
+#define NAND_FEAT_STATUS          0xC0
+#define NAND_FEAT_DRIVE           0xD0
+#define NAND_ST_OIP               (1 << 0)
+#define NAND_ST_WEL               (1 << 1)
+#define NAND_ST_EFAIL             (1 << 2)
+#define NAND_ST_PFAIL             (1 << 3)
+#define NAND_CFG_ECC_EN           (1 << 4)
+
 /* status register bits (norflash_gd25q32c.h:100-112) */
 #define FLASH_SR_WIP   (1 << 0)
 #define FLASH_SR_WEL   (1 << 1)
 #define FLASH_SR2_QE   (1 << 1)
 
-#define FLASH_TXFIFO_DEPTH 1024
-#define FLASH_RXFIFO_DEPTH 64
+/* RXFIFO_COUNT is a 5-bit field; software only waits on it for short
+ * register reads (sub_C0C4DA0 waits count >= len, len < 32) */
+#define FLASH_RXFIFO_COUNT_MAX 31
 
 /* register offsets (reg_norflaship_v2.h) */
 #define FLASH_REG_000   0x000   /* CMD | ADDR<<8 | NEW_CMD fields */
 #define FLASH_REG_004   0x004   /* BLOCK_SIZE / NEW_CMD_EN */
-#define FLASH_REG_008   0x008   /* TX FIFO data */
+#define FLASH_REG_008   0x008   /* TX FIFO data / DMA data port */
 #define FLASH_REG_00C   0x00C   /* status */
 #define FLASH_REG_010   0x010   /* RX FIFO data */
 #define FLASH_REG_018   0x018   /* FIFO clear (self-clearing) */
+#define FLASH_REG_01C   0x01C   /* DMA control */
 #define FLASH_REG_204   0x204   /* dual-chip / data copy / reorder config */
 
 /* REG_000 fields (reg_norflaship_v2.h:131-152) */
@@ -126,6 +198,10 @@
 /* REG_004 fields (reg_norflaship_v2.h:154-168) */
 #define R004_BLOCK_SIZE(x)      (((x) >> 12) & 0x1FFF)
 #define R004_NEW_CMD_EN         (1 << 0)
+/* REG_01C fields (firmware, see header comment) */
+#define R01C_TX_DMA_EN          (1 << 1)
+#define R01C_RX_DMA_EN          (1 << 2)
+#define R01C_RX_DMA_WIDTH(x)    (((x) >> 16) & 0x3)
 /* REG_204 fields (reg_norflaship_v2.h:600-624) */
 #define R204_TX_DATA_COPY       (1 << 21)
 #define R204_RX_DATA_REORDER    (1 << 20)
@@ -133,27 +209,6 @@
 
 /* JEDEC ID of each GD25LQ64C die (SDK norflash_gd25lq32c.c:241) */
 static const uint8_t bes_flash_jedec_id[3] = { 0xC8, 0x60, 0x17 };
-
-/* SPI NAND (/dev/nand_data, GigaDevice 1Gbit): firmware NAND ID table
- * entry 0x2CCD400C matches c8-81-c8 (GD5F1GQ5-class). The chip-select
- * scheme is NOT "addr==0x61" (that was a misread of the extended-command
- * RX_LEN field); real NAND traffic has not been observed yet, so the die
- * model below is parked until the routing is identified from traffic. */
-static const uint8_t bes_nand_jedec_id[3] = { 0xC8, 0x81, 0xC8 };
-
-/* SPI NAND geometry (GD5F1GQ5-class) */
-#define BES_NAND_PAGE_BYTES     2112    /* 2048 data + 64 OOB */
-#define BES_NAND_PAGES_PER_BLK  64
-#define BES_NAND_BLOCKS         1024
-#define BES_NAND_TOTAL_BYTES    (BES_NAND_PAGE_BYTES * \
-                                 BES_NAND_PAGES_PER_BLK * BES_NAND_BLOCKS)
-/* feature register addresses (GD SPI NAND standard) */
-#define BES_NAND_SR_STAT        0xA0    /* OIP|WEL|BP|CMP */
-#define BES_NAND_SR_DRV         0xB0
-#define BES_NAND_SR_ECC         0xC0    /* ECC_EN|ECC status (0=no error) */
-#define BES_NAND_SR_PROT        0xD0
-#define BES_NAND_SR_OIP         (1 << 0)
-#define BES_NAND_SR_WEL         (1 << 1)
 
 /* Unique ID: GD dies report 18 bytes (SDK norflash_drv.c:56
  * GD_UNIQUE_ID_LEN). Per-unit values are not published; model a fixed
@@ -163,10 +218,87 @@ static const uint8_t bes_flash_unique_id[18] = {
     0xB5, 0xE5, 0x15, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01,
 };
 
+static bool bes_flash_is_nand(BesFlashState *s)
+{
+    return s->nand_fp != NULL;
+}
+
 static bool bes_flash_dual(BesFlashState *s)
 {
     return s->regs[FLASH_REG_204 / 4] & R204_DUAL_CHIP_MODE;
 }
+
+/* DMA request: RX while the transaction still has data to deliver, TX
+ * while a streaming load wants bytes or the FIFO has room */
+static void bes_flash_update_dma(BesFlashState *s)
+{
+    uint32_t r01c = s->regs[FLASH_REG_01C / 4];
+    bool req = false;
+
+    if ((r01c & R01C_RX_DMA_EN) && s->rx_pos < s->rx_cnt) {
+        req = true;
+    }
+    if ((r01c & R01C_TX_DMA_EN) &&
+        ((s->nand_load_active && s->nand_load_left) ||
+         s->tx_cnt < BES_FLASH_TXFIFO_DEPTH)) {
+        req = true;
+    }
+    qemu_set_irq(s->dma_req, req);
+}
+
+static void bes_flash_rx_fill(BesFlashState *s, const uint8_t *data,
+                              uint32_t len)
+{
+    uint32_t n = MIN(len, BES_FLASH_RX_MAX);
+
+    memcpy(s->rxbuf, data, n);
+    s->rx_cnt = n;
+    s->rx_pos = 0;
+}
+
+/* pad an RX stream to the requested length with a constant byte */
+static void bes_flash_rx_fill_pad(BesFlashState *s, const uint8_t *data,
+                                  uint32_t len, uint32_t want, uint8_t pad)
+{
+    want = MIN(want, BES_FLASH_RX_MAX);
+    len = MIN(len, want);
+    memcpy(s->rxbuf, data, len);
+    memset(s->rxbuf + len, pad, want - len);
+    s->rx_cnt = want;
+    s->rx_pos = 0;
+}
+
+/* RX pop unit. REG_01C[17:16] selects the width used for DMA page reads
+ * (firmware sub_C0C44F8); otherwise REG_204 CFG_RXSIZE[18:17]
+ * (0=1B/1=2B/2=4B, hal_norflaship_v2.c:989-1002). Not the CPU access
+ * size: the SDK reads REG_010 as a word even in 1-byte mode and consumes
+ * only the low byte (hal_norflaship_v2.c:198-201,
+ * norflash_drv.c:1483-1485). */
+static uint32_t bes_flash_rx_width(BesFlashState *s)
+{
+    uint32_t dma = R01C_RX_DMA_WIDTH(s->regs[FLASH_REG_01C / 4]);
+    uint32_t cfg = (s->regs[FLASH_REG_204 / 4] >> 17) & 0x3;
+
+    if (dma) {
+        return 1 << MIN(dma, 2);
+    }
+    return 1 << MIN(cfg, 2);
+}
+
+static uint32_t bes_flash_rx_pop(BesFlashState *s)
+{
+    uint32_t width = bes_flash_rx_width(s);
+    uint32_t v = 0, n;
+
+    for (n = 0; n < width && s->rx_pos < s->rx_cnt; n++) {
+        v |= (uint32_t)s->rxbuf[s->rx_pos++] << (n * 8);
+    }
+    return v;
+}
+
+/* ======================================================================
+ * NOR die model
+ * ====================================================================== */
 
 /* whether the command has a data-out phase that drains TX FIFO bytes.
  * Command-only operations (WREN/erase/reads/mode changes) leave queued
@@ -210,23 +342,13 @@ static bool bes_flash_cmd_has_tx(uint8_t cmd)
     }
 }
 
-static void bes_flash_rx_fill(BesFlashState *s, const uint8_t *data,
-                              uint32_t len)
-{
-    uint32_t n = MIN(len, FLASH_RXFIFO_DEPTH);
-
-    memcpy(s->rxfifo, data, n);
-    s->rx_cnt = n;
-    s->rx_pos = 0;
-}
-
 /* Dual-chip 1x-wire RX packing (norflash_drv.c:1505-1512 inverse):
  * both dies respond identically here (same die model, same register
  * state); per-die byte C -> FIFO pair (B0, B1). */
 static void bes_flash_rx_fill_dual(BesFlashState *s, const uint8_t *die,
                                    uint32_t len)
 {
-    uint8_t buf[FLASH_RXFIFO_DEPTH];
+    uint8_t buf[64];
     uint32_t i, n = 0;
 
     for (i = 0; i < len && n + 2 <= sizeof(buf); i++) {
@@ -258,11 +380,6 @@ static void bes_flash_erase(BesFlashState *s, uint32_t addr, uint32_t size)
     uint32_t gran = bes_flash_dual(s) ? 2 * size : size;
     uint32_t base = addr & ~(gran - 1);
 
-    if (s->rom_map) {   /* read-only mmap backend (romfs) */
-        qemu_log_mask(LOG_UNIMP,
-                      "bes.flash: erase ignored on read-only backend\n");
-        return;
-    }
     if (!(s->sr & FLASH_SR_WEL)) {
         return;
     }
@@ -280,17 +397,6 @@ static void bes_flash_do_program(BesFlashState *s)
 {
     uint32_t n, i;
 
-    /* rom-image backends are read-only mmaps; programming them would
-     * segfault the process. Real firmware never programs the romfs
-     * partition. */
-    if (s->rom_map) {
-        qemu_log_mask(LOG_UNIMP,
-                      "bes.flash: program ignored on read-only backend\n");
-        s->pp_active = false;
-        s->tx_cnt = 0;
-        return;
-    }
-
     if ((s->sr & FLASH_SR_WEL) && s->pp_addr < s->size) {
         n = MIN(s->pp_total, s->size - s->pp_addr);
         for (i = 0; i < n; i++) {
@@ -302,150 +408,9 @@ static void bes_flash_do_program(BesFlashState *s)
     s->tx_cnt = 0;
 }
 
-static void bes_flash_exec(BesFlashState *s, uint32_t reg000);
-
-/* ---- SPI NAND die (route addr==0x61) ---- */
-
-static uint8_t *bes_nand_backend(BesFlashState *s)
+static void bes_nor_exec(BesFlashState *s, uint8_t cmd, uint32_t addr,
+                         uint32_t tx_len, uint32_t rx_len)
 {
-    return s->nand_map ? (uint8_t *)g_mapped_file_get_contents(
-               (GMappedFile *)s->nand_map) : NULL;
-}
-
-static void bes_nand_exec(BesFlashState *s, uint8_t cmd, uint32_t tx_len,
-                          uint32_t rx_len)
-{
-    uint8_t *be = bes_nand_backend(s);
-    uint32_t pos = 0;
-    uint32_t page, col;
-
-    qemu_log_mask(LOG_UNIMP, "bes.nand%c: cmd=0x%02x tx_len=%u rx_len=%u\n",
-                  s->rom_map ? '1' : '0', cmd, tx_len, rx_len);
-    switch (cmd) {
-    case 0x9F:                      /* READ ID */
-        bes_flash_respond_reg(s, bes_nand_jedec_id,
-                              rx_len ? MIN(rx_len, 3) : 3);
-        break;
-    case 0xFF:                      /* RESET */
-        memset(s->nand_sr, 0, sizeof(s->nand_sr));
-        s->nand_sr[BES_NAND_SR_ECC] = 1;    /* ECC_EN default on */
-        s->nand_cache_dirty = false;
-        break;
-    case 0x06:                      /* WREN */
-        s->nand_sr[BES_NAND_SR_STAT] |= BES_NAND_SR_WEL;
-        break;
-    case 0x04:                      /* WRDI */
-        s->nand_sr[BES_NAND_SR_STAT] &= ~BES_NAND_SR_WEL;
-        break;
-    case 0x0F: {                    /* GET FEATURE: TX 1B addr -> RX 1B */
-        uint8_t fa = s->tx_cnt ? s->txfifo[0] : 0;
-
-        bes_flash_respond_reg(s, &s->nand_sr[fa], 1);
-        break;
-    }
-    case 0x1F:                      /* SET FEATURE: TX addr+val */
-        if (s->tx_cnt >= 2) {
-            s->nand_sr[s->txfifo[0]] = s->txfifo[1];
-        }
-        break;
-    case 0x13:                      /* PAGE READ: TX 3B page addr -> cache */
-        if (s->tx_cnt >= 3) {
-            page = (s->txfifo[0] << 16) | (s->txfifo[1] << 8) | s->txfifo[2];
-            if (be && page * BES_NAND_PAGE_BYTES < s->nand_size) {
-                memcpy(s->nand_cache, be + page * BES_NAND_PAGE_BYTES,
-                       BES_NAND_PAGE_BYTES);
-            } else {
-                memset(s->nand_cache, 0xFF, BES_NAND_PAGE_BYTES);
-            }
-            s->nand_cache_dirty = false;
-            s->nand_sr[BES_NAND_SR_STAT] &= ~BES_NAND_SR_OIP;
-        }
-        break;
-    case 0x03:                      /* READ FROM CACHE: TX 2B col -> RX */
-    case 0x0B: {                    /* FAST READ FROM CACHE: col + 1 dummy */
-        col = s->tx_cnt >= 2 ? (s->txfifo[0] << 8) | s->txfifo[1] : 0;
-        if (rx_len && col < BES_NAND_PAGE_BYTES) {
-            bes_flash_rx_fill(s, s->nand_cache + col,
-                              MIN(rx_len, BES_NAND_PAGE_BYTES - col));
-        }
-        break;
-    }
-    case 0x02:                      /* PROGRAM LOAD: TX 2B col + data */
-    case 0x84:
-        if (s->tx_cnt >= 2) {
-            col = (s->txfifo[0] << 8) | s->txfifo[1];
-            uint32_t n = s->tx_cnt - 2;
-
-            if (col + n > BES_NAND_PAGE_BYTES) {
-                n = BES_NAND_PAGE_BYTES - col;
-            }
-            memcpy(s->nand_cache + col, s->txfifo + 2, n);
-            s->nand_cache_dirty = true;
-        }
-        break;
-    case 0x10:                      /* PROGRAM EXECUTE: TX 3B page addr */
-        if (s->tx_cnt >= 3 && (s->nand_sr[BES_NAND_SR_STAT] & BES_NAND_SR_WEL)) {
-            page = (s->txfifo[0] << 16) | (s->txfifo[1] << 8) | s->txfifo[2];
-            if (be && page * BES_NAND_PAGE_BYTES < s->nand_size) {
-                uint8_t *dst = be + page * BES_NAND_PAGE_BYTES;
-                uint32_t i;
-
-                for (i = 0; i < BES_NAND_PAGE_BYTES; i++) {
-                    dst[i] &= s->nand_cache[i];
-                }
-            }
-            s->nand_sr[BES_NAND_SR_STAT] &= ~BES_NAND_SR_WEL;
-            s->nand_cache_dirty = false;
-        }
-        s->nand_sr[BES_NAND_SR_STAT] &= ~BES_NAND_SR_OIP;
-        break;
-    case 0xD8:                      /* BLOCK ERASE: TX 3B page addr */
-        if (s->tx_cnt >= 3 && (s->nand_sr[BES_NAND_SR_STAT] & BES_NAND_SR_WEL)) {
-            page = (s->txfifo[0] << 16) | (s->txfifo[1] << 8) | s->txfifo[2];
-            page &= ~(BES_NAND_PAGES_PER_BLK - 1);
-            if (be && page * BES_NAND_PAGE_BYTES < s->nand_size) {
-                memset(be + page * BES_NAND_PAGE_BYTES, 0xFF,
-                       BES_NAND_PAGE_BYTES * BES_NAND_PAGES_PER_BLK);
-            }
-            s->nand_sr[BES_NAND_SR_STAT] &= ~BES_NAND_SR_WEL;
-        }
-        s->nand_sr[BES_NAND_SR_STAT] &= ~BES_NAND_SR_OIP;
-        break;
-    default:
-        qemu_log_mask(LOG_UNIMP, "bes.flash: unhandled NAND cmd 0x%02x\n",
-                      cmd);
-        break;
-    }
-    (void)pos;
-    s->tx_cnt = 0;   /* the whole TX phase belongs to this transaction */
-}
-
-static void bes_flash_exec(BesFlashState *s, uint32_t reg000)
-{
-    uint8_t cmd = R000_CMD(reg000);
-    uint32_t addr = R000_ADDR(reg000);
-    bool ext = s->regs[FLASH_REG_004 / 4] & R004_NEW_CMD_EN;
-    uint32_t tx_len = R004_BLOCK_SIZE(s->regs[FLASH_REG_004 / 4]);
-    /* normal mode: BLOCK_SIZE is the RX count for read commands
-     * (hal_norflaship_v2.c:202-210, norflash_drv.c:2761-2766);
-     * extended mode: RX length comes from REG_000 when RX_EN */
-    uint32_t rx_len = ext ? ((reg000 & R000_NEW_CMD_RX_EN) ?
-                             R000_NEW_CMD_RX_LEN(reg000) : 0) : tx_len;
-
-    qemu_log_mask(LOG_UNIMP, "bes.flash: cmd=0x%02x addr=0x%06x ext=%d "
-                  "tx_len=%u rx_len=%u dual=%d\n",
-                  cmd, addr, ext, tx_len, rx_len, bes_flash_dual(s));
-
-/* SPI NAND die: NOT routed by REG_000 bits[31:8]. In extended-command
- * mode (REG_004 NEW_CMD_EN) those bits are RX_EN|RX_LEN|TX_LINE|RX_LINE
- * (reg_norflaship_v2.h:139-148), not an address -- e.g. the NOR RC
- * calibration issues 0x9F with reg000=0x619f (RX_EN|rx_len=3), which a
- * naive addr==0x61 check would misroute to NAND. Real NAND traffic has
- * never been observed on this controller yet (NAND probe never runs this
- * early); the route is reinstated once the actual chip-select scheme is
- * identified from real command traffic. */
-    (void)bes_nand_exec;
-
     switch (cmd) {
     case FLASH_CMD_ID: {
         uint32_t n = rx_len ? MIN(rx_len / (bes_flash_dual(s) ? 2 : 1),
@@ -483,7 +448,7 @@ static void bes_flash_exec(BesFlashState *s, uint32_t reg000)
     case FLASH_CMD_DUAL_IO_READ:
     case FLASH_CMD_QUAD_OUT_READ:
     case FLASH_CMD_QUAD_IO_READ:
-    case FLASH_CMD_DTR_QUAD_READ: {
+    case FLASH_CMD_DTR_QUAD_READ:
         /* data read: controller re-assembles the logical byte stream
          * itself, RX FIFO carries plain bytes (norflash_drv.c:2768-2780) */
         if (rx_len && addr < s->size) {
@@ -491,15 +456,11 @@ static void bes_flash_exec(BesFlashState *s, uint32_t reg000)
                               MIN(rx_len, s->size - addr));
         }
         break;
-    }
     case FLASH_CMD_SECREG_READ:
         /* security registers are one-time-programmable area; never
          * programmed on this unit -> erased state 0xFF */
         if (rx_len) {
-            uint8_t ff[FLASH_RXFIFO_DEPTH];
-
-            memset(ff, 0xFF, sizeof(ff));
-            bes_flash_rx_fill(s, ff, rx_len);
+            bes_flash_rx_fill_pad(s, NULL, 0, rx_len, 0xFF);
         }
         break;
     case FLASH_CMD_WRITE_ENABLE:
@@ -533,10 +494,7 @@ static void bes_flash_exec(BesFlashState *s, uint32_t reg000)
         break;
     case FLASH_CMD_CHIP_ERASE:
     case FLASH_CMD_CHIP_ERASE2:
-        if (s->rom_map) {
-            qemu_log_mask(LOG_UNIMP,
-                          "bes.flash: chip erase ignored on read-only backend\n");
-        } else if (s->sr & FLASH_SR_WEL) {
+        if (s->sr & FLASH_SR_WEL) {
             memset(s->storage, 0xFF, s->size);
             s->sr &= ~FLASH_SR_WEL;
         }
@@ -581,17 +539,16 @@ static void bes_flash_exec(BesFlashState *s, uint32_t reg000)
          * parts (norflash_drv.c:2441-2487 list). Report erased state so
          * any unexpected probe sees "no table". */
         if (rx_len) {
-            uint8_t ff[FLASH_RXFIFO_DEPTH];
+            uint8_t ff[32];
 
             memset(ff, 0xFF, sizeof(ff));
-            bes_flash_respond_reg(s, ff, MIN(rx_len,
-                                             (uint32_t)sizeof(ff)));
+            bes_flash_respond_reg(s, ff, MIN(rx_len, (uint32_t)sizeof(ff)));
         }
         break;
     case FLASH_CMD_SECREG_ERASE:
         break;
     default:
-        qemu_log_mask(LOG_UNIMP, "bes.flash: unknown cmd 0x%02x\n", cmd);
+        qemu_log_mask(LOG_UNIMP, "bes.flash: unknown NOR cmd 0x%02x\n", cmd);
         break;
     }
 
@@ -609,25 +566,292 @@ static void bes_flash_exec(BesFlashState *s, uint32_t reg000)
     }
 }
 
+/* ======================================================================
+ * SPI NAND chip model
+ * ====================================================================== */
+
+static uint32_t bes_nand_phys_page(BesFlashState *s)
+{
+    return s->nand_page + s->nand_oob;
+}
+
+static uint32_t bes_nand_rows(BesFlashState *s)
+{
+    return s->nand_blocks * s->nand_ppb;
+}
+
+static bool bes_nand_io(BesFlashState *s, uint32_t row, uint8_t *buf,
+                        uint32_t len, bool write)
+{
+    uint64_t off = (uint64_t)row * bes_nand_phys_page(s);
+
+    if (fseeko(s->nand_fp, off, SEEK_SET) != 0) {
+        return false;
+    }
+    if (write) {
+        return fwrite(buf, 1, len, s->nand_fp) == len &&
+               fflush(s->nand_fp) == 0;
+    }
+    return fread(buf, 1, len, s->nand_fp) == len;
+}
+
+static void bes_nand_feature_reset(BesFlashState *s)
+{
+    memset(s->nand_feat, 0, sizeof(s->nand_feat));
+    /* power-up defaults: all blocks locked (BP bits set) and internal ECC
+     * on. Block-protect ranges are not enforced: firmware nandflash_init
+     * always clears the protection bits (sub_C221978) before use. */
+    s->nand_feat[NAND_FEAT_PROT] = 0x38;
+    s->nand_feat[NAND_FEAT_CFG] = NAND_CFG_ECC_EN;
+}
+
+static void bes_nand_consume_tx(BesFlashState *s, uint32_t n)
+{
+    n = MIN(n, s->tx_cnt);
+    if (n) {
+        memmove(s->txfifo, s->txfifo + n, s->tx_cnt - n);
+        s->tx_cnt -= n;
+    }
+}
+
+/* PROGRAM LOAD streaming: move bytes into the page cache */
+static void bes_nand_load_bytes(BesFlashState *s, const uint8_t *data,
+                                uint32_t n)
+{
+    uint32_t phys = bes_nand_phys_page(s);
+    uint32_t i;
+
+    n = MIN(n, s->nand_load_left);
+    for (i = 0; i < n; i++) {
+        if (s->nand_load_col < phys) {
+            s->nand_cache[s->nand_load_col] = data[i];
+        }
+        s->nand_load_col++;
+    }
+    s->nand_load_left -= n;
+    if (s->nand_load_left == 0) {
+        s->nand_load_active = false;
+    }
+}
+
+static void bes_nand_exec(BesFlashState *s, uint8_t cmd, uint32_t addr,
+                          bool ext, uint32_t tx_len, uint32_t rx_len)
+{
+    uint32_t phys = bes_nand_phys_page(s);
+    uint8_t *st = &s->nand_feat[NAND_FEAT_STATUS];
+    uint32_t row;
+
+    if (s->nand_dpd && cmd != NAND_CMD_RELEASE_DP) {
+        /* a chip in deep power-down ignores everything but release */
+        if (ext) {
+            bes_nand_consume_tx(s, tx_len);
+        }
+        return;
+    }
+
+    switch (cmd) {
+    case NAND_CMD_RESET:
+        bes_nand_feature_reset(s);
+        s->nand_load_active = false;
+        break;
+    case NAND_CMD_READ_ID: {
+        uint8_t id[3] = { s->nand_id >> 16, s->nand_id >> 8, s->nand_id };
+
+        bes_flash_rx_fill_pad(s, id, sizeof(id), rx_len ? rx_len : 3, 0x00);
+        break;
+    }
+    case NAND_CMD_WRITE_ENABLE:
+        *st |= NAND_ST_WEL;
+        break;
+    case NAND_CMD_WRITE_DISABLE:
+        *st &= ~NAND_ST_WEL;
+        break;
+    case NAND_CMD_GET_FEATURE: {
+        uint8_t v = s->nand_feat[s->tx_cnt ? s->txfifo[0] : 0];
+
+        bes_flash_rx_fill_pad(s, &v, 1, rx_len ? rx_len : 1, v);
+        break;
+    }
+    case NAND_CMD_SET_FEATURE:
+        if (s->tx_cnt >= 2) {
+            uint8_t fa = s->txfifo[0];
+
+            if (fa == NAND_FEAT_STATUS) {
+                /* status is read-only */
+            } else {
+                s->nand_feat[fa] = s->txfifo[1];
+            }
+        }
+        break;
+    case NAND_CMD_PAGE_READ:
+        row = addr & 0xFFFFFF;
+        trace_bes_nand_page_read(row);
+        if (row >= bes_nand_rows(s) ||
+            !bes_nand_io(s, row, s->nand_cache, phys, false)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "bes.nand: page read of row 0x%x failed\n", row);
+            memset(s->nand_cache, 0xFF, phys);
+        }
+        /* internal ECC on a perfect store: never any bit errors */
+        *st &= ~(NAND_ST_OIP | 0x70);
+        break;
+    case NAND_CMD_READ_CACHE:
+    case NAND_CMD_FAST_READ_CACHE:
+    case NAND_CMD_READ_CACHE_X2:
+    case NAND_CMD_READ_CACHE_X4:
+    case NAND_CMD_READ_CACHE_DIO:
+    case NAND_CMD_READ_CACHE_QIO: {
+        uint32_t col = addr & 0xFFFF;
+
+        if (rx_len) {
+            bes_flash_rx_fill_pad(s, s->nand_cache + MIN(col, phys),
+                                  col < phys ? phys - col : 0, rx_len, 0xFF);
+        }
+        break;
+    }
+    case NAND_CMD_PROGRAM_LOAD:
+    case NAND_CMD_PROGRAM_LOAD_X4:
+    case NAND_CMD_RND_LOAD:
+    case NAND_CMD_RND_LOAD_X4: {
+        uint32_t n;
+
+        if (cmd == NAND_CMD_PROGRAM_LOAD || cmd == NAND_CMD_PROGRAM_LOAD_X4) {
+            /* plain load resets the cache; random load keeps it */
+            memset(s->nand_cache, 0xFF, phys);
+        }
+        s->nand_load_col = addr & 0xFFFF;
+        s->nand_load_left = tx_len;
+        s->nand_load_active = tx_len != 0;
+        n = MIN(s->tx_cnt, tx_len);
+        bes_nand_load_bytes(s, s->txfifo, n);
+        bes_nand_consume_tx(s, n);
+        return;
+    }
+    case NAND_CMD_PROGRAM_EXEC:
+        row = addr & 0xFFFFFF;
+        trace_bes_nand_program(row);
+        *st &= ~(NAND_ST_OIP | NAND_ST_PFAIL);
+        if (!(*st & NAND_ST_WEL)) {
+            break;
+        }
+        if (row < bes_nand_rows(s)) {
+            uint8_t page[BES_NAND_MAX_PAGE];
+            uint32_t i;
+
+            if (bes_nand_io(s, row, page, phys, false)) {
+                for (i = 0; i < phys; i++) {
+                    page[i] &= s->nand_cache[i];    /* program: 1 -> 0 only */
+                }
+                if (!bes_nand_io(s, row, page, phys, true)) {
+                    *st |= NAND_ST_PFAIL;
+                }
+            } else {
+                *st |= NAND_ST_PFAIL;
+            }
+        } else {
+            *st |= NAND_ST_PFAIL;
+        }
+        *st &= ~NAND_ST_WEL;
+        break;
+    case NAND_CMD_BLOCK_ERASE:
+        row = addr & 0xFFFFFF;
+        trace_bes_nand_erase(row);
+        *st &= ~(NAND_ST_OIP | NAND_ST_EFAIL);
+        if (!(*st & NAND_ST_WEL)) {
+            break;
+        }
+        row -= row % s->nand_ppb;
+        if (row < bes_nand_rows(s)) {
+            uint8_t ff[BES_NAND_MAX_PAGE];
+            uint32_t p;
+
+            memset(ff, 0xFF, phys);
+            for (p = 0; p < s->nand_ppb; p++) {
+                if (!bes_nand_io(s, row + p, ff, phys, true)) {
+                    *st |= NAND_ST_EFAIL;
+                    break;
+                }
+            }
+        } else {
+            *st |= NAND_ST_EFAIL;
+        }
+        *st &= ~NAND_ST_WEL;
+        break;
+    case NAND_CMD_DIE_SELECT:
+        if (s->tx_cnt && s->txfifo[0] != 0) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "bes.nand: select of absent die %u\n",
+                          s->txfifo[0]);
+        }
+        break;
+    case NAND_CMD_DEEP_POWERDOWN:
+        s->nand_dpd = true;
+        break;
+    case NAND_CMD_RELEASE_DP:
+        s->nand_dpd = false;
+        break;
+    default:
+        qemu_log_mask(LOG_UNIMP, "bes.nand: unknown cmd 0x%02x\n", cmd);
+        break;
+    }
+
+    /* extended-mode commands own their TX phase (address/value bytes) */
+    if (ext) {
+        bes_nand_consume_tx(s, tx_len);
+    }
+}
+
+/* ======================================================================
+ * controller
+ * ====================================================================== */
+
+static void bes_flash_exec(BesFlashState *s, uint32_t reg000)
+{
+    uint8_t cmd = R000_CMD(reg000);
+    uint32_t addr = R000_ADDR(reg000);
+    bool ext = s->regs[FLASH_REG_004 / 4] & R004_NEW_CMD_EN;
+    uint32_t tx_len = R004_BLOCK_SIZE(s->regs[FLASH_REG_004 / 4]);
+    /* normal mode: BLOCK_SIZE is the RX count for read commands
+     * (hal_norflaship_v2.c:202-210, norflash_drv.c:2761-2766);
+     * extended mode: RX length comes from REG_000 when RX_EN. In extended
+     * mode REG_000[31:8] carries RX_EN|RX_LEN|TX_LINE|RX_LINE
+     * (reg_norflaship_v2.h:139-148), not an address. */
+    uint32_t rx_len = ext ? ((reg000 & R000_NEW_CMD_RX_EN) ?
+                             R000_NEW_CMD_RX_LEN(reg000) : 0) : tx_len;
+
+    trace_bes_flash_cmd(bes_flash_is_nand(s) ? "nand" : "nor", cmd,
+                        ext ? 0 : addr, ext, tx_len, rx_len);
+
+    /* a new transaction replaces whatever was left in the RX stream */
+    s->rx_cnt = 0;
+    s->rx_pos = 0;
+    if (bes_flash_is_nand(s)) {
+        bes_nand_exec(s, cmd, ext ? 0 : addr, ext, tx_len, rx_len);
+    } else {
+        bes_nor_exec(s, cmd, addr, tx_len, rx_len);
+    }
+}
+
 static uint32_t bes_flash_status(BesFlashState *s)
 {
+    uint32_t rx_left = s->rx_cnt - s->rx_pos;
     uint32_t v = 0;
 
     /* REG_00C, CTRL_VER>=7 layout (reg_norflaship_v2.h:186-202) */
-    if (s->rx_cnt - s->rx_pos == 0) {
+    if (rx_left == 0) {
         v |= (1 << 3);   /* RXFIFO_EMPTY */
     }
     if (s->tx_cnt == 0) {
         v |= (1 << 1);   /* TXFIFO_EMPTY */
     }
-    if (s->tx_cnt >= FLASH_TXFIFO_DEPTH) {
+    if (s->tx_cnt >= BES_FLASH_TXFIFO_DEPTH) {
         v |= (1 << 2);   /* TXFIFO_FULL */
     }
-    v |= ((s->rx_cnt - s->rx_pos) & 0x1F) << 4;         /* RXFIFO_COUNT */
+    v |= MIN(rx_left, FLASH_RXFIFO_COUNT_MAX) << 4;     /* RXFIFO_COUNT */
     /* TXFIFO_EMPCNT is a 5-bit field (max 31); an empty FIFO must read
      * 31, not (32 & 0x1F)=0 which firmware would take as "FIFO full"
      * (hal_norflaship_v2.c:132-169) */
-    v |= (MIN(FLASH_TXFIFO_DEPTH - s->tx_cnt, 31) & 0x1F) << 9;
+    v |= (MIN(BES_FLASH_TXFIFO_DEPTH - s->tx_cnt, 31) & 0x1F) << 9;
     /* BUSY(bit0) = 0: transactions complete instantly */
     return v;
 }
@@ -641,40 +865,11 @@ static uint64_t bes_flash_read(void *opaque, hwaddr offset, unsigned size)
     case FLASH_REG_00C:
         v = bes_flash_status(s);
         break;
-    case FLASH_REG_010: {
-        /* RX FIFO pop unit comes from REG_204 CFG_RXSIZE[18:17]
-         * (0=1B/1=2B/2=4B, hal_norflaship_v2.c:989-1002), NOT from the
-         * CPU access size: the SDK reads REG_010 as a word even in
-         * 1-byte mode and consumes only the low byte
-         * (hal_norflaship_v2.c:198-201, norflash_drv.c:1483-1485). */
-        uint32_t cfg = (s->regs[FLASH_REG_204 / 4] >> 17) & 0x3;
-        uint32_t width = 1 << MIN(cfg, 2);
-        uint32_t n;
-
-        for (n = 0; n < width && s->rx_pos < s->rx_cnt; n++) {
-            v |= (uint64_t)s->rxfifo[s->rx_pos++] << (n * 8);
-        }
-        if (current_cpu) {   /* debug: who pops RX FIFO */
-            CPUARMState *env = &(ARM_CPU(current_cpu)->env);
-            uint32_t sp = env->regs[13];
-            uint32_t w0 = 0, w1 = 0, w2 = 0, w3 = 0;
-
-            address_space_read(&address_space_memory, sp,
-                               MEMTXATTRS_UNSPECIFIED, &w0, 4);
-            address_space_read(&address_space_memory, sp + 4,
-                               MEMTXATTRS_UNSPECIFIED, &w1, 4);
-            address_space_read(&address_space_memory, sp + 8,
-                               MEMTXATTRS_UNSPECIFIED, &w2, 4);
-            address_space_read(&address_space_memory, sp + 12,
-                               MEMTXATTRS_UNSPECIFIED, &w3, 4);
-            qemu_log_mask(LOG_UNIMP,
-                          "bes.flash: rxpop pc=0x%08x lr=0x%08x v=0x%02llx "
-                          "sp=0x%08x [%08x %08x %08x %08x]\n",
-                          env->regs[15], env->regs[14],
-                          (unsigned long long)v, sp, w0, w1, w2, w3);
-        }
+    case FLASH_REG_008:     /* DMA data port */
+    case FLASH_REG_010:
+        v = bes_flash_rx_pop(s);
+        bes_flash_update_dma(s);
         break;
-    }
     case FLASH_REG_018:
         v = 0;   /* self-clearing */
         break;
@@ -685,8 +880,8 @@ static uint64_t bes_flash_read(void *opaque, hwaddr offset, unsigned size)
         break;
     }
 
-    qemu_log_mask(LOG_UNIMP, "bes.flash: read  off=0x%03x -> 0x%0*llx\n",
-                  (unsigned)offset, size * 2, (unsigned long long)v);
+    trace_bes_flash_reg_read(bes_flash_is_nand(s) ? "nand" : "nor",
+                             (uint32_t)offset, (uint32_t)v);
     return v;
 }
 
@@ -695,47 +890,36 @@ static void bes_flash_write(void *opaque, hwaddr offset, uint64_t value,
 {
     BesFlashState *s = BES_FLASH(opaque);
 
-    qemu_log_mask(LOG_UNIMP, "bes.flash: write off=0x%03x = 0x%0*llx\n",
-                  (unsigned)offset, size * 2, (unsigned long long)value);
+    trace_bes_flash_reg_write(bes_flash_is_nand(s) ? "nand" : "nor",
+                              (uint32_t)offset, (uint32_t)value);
 
     switch (offset) {
     case FLASH_REG_000:
         s->regs[0] = value;
-        if (current_cpu && (value & 0xFF) == 0x9F) {
-            CPUARMState *env = &(ARM_CPU(current_cpu)->env);
-            uint32_t sp = env->regs[13];
-            uint32_t w[16];
-            int i;
-
-            memset(w, 0, sizeof(w));
-            for (i = 0; i < 16; i++) {
-                if (address_space_read(&address_space_memory, sp + 4 * i,
-                                       MEMTXATTRS_UNSPECIFIED,
-                                       &w[i], 4) != MEMTX_OK) {
-                    break;
-                }
-            }
-            qemu_log_mask(LOG_UNIMP,
-                          "bes.flash: cmd9f pc=0x%08x lr=0x%08x sp=0x%08x\n"
-                          "  %08x %08x %08x %08x %08x %08x %08x %08x\n"
-                          "  %08x %08x %08x %08x %08x %08x %08x %08x\n",
-                          env->regs[15], env->regs[14], sp,
-                          w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7],
-                          w[8], w[9], w[10], w[11], w[12], w[13], w[14],
-                          w[15]);
-        }
         bes_flash_exec(s, value);
         break;
     case FLASH_REG_008: {
         /* TX FIFO push, byte-wise regardless of access size */
-        uint32_t n;
+        uint8_t b[4];
+        uint32_t n, i = 0;
 
         for (n = 0; n < size; n++) {
-            if (s->tx_cnt < FLASH_TXFIFO_DEPTH) {
-                s->txfifo[s->tx_cnt++] = (value >> (n * 8)) & 0xFF;
+            b[n] = (value >> (n * 8)) & 0xFF;
+        }
+        /* a streaming NAND PROGRAM LOAD takes bytes straight into the
+         * page cache once its queued FIFO contents are consumed */
+        if (s->nand_load_active) {
+            uint32_t take = MIN(size, s->nand_load_left);
+
+            bes_nand_load_bytes(s, b, take);
+            i = take;
+        }
+        for (; i < size; i++) {
+            if (s->tx_cnt < BES_FLASH_TXFIFO_DEPTH) {
+                s->txfifo[s->tx_cnt++] = b[i];
             }
         }
-        /* a pending page-program completes once the full page arrived */
+        /* a pending NOR page-program completes once the full page arrived */
         if (s->pp_active && s->tx_cnt >= s->pp_total) {
             bes_flash_do_program(s);
         }
@@ -756,11 +940,47 @@ static void bes_flash_write(void *opaque, hwaddr offset, uint64_t value,
         }
         break;
     }
+    bes_flash_update_dma(s);
 }
 
 static const MemoryRegionOps bes_flash_ops = {
     .read = bes_flash_read,
     .write = bes_flash_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .impl.min_access_size = 1,
+    .impl.max_access_size = 4,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
+/* NAND memory-mapped window: read-from-cache at column = offset */
+static uint64_t bes_flash_window_read(void *opaque, hwaddr offset,
+                                      unsigned size)
+{
+    BesFlashState *s = BES_FLASH(opaque);
+    uint32_t phys = bes_nand_phys_page(s);
+    uint64_t v = 0;
+    unsigned n;
+
+    for (n = 0; n < size; n++) {
+        uint32_t col = offset + n;
+
+        v |= (uint64_t)(col < phys ? s->nand_cache[col] : 0xFF) << (n * 8);
+    }
+    return v;
+}
+
+static void bes_flash_window_write(void *opaque, hwaddr offset,
+                                   uint64_t value, unsigned size)
+{
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "bes.nand: write to read-only cache window +0x%x\n",
+                  (unsigned)offset);
+}
+
+static const MemoryRegionOps bes_flash_window_ops = {
+    .read = bes_flash_window_read,
+    .write = bes_flash_window_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .impl.min_access_size = 1,
     .impl.max_access_size = 4,
@@ -778,7 +998,7 @@ uint8_t *bes_flash_data(BesFlashState *s)
     return s->storage;
 }
 
-/* write the storage back to the backing image on exit */
+/* write the NOR storage back to the backing image on exit */
 static void bes_flash_shutdown(Notifier *n, void *opaque)
 {
     BesFlashState *s = BES_FLASH(opaque);
@@ -802,54 +1022,104 @@ static void bes_flash_shutdown(Notifier *n, void *opaque)
     fclose(fp);
 }
 
+/* open (or create erased) the NAND backing file */
+static bool bes_nand_open(BesFlashState *s, Error **errp)
+{
+    uint64_t want;
+    int64_t have;
+
+    if (s->nand_page == 0 || s->nand_ppb == 0 || s->nand_blocks == 0 ||
+        s->nand_page + s->nand_oob > BES_NAND_MAX_PAGE) {
+        error_setg(errp, "bes.flash: invalid NAND geometry %u+%u x %u x %u",
+                   s->nand_page, s->nand_oob, s->nand_ppb, s->nand_blocks);
+        return false;
+    }
+    want = (uint64_t)bes_nand_rows(s) * bes_nand_phys_page(s);
+
+    s->nand_fp = fopen(s->nand_image, "r+b");
+    if (!s->nand_fp) {
+        uint8_t *ff = g_malloc(1024 * 1024);
+        uint64_t off;
+
+        s->nand_fp = fopen(s->nand_image, "w+b");
+        if (!s->nand_fp) {
+            g_free(ff);
+            error_setg_errno(errp, errno, "bes.flash: cannot create NAND "
+                             "image '%s'", s->nand_image);
+            return false;
+        }
+        memset(ff, 0xFF, 1024 * 1024);
+        for (off = 0; off < want; off += 1024 * 1024) {
+            size_t n = MIN(1024 * 1024, want - off);
+
+            if (fwrite(ff, 1, n, s->nand_fp) != n) {
+                g_free(ff);
+                error_setg(errp, "bes.flash: short write creating '%s'",
+                           s->nand_image);
+                return false;
+            }
+        }
+        g_free(ff);
+        fflush(s->nand_fp);
+        info_report("bes.flash: created erased NAND image '%s'",
+                    s->nand_image);
+    }
+    if (fseeko(s->nand_fp, 0, SEEK_END) != 0 ||
+        (have = ftello(s->nand_fp)) < 0 || (uint64_t)have != want) {
+        error_setg(errp, "bes.flash: NAND image '%s' must be %" PRIu64
+                   " bytes ((%u + %u) x %u x %u)", s->nand_image, want,
+                   s->nand_page, s->nand_oob, s->nand_ppb, s->nand_blocks);
+        fclose(s->nand_fp);
+        s->nand_fp = NULL;
+        return false;
+    }
+    info_report("bes.flash: NAND id %06x, %u MiB, image '%s'", s->nand_id,
+                (uint32_t)(((uint64_t)bes_nand_rows(s) * s->nand_page) >> 20),
+                s->nand_image);
+    return true;
+}
+
 static void bes_flash_realize(DeviceState *dev, Error **errp)
 {
     BesFlashState *s = BES_FLASH(dev);
     FILE *fp;
 
-    /* read-only mmap backend for huge ROMs (resource flash): demand
-     * paging, no physical memory cost */
-    if (s->rom_image) {
-        GMappedFile *mf;
+    memory_region_init_io(&s->iomem, OBJECT(dev), &bes_flash_ops, s,
+                          "bes.flash", 0x400);
+    /* The DMA engine pulls/pushes the REG_008 data port synchronously
+     * when this device raises its request from inside a register access
+     * (e.g. the REG_000 write that starts a page read), which the default
+     * re-entrancy guard would block. */
+    s->iomem.disable_reentrancy_guard = true;
+    sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
+    sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->dma_req);
+
+    if (s->nand_image) {
+        if (!bes_nand_open(s, errp)) {
+            return;
+        }
+        memory_region_init_io(&s->window, OBJECT(dev), &bes_flash_window_ops,
+                              s, "bes.flash.nand-window", 0x4000000);
+        sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->window);
+        return;
+    }
+
+    if (s->size == 0) {
+        error_setg(errp, "bes.flash: size property is required");
+        return;
+    }
+
+    /* NOR storage backend, erased state = 0xFF. RAMBlock name must be
+     * unique across instances. */
+    {
         g_autofree char *name =
             g_strdup_printf("bes.flash.storage.%p", (void *)s);
-        uint64_t fsize;
 
-        mf = g_mapped_file_new(s->rom_image, FALSE, NULL);
-        if (!mf) {
-            error_setg(errp, "bes.flash: cannot mmap rom image '%s'",
-                       s->rom_image);
-            return;
-        }
-        fsize = g_mapped_file_get_length(mf);
-        if (s->size == 0 || s->size > fsize) {
-            s->size = fsize;
-        }
-        s->rom_map = mf;
-        s->storage = (uint8_t *)g_mapped_file_get_contents(mf);
-        memory_region_init_ram_ptr(&s->storage_mr, OBJECT(dev), name,
-                                   s->size, s->storage);
-        memory_region_set_readonly(&s->storage_mr, true);
-        info_report("bes.flash: rom image '%s' mapped, 0x%x bytes",
-                    s->rom_image, s->size);
-    } else {
-        if (s->size == 0) {
-            error_setg(errp, "bes.flash: size property is required");
-            return;
-        }
-
-        /* storage backend, NOR erased state = 0xFF. RAMBlock name must be
-         * unique across instances (flash0/flash1 share this model). */
-        {
-            g_autofree char *name =
-                g_strdup_printf("bes.flash.storage.%p", (void *)s);
-
-            memory_region_init_ram(&s->storage_mr, OBJECT(dev), name,
-                                   s->size, &error_fatal);
-        }
-        s->storage = memory_region_get_ram_ptr(&s->storage_mr);
-        memset(s->storage, 0xFF, s->size);
+        memory_region_init_ram(&s->storage_mr, OBJECT(dev), name,
+                               s->size, &error_fatal);
     }
+    s->storage = memory_region_get_ram_ptr(&s->storage_mr);
+    memset(s->storage, 0xFF, s->size);
 
     /* optional backing image: load content, write back on shutdown */
     if (s->image) {
@@ -867,60 +1137,6 @@ static void bes_flash_realize(DeviceState *dev, Error **errp)
         s->shutdown_notifier.notify = bes_flash_shutdown;
         qemu_register_shutdown_notifier(&s->shutdown_notifier);
     }
-
-    /* SPI NAND backend (writable mmap; created erased-0xFF if absent).
-     * Demand-paged like rom-image but writable, so no RAM cost for the
-     * 132MB NAND address space. */
-    if (s->nand_image) {
-        GMappedFile *mf = g_mapped_file_new(s->nand_image, TRUE, NULL);
-
-        if (!mf || g_mapped_file_get_length(mf) < BES_NAND_TOTAL_BYTES) {
-            uint8_t *ff;
-            FILE *nfp;
-
-            if (mf) {
-                g_mapped_file_unref(mf);
-                mf = NULL;
-            }
-            nfp = fopen(s->nand_image, "wb");
-            if (!nfp) {
-                error_setg(errp, "bes.flash: cannot create nand image '%s'",
-                           s->nand_image);
-                return;
-            }
-            ff = g_malloc(1024 * 1024);
-            memset(ff, 0xFF, 1024 * 1024);
-            for (uint32_t off = 0; off < BES_NAND_TOTAL_BYTES;
-                 off += 1024 * 1024) {
-                uint32_t n = MIN(1024 * 1024u,
-                                 BES_NAND_TOTAL_BYTES - off);
-                if (fwrite(ff, 1, n, nfp) != n) {
-                    g_free(ff);
-                    fclose(nfp);
-                    error_setg(errp,
-                               "bes.flash: short write creating '%s'",
-                               s->nand_image);
-                    return;
-                }
-            }
-            g_free(ff);
-            fclose(nfp);
-            mf = g_mapped_file_new(s->nand_image, TRUE, NULL);
-        }
-        if (!mf) {
-            error_setg(errp, "bes.flash: cannot mmap nand image '%s'",
-                       s->nand_image);
-            return;
-        }
-        s->nand_map = mf;
-        s->nand_size = g_mapped_file_get_length(mf);
-        info_report("bes.flash: nand image '%s' mapped, 0x%x bytes",
-                    s->nand_image, s->nand_size);
-    }
-
-    memory_region_init_io(&s->iomem, OBJECT(dev), &bes_flash_ops, s,
-                          "bes.flash", 0x400);
-    sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
 }
 
 static void bes_flash_reset(DeviceState *dev)
@@ -934,16 +1150,21 @@ static void bes_flash_reset(DeviceState *dev)
     s->pp_active = false;
     s->sr = 0;
     s->sr2 = 0;
-    memset(s->nand_sr, 0, sizeof(s->nand_sr));
-    s->nand_sr[BES_NAND_SR_ECC] = 1;
-    s->nand_cache_dirty = false;
+    bes_nand_feature_reset(s);
+    s->nand_load_active = false;
+    s->nand_dpd = false;
+    memset(s->nand_cache, 0xFF, sizeof(s->nand_cache));
 }
 
 static const Property bes_flash_props[] = {
     DEFINE_PROP_UINT32("size", BesFlashState, size, 0),
     DEFINE_PROP_STRING("image", BesFlashState, image),
-    DEFINE_PROP_STRING("rom-image", BesFlashState, rom_image),
     DEFINE_PROP_STRING("nand-image", BesFlashState, nand_image),
+    DEFINE_PROP_UINT32("nand-id", BesFlashState, nand_id, 0),
+    DEFINE_PROP_UINT32("nand-page-size", BesFlashState, nand_page, 2048),
+    DEFINE_PROP_UINT32("nand-oob-size", BesFlashState, nand_oob, 64),
+    DEFINE_PROP_UINT32("nand-pages-per-block", BesFlashState, nand_ppb, 64),
+    DEFINE_PROP_UINT32("nand-blocks", BesFlashState, nand_blocks, 0),
 };
 
 static void bes_flash_class_init(ObjectClass *klass, const void *data)

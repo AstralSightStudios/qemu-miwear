@@ -30,6 +30,7 @@
 #include "hw/misc/bes_pmu.h"
 #include "hw/misc/bes_i2c.h"
 #include "hw/misc/bes_lcdc.h"
+#include "hw/misc/bes_dma.h"
 #include "system/address-spaces.h"
 #include "system/reset.h"
 #include "system/system.h"
@@ -49,16 +50,35 @@
 #define BEST1503_UART1_BASE      0x4000C000
 #define BEST1503_UART2_BASE      0x4000D000
 #define BEST1503_AON_CMU_BASE    0x40080000
-/* flash0 控制器：SDK plat_addr_map_best1503.h:265 REAL_FLASH_CTRL_BASE；
- * flash1 控制器 :261 REAL_FLASH1_CTRL_BASE=0x40500000 —— resource romfs
- * （vela_resource.bin, ~164MB）所在的第二颗大容量 flash（固件在挂载
- * 文件系统前轮询 flash1 REG_00C）。 */
+/* flash 控制器：固件控制器表 0x2009D8F0（id0=0x40140000，id1=0x40500000；
+ * 与 SDK plat_addr_map_best1503.h:265/:261 一致）。
+ * flash0 = 代码 NOR；flash1 = SPI NAND（/dev/resource + /dev/nand_data，
+ * 固件 bes_nand_initialize sub_C19FDF0 以控制器 id 1 调 nandflash_init）。 */
 #define BEST1503_FLASH_CTRL_BASE  0x40140000
 #define BEST1503_FLASH1_CTRL_BASE 0x40500000
-/* flash1 后端容量 256MB（romfs 164MB 只能放得下 NAND/大 NOR 级别芯片）；
- * XIP 窗口 SDK :212 REAL_FLASH1X_BASE=0x14000000、:210 cached
- * REAL_FLASH1_BASE=0x34000000（后者只映射到外设区之前的 192MB） */
-#define BEST1503_FLASH1_XIP_BASE  0x14000000
+/* flash1 NC 窗口：NAND 驱动经 0x30000000 + column 直读页缓存（坏块标记
+ * sub_C2215FC、非对齐尾部 sub_C221680 里的立即数 0x30000000）。 */
+#define BEST1503_FLASH1_NC_BASE   0x30000000
+/* SPI NAND 芯片：固件 ID 表 0x2CCD4134 第 1 项（0x2CCD3FE4）：
+ * ID c8-f4-c8，2048+64B 页，128KB 块，512MB。选 512MB 的依据：
+ * bes_board_nand_initialize（sub_C20AB44）按容量选分区表，只有 512MB 表
+ * 的 resource 分区（0x19000 页 = 200MB，表 0x2CCC72C0）装得下
+ * vela_resource.bin（romfs 头标 171754096 字节）；128/256MB 表只有
+ * 0x10E00 页 = 141.5MB。整机实际贴片型号未知，表中 512MB/2KB 页的
+ * 候选里取首项。 */
+#define BEST1503_NAND_ID          0xC8F4C8
+#define BEST1503_NAND_PAGE        2048
+#define BEST1503_NAND_OOB         64
+#define BEST1503_NAND_PPB         64
+#define BEST1503_NAND_BLOCKS      4096
+/* 通用 DMA ×2：固件 hal_dma 基址表 0x2CCDA91C、NVIC 号表 0x2CCDA918
+ * （hal_dma_open sub_C22E8D0 装向量）。flash1 的 DMA 请求 = 外设号 28
+ * → DMA1 请求线 6（外设表 0x2CCDA924 下标 6，数据口 0x40500008）。 */
+#define BEST1503_DMA0_BASE        0x40120000
+#define BEST1503_DMA1_BASE        0x40130000
+#define BEST1503_DMA0_IRQ         3
+#define BEST1503_DMA1_IRQ         4
+#define BEST1503_FLASH1_DMA_REQ   6
 /* PSRAM PHY：SDK plat_addr_map_best1503.h:284 候选值，经固件运行时行为
  * 证实（PHY 校准时序公式 0x60/0x64 在 48MHz 下逐位吻合，见 bes_psram.c） */
 #define BEST1503_PSRAM_PHY_BASE  0x40168000
@@ -160,6 +180,10 @@ static ARMCPU *g_cpu;
  * 作为 bes_flash 后端并在退出时写回；缺省则由 -kernel 固件按
  * OTA_CODE_OFFSET 构造后端内容。 */
 static char *g_flash_image;
+/* -M best1503,nand-image=<file>：SPI NAND 后端（每页 page+oob 字节，
+ * 页序排列）。缺省 emu/nand.img；不存在时创建全擦除镜像。出厂内容
+ * （resource romfs）由 emu/mknand.py 生成。 */
+static char *g_nand_image;
 
 static char *best1503_get_flash_image(Object *obj, Error **errp)
 {
@@ -171,6 +195,18 @@ static void best1503_set_flash_image(Object *obj, const char *val,
 {
     g_free(g_flash_image);
     g_flash_image = g_strdup(val);
+}
+
+static char *best1503_get_nand_image(Object *obj, Error **errp)
+{
+    return g_strdup(g_nand_image);
+}
+
+static void best1503_set_nand_image(Object *obj, const char *val,
+                                    Error **errp)
+{
+    g_free(g_nand_image);
+    g_nand_image = g_strdup(val);
 }
 
 /*
@@ -247,11 +283,6 @@ static void best1503_init(MachineState *machine)
         uint32_t flash_nc_start = g_img.nc_base - g_img.ota_code_offset;
 
         qdev_prop_set_uint32(fc, "size", g_img.flash_size);
-        /* 同一控制器的 NAND die（addr==0x61 路由）：/dev/nand_data 的
-         * SPI NAND（yaffs /data）。实证：探测/事务命令全部落在
-         * flash0 控制器（bes.nand0 日志）。后端可写 mmap，不存在则
-         * 创建并填 0xFF（NAND 擦除态）。 */
-        qdev_prop_set_string(fc, "nand-image", "emu/nand_data.img");
         if (g_flash_image) {
             qdev_prop_set_string(fc, "image", g_flash_image);
         }
@@ -312,40 +343,6 @@ static void best1503_init(MachineState *machine)
                g_img.data_end - g_img.data_start);
     }
 
-    /* ---- boot ROM 驻留驱动段预加载 ----
-     * 真机 mask ROM 引导时把一组 norflash/ISPI 驱动函数与 libc 例程
-     * 驻留在 SRAM 低区（SDK hal_location.h：ROM_BUILD 的
-     * BOOT_TEXT_SRAM_LOC/SRAM_TEXT_LOC = .rom_ramx），AP 固件的
-     * thunk 表（0xC588xxx，LDR.W PC 绝对跳转）静态指向 RAMX
-     * 0x276660-0x2788FC ↔ VMA [0x20066660, 0x200688FC]。
-     * 实体只在芯片 mask ROM 中（实证：AP/BL2/OTA 镜像及真机
-     * 16MB flash dump 的 BL2 区均不含——dump 0xA2444 处为 BL2
-     * rodata 字符串而非代码，BL2 区无任何 LDR.W PC thunk）。
-     * 缺失时 NAND/flash 驱动经 thunk 跳入空区（0x0000 滑行、
-     * R0 不变），SPI NAND 读 ID 写不进驱动缓冲 →
-     * bes nandflash_init error → /dev/nand_data 挂载失败 →
-     * persist property 无法持久 → reboot 循环。
-     * 故以 SDK 语义（hal_norflaship_v2.c / norflash_drv.c）交叉
-     * 编译等价 helper（emu/romdrv），按 thunk 目标地址逐位摆放
-     * 入口跳板后预加载。 */
-    {
-        static const char *romdrv_path = "emu/romdrv/romdrv.bin";
-        FILE *rfp = fopen(romdrv_path, "rb");
-
-        if (rfp) {
-            /* romdrv.bin 链接基址为 RAMX 0x266600（== SRAM 0x20066600，
-             * 保证 b.w 相对跳转在 RAMX 执行时正确解析） */
-            size_t got = fread(memory_region_get_ram_ptr(&sram) + 0x66600,
-                               1, 0x20000, rfp);
-            fclose(rfp);
-            info_report("best1503: loaded %zu bytes romdrv helpers "
-                        "from '%s'", got, romdrv_path);
-        } else {
-            warn_report("best1503: romdrv helpers '%s' not found; "
-                        "mask-ROM driver area left empty", romdrv_path);
-        }
-    }
-
     /* ---- PSRAM：cached 窗口 + NC 别名（固件 sub_C0C0AC8 段复制证实） ---- */
     memory_region_init_ram(&psram, NULL, "best1503.psram",
                            BEST1503_PSRAM_SIZE, &error_fatal);
@@ -373,35 +370,18 @@ static void best1503_init(MachineState *machine)
                            &error_fatal);
     memory_region_add_subregion(sysmem, 0xD0210000, &bt_exch);
 
-    /* ---- flash1：resource romfs 所在的大容量 flash ----
-     * 后端为 rom-image（mmap 只读、按需分页）：romfs 只读使用，
-     * 256MB 级 RAM 后端在 Windows 宿主上会导致严重的性能问题
-     * （实测 64MB 以上 RAMBlock 使 TCG 执行慢两个数量级）。
-     * flash1 的 JEDEC ID 沿用 flash0 同款（GD 系列，固件同一张 ID 表
-     * 匹配）；若固件对 flash1 有独立 ID 要求，按 unimp/调试证据再调。 */
-    DeviceState *fc1 = NULL;
-    {
-        static MemoryRegion flash1_xip;
-        static const char *resource_path = "miwear.watch.p67tc_v3.101.043_full_a4ce8564/vela_resource.bin";
-        uint32_t f1size;
-
-        fc1 = qdev_new(TYPE_BES_FLASH);
-        qdev_prop_set_string(fc1, "rom-image", resource_path);
-        sysbus_realize_and_unref(SYS_BUS_DEVICE(fc1), &error_fatal);
-        sysbus_mmio_map(SYS_BUS_DEVICE(fc1), 0, BEST1503_FLASH1_CTRL_BASE);
-        f1size = BES_FLASH(fc1)->size;
-
-        memory_region_init_alias(&flash1_xip, NULL, "best1503.flash1_xip",
-                                 bes_flash_storage(BES_FLASH(fc1)), 0,
-                                 f1size);
-        memory_region_add_subregion(sysmem, BEST1503_FLASH1_XIP_BASE,
-                                    &flash1_xip);
-        /* cached 窗口（SDK REAL_FLASH1_BASE=0x34000000）不挂：
-         * 192MB 起步的映射会遮蔽 PSRAM cached（0x3C000000）。真机上
-         * flash1 的 cached 窗口与 PSRAM 不可能重叠，说明 romfs 访问
-         * 只走 XIP（0x14000000）；若固件访问 0x34000000，unimp 兜底
-         * 会记录，届时再按证据处理。 */
-    }
+    /* ---- flash1：SPI NAND（resource romfs + yaffs /data） ---- */
+    DeviceState *fc1 = qdev_new(TYPE_BES_FLASH);
+    qdev_prop_set_string(fc1, "nand-image",
+                         g_nand_image ? g_nand_image : "emu/nand.img");
+    qdev_prop_set_uint32(fc1, "nand-id", BEST1503_NAND_ID);
+    qdev_prop_set_uint32(fc1, "nand-page-size", BEST1503_NAND_PAGE);
+    qdev_prop_set_uint32(fc1, "nand-oob-size", BEST1503_NAND_OOB);
+    qdev_prop_set_uint32(fc1, "nand-pages-per-block", BEST1503_NAND_PPB);
+    qdev_prop_set_uint32(fc1, "nand-blocks", BEST1503_NAND_BLOCKS);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(fc1), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(fc1), 0, BEST1503_FLASH1_CTRL_BASE);
+    sysbus_mmio_map(SYS_BUS_DEVICE(fc1), 1, BEST1503_FLASH1_NC_BASE);
 
     /* ---- 伪 boot 向量表 @0x0（模拟 boot ROM 跳转，不碰固件） ---- */
     memory_region_init_ram(&g_bootvec, NULL, "best1503.bootvec", 0x1000,
@@ -518,6 +498,32 @@ static void best1503_init(MachineState *machine)
         sysbus_mmio_map(SYS_BUS_DEVICE(lcdc), 0, 0x40200000);
     }
 
+    /* 通用 DMA ×2（PL080 兼容 + BES 2D 扩展，见 bes_dma.c） */
+    {
+        static const struct {
+            uint32_t base;
+            int irq;
+        } dmas[] = {
+            { BEST1503_DMA0_BASE, BEST1503_DMA0_IRQ },
+            { BEST1503_DMA1_BASE, BEST1503_DMA1_IRQ },
+        };
+        DeviceState *dma[2];
+        int i;
+
+        for (i = 0; i < ARRAY_SIZE(dmas); i++) {
+            dma[i] = qdev_new(TYPE_BES_DMA);
+            object_property_set_link(OBJECT(dma[i]), "downstream",
+                                     OBJECT(sysmem), &error_fatal);
+            sysbus_realize_and_unref(SYS_BUS_DEVICE(dma[i]), &error_fatal);
+            sysbus_mmio_map(SYS_BUS_DEVICE(dma[i]), 0, dmas[i].base);
+            sysbus_connect_irq(SYS_BUS_DEVICE(dma[i]), 0,
+                               qdev_get_gpio_in(armv7m, dmas[i].irq));
+        }
+        sysbus_connect_irq(SYS_BUS_DEVICE(fc1), 0,
+                           qdev_get_gpio_in_named(dma[1], "dma-req",
+                                                  BEST1503_FLASH1_DMA_REQ));
+    }
+
     /* PSRAM 控制器对 @0x40168000（PHY）+ @0x40160000（MC/MGR 引擎） */
     {
         DeviceState *psramc = qdev_new(TYPE_BES_PSRAM);
@@ -567,6 +573,14 @@ static void best1503_machine_init(MachineClass *mc)
                                           "backing image file for the 16MB "
                                           "boot flash (loaded at startup, "
                                           "written back on exit)");
+    object_class_property_add_str(OBJECT_CLASS(mc), "nand-image",
+                                  best1503_get_nand_image,
+                                  best1503_set_nand_image);
+    object_class_property_set_description(OBJECT_CLASS(mc), "nand-image",
+                                          "backing file of the SPI NAND "
+                                          "(resource romfs + /data); "
+                                          "default emu/nand.img, created "
+                                          "erased if missing");
 }
 
 DEFINE_MACHINE_ARM("best1503", best1503_machine_init)

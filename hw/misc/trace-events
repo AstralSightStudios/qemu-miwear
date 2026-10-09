@@ -443,6 +443,14 @@ iommu_testdev_dma_verify(uint32_t expected, uint32_t actual) "expected=0x%x actu
 iommu_testdev_dma_result(uint32_t result) "DMA completed result=0x%x"
 iommu_testdev_dma_armed(bool armed) "armed=%d"
 
+# bes_flash.c
+bes_flash_cmd(const char *chip, uint8_t cmd, uint32_t addr, int ext, uint32_t tx_len, uint32_t rx_len) "%s cmd=0x%02x addr=0x%06x ext=%d tx_len=%u rx_len=%u"
+bes_flash_reg_read(const char *chip, uint32_t off, uint32_t val) "%s off=0x%03x -> 0x%08x"
+bes_flash_reg_write(const char *chip, uint32_t off, uint32_t val) "%s off=0x%03x = 0x%08x"
+bes_nand_page_read(uint32_t row) "row=0x%06x"
+bes_nand_program(uint32_t row) "row=0x%06x"
+bes_nand_erase(uint32_t row) "row=0x%06x"
+
 # bes_dma.c
 bes_dma_write(uint32_t off, uint32_t val) "off=0x%03x = 0x%08x"
 bes_dma_item_done(int chan, uint32_t next, int irq) "chan=%d next=0x%08x irq=%d"
