@@ -39,9 +39,13 @@
  * board wires TE to a GPIO interrupt that paces frame starts (display PM
  * thread sub_C224ECC).
  *
- * A started frame is composed from the enabled layers into the panel
- * window set by the last CASET/RASET, shown on a QEMU graphic console,
- * and completes after the QSPI transfer time with the frame-done IRQ.
+ * A started frame is composed from the enabled layers into the panel's
+ * frame memory (GRAM) at the window set by the last CASET/RASET, and
+ * completes after the QSPI transfer time with the frame-done IRQ.  The
+ * QEMU graphic console shows what the panel emits: the GRAM while the
+ * panel is out of sleep with the display on, black otherwise (an AMOLED
+ * panel in SLPIN / DISPOFF is dark; the firmware sends both when the
+ * screen times out).
  *
  * This code is licensed under the GPL version 2 or later.
  */
@@ -101,6 +105,7 @@ struct BesLcdcState {
     bool display_on;
     bool te_on;
     uint16_t win_x0, win_x1, win_y0, win_y1;
+    uint32_t *gram;             /* panel frame memory, panel_w x panel_h */
     QEMUTimer *te_timer;
     bool te_high;
     QEMUTimer *frame_timer;
@@ -126,6 +131,37 @@ static void bes_lcdc_update_irq(BesLcdcState *s)
 {
     qemu_set_irq(s->irq, !!(lcdc_reg(s, LCDC_IRQ_ISR) &
                             lcdc_reg(s, LCDC_IRQ_ENA)));
+}
+
+/* ---- panel: visible output ---- */
+
+static bool bes_lcdc_panel_visible(BesLcdcState *s)
+{
+    return !s->sleeping && s->display_on;
+}
+
+/* copy a GRAM rectangle to the console, or black while the panel is dark */
+static void bes_lcdc_show(BesLcdcState *s, unsigned x0, unsigned y0,
+                          unsigned w, unsigned h)
+{
+    DisplaySurface *surf = qemu_console_surface(s->con);
+    bool visible = bes_lcdc_panel_visible(s);
+    unsigned y;
+
+    if (!surf || surface_bits_per_pixel(surf) != 32) {
+        return;
+    }
+    for (y = y0; y < y0 + h; y++) {
+        uint8_t *dst = (uint8_t *)surface_data(surf) +
+                       y * surface_stride(surf) + x0 * 4;
+
+        if (visible) {
+            memcpy(dst, &s->gram[y * s->panel_w + x0], w * 4);
+        } else {
+            memset(dst, 0, w * 4);
+        }
+    }
+    qemu_console_update(s->con, x0, y0, w, h);
 }
 
 /* ---- panel: TE output ---- */
@@ -169,6 +205,7 @@ static void bes_lcdc_panel_cmd(BesLcdcState *s, uint32_t cmdword)
     uint8_t instr = cmdword >> 24;
     uint8_t dcs = cmdword >> 8;
     uint32_t p = lcdc_reg(s, LCDC_SPU_DATA0);
+    bool was_visible = bes_lcdc_panel_visible(s);
 
     trace_bes_lcdc_panel_cmd(instr, dcs, p);
     if (instr != 0x02) {
@@ -203,6 +240,9 @@ static void bes_lcdc_panel_cmd(BesLcdcState *s, uint32_t cmdword)
         break;
     }
     bes_lcdc_te_update(s);
+    if (bes_lcdc_panel_visible(s) != was_visible) {
+        bes_lcdc_show(s, 0, 0, s->panel_w, s->panel_h);
+    }
 }
 
 /* ---- frame composition ---- */
@@ -241,7 +281,6 @@ static unsigned lcdc_bpp(unsigned fmt)
 
 static void bes_lcdc_compose(BesLcdcState *s)
 {
-    DisplaySurface *surf = qemu_console_surface(s->con);
     uint32_t out = lcdc_reg(s, LCDC_SPU_OUT_SIZE);
     uint32_t ow = out & 0xFFF, oh = (out >> 16) & 0xFFF;
     uint32_t bg = lcdc_reg(s, LCDC_SPU_BGCOLOR) | 0xFF000000;
@@ -249,9 +288,6 @@ static void bes_lcdc_compose(BesLcdcState *s)
     uint8_t *src;
     unsigned x, y, l;
 
-    if (!surf || surface_bits_per_pixel(surf) != 32) {
-        return;
-    }
     if (!ow || !oh) {
         ow = s->win_x1 - s->win_x0 + 1;
         oh = s->win_y1 - s->win_y0 + 1;
@@ -308,13 +344,12 @@ static void bes_lcdc_compose(BesLcdcState *s)
                 }
             }
         }
-        memcpy((uint8_t *)surface_data(surf) +
-               (s->win_y0 + y) * surface_stride(surf) + s->win_x0 * 4,
+        memcpy(&s->gram[(s->win_y0 + y) * s->panel_w + s->win_x0],
                line, ow * 4);
     }
     g_free(src);
     g_free(line);
-    qemu_console_update(s->con, s->win_x0, s->win_y0, ow, oh);
+    bes_lcdc_show(s, s->win_x0, s->win_y0, ow, oh);
     trace_bes_lcdc_frame(ow, oh, s->win_x0, s->win_y0);
 }
 
@@ -409,6 +444,8 @@ static void bes_lcdc_reset(DeviceState *dev)
     s->win_y1 = s->panel_h - 1;
     s->frame_busy = false;
     s->te_high = false;
+    memset(s->gram, 0, s->panel_w * s->panel_h * 4);
+    bes_lcdc_show(s, 0, 0, s->panel_w, s->panel_h);
     timer_del(s->te_timer);
     timer_del(s->frame_timer);
     qemu_irq_lower(s->te);
@@ -422,6 +459,7 @@ static void bes_lcdc_realize(DeviceState *dev, Error **errp)
     s->frame_timer = timer_new_us(QEMU_CLOCK_VIRTUAL, bes_lcdc_frame_done, s);
     s->con = qemu_graphic_console_create(dev, 0, &bes_lcdc_gfx_ops, s);
     qemu_console_resize(s->con, s->panel_w, s->panel_h);
+    s->gram = g_new0(uint32_t, s->panel_w * s->panel_h);
 }
 
 static void bes_lcdc_init(Object *obj)
