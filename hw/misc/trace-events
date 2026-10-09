@@ -442,3 +442,7 @@ iommu_testdev_dma_read(uint64_t gva, uint32_t len) "gva=0x%" PRIx64 " len=%u"
 iommu_testdev_dma_verify(uint32_t expected, uint32_t actual) "expected=0x%x actual=0x%x"
 iommu_testdev_dma_result(uint32_t result) "DMA completed result=0x%x"
 iommu_testdev_dma_armed(bool armed) "armed=%d"
+
+# bes_dma.c
+bes_dma_write(uint32_t off, uint32_t val) "off=0x%03x = 0x%08x"
+bes_dma_item_done(int chan, uint32_t next, int irq) "chan=%d next=0x%08x irq=%d"

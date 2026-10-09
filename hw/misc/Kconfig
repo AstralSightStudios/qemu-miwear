@@ -213,6 +213,9 @@ config BES_I2C
 config BES_LCDC
     bool
 
+config BES_DMA
+    bool
+
 config LED
     bool
 
