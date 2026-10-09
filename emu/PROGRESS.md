@@ -189,10 +189,54 @@ AONCMU/CMU 魔术值 → UART（console, qemu chardev 直通终端）→ TIMER/S
 - [x] boot 到 miwear 应用（NuttX 全部服务起来，LVGL UI 主循环运行）
 - [x] 显示链路（LCDC 帧路径 + TE + VGLite GPU 光栅化 → QEMU 图形控制台；开机向导"选择语言"页可见）
 - [x] 触摸注入（Zinitix ZTW662 I2C 模型，I2C5@0x20，INT=GPIO76；宿主鼠标=手指，emu/touch.py 脚本注入）
-- [ ] 越过配对（未绑定 → 一直停在开机向导；见 7. ㉞）
+- [x] CPU 掉电休眠/唤醒（PSC + AON_CMU 复位向量）、熄屏/手势亮屏、系统时钟校准
+- [x] NSH 交互 shell（调试探针式注入，emu/nsh.py；生产固件本身无 shell）
+- [ ] 越过配对（未绑定 → 一直停在开机向导；见 7. ㉞。调试可用 NSH `setprop persist.setup_wizard 1`）
 - [ ] 快应用环境验证
 
 ## 7. 最新变更
+
+- **2026-10-09 (5)（掉电休眠、熄屏/亮屏、时钟、NSH，未提交）**：
+  ㊵**"上滑进启动器就崩溃"= CPU 掉电后永不唤醒**：空闲时 hal_sleep_deep_sleep
+  （sub_C10B5B8）→ hal_cmu_lpu_sleep(4)（sub_C10AB50）在栈上存 CMU 寄存器，
+  sub_C10BB78（RAM 中执行）保存 r4-r12/lr/PSP/MSPLIM/PSPLIM/PRIMASK/BASEPRI/
+  FAULTMASK/CONTROL、SP 存 SRAM，再写 PSC +0x18=0xCAFE0000、+0x00=0xCAFE0001
+  （MCU_PG_AUTO）、+0x10=0xCAFE0001（MCU_POWERDN_START）后 `b .` 等断电。唤醒
+  = 内核复位，向量表取自 **AON_CMU +0x78**（固件写 SCB->VTOR|旧值低 7 位，
+  RAM 函数经 sub_C0C22B0 调用）：startup sub_C0C1B08 在 SRAM 0x20076400 建
+  向量表并把复位向量设为恢复函数。模拟器原先 PSC 落在 unimp → 永久死循环，
+  画面停在最后一帧。现：**bes_psc**（新，写钥匙 0xCAFE，GPIO 中断子块仍归
+  bes_gpio 覆盖映射）掉电时 arm_set_cpu_off，NVIC 有可取中断即
+  arm_set_cpu_on_and_reset；**bes_aoncmu +0x78 → CPU init-svtor**（同
+  iotkit-sysctl INITSVTOR 做法，系统复位清 0 回到 boot ROM 向量）。实测 4 分钟
+  掉电/唤醒约 1400 次，启动器/引导页/应用列表正常。
+  ㊶**系统时钟 2 倍速**：AON_TIMER0 实为 16384Hz（32.768K 二分频）：
+  bes_freerun.c µs = ticks*1e6>>14，bes_oneshot.c 余量 /16384e6。原按 32768
+  计数，uptime 走 62s/墙钟 30s；改后 61s/60s，5s 熄屏也恢复为真实 5s。
+  ㊷**熄屏显示**：固件 5s 无操作发 0x51=0、DISPOFF、SLPIN（"panel sleep"）。
+  bes_lcdc 改为帧写入面板 GRAM，控制台只在 SLPOUT+DISPON 时显示 GRAM，否则
+  黑屏（原来一直显示最后一帧，像死机）。
+  ㊸**触摸手势唤醒**（zinitix_ts）：熄屏挂起 sub_C3F6D6C 写 0x00AF 手势使能
+  掩码 → 命令 0x0003 → 命令 0x0005（SLEEP）；挂起时中断处理 sub_C3F5F94 读
+  0x0126 手势码：1=双击、4=上滑（受 touch_double_click/touch_slide_up 设置
+  约束，二者都关时固件强制开双击）；恢复 sub_C3F67BC 重跑上电序列（0xC000=1…）。
+  模型：SLEEP 后只做手势检测（500ms 内两次点击=双击，抬起点比按下点高 1/4
+  屏=上滑），写 0xC000 / WAKEUP / SWRESET 退出。**宿主双击或上滑即可亮屏**。
+  ㊹**NSH**：生产固件 rcS 末行 `exit` 使 init NSH 结束（nsh_main sub_C6EE76C →
+  nsh_initialize 跑 rc.sysinit/rcS），串口特殊字符只开了 FORCE_PANIC(0x1F)/
+  SIGINT（uart_check_special sub_C1ABC64），无 TTY_LAUNCH，miwear_product_load
+  只在内置 JSON 损坏时失败，所有 system() 调用都是固定字符串——**没有合法的
+  数据入口**。emu/nsh.py `inject`：机器 -S 启动，经 gdbstub 在 nx_bringup 创建
+  init 任务后再调一次固件自己的 task_spawn（同一 attr/argv），拉起内建 `sh`
+  （nsh_system，无 rcS，继承 /dev/console）。不改固件字节；task_spawn 调用点
+  （"nsh_main" 字面量加载后的 BL）与 builtin 表（{name,prio,stack,main}）均从
+  镜像结构定位，本机 band 9/9 Pro/10 Pro/11 七个版本均唯一命中。
+  `NSH=5600 emu/run.sh <out> 0` + `emu/nsh.py console 5600`，提示符 `ap>`；
+  属调试探针性质，与"只在硬件接口层工作"的红线擦边，按需开启。
+  ㊺**cocoa**：GUI 模式加 show-cursor=on（宿主光标常显）；ui/cocoa.m 绝对坐标
+  模式下按下即抓取并下发、接受激活窗口的点击（原来后台启动的窗口前一两次
+  点击会被吞掉）。emu/ramlog.py 修复日志簇贴 PSRAM 末尾时输出为空。
+  仍存在：NFC eSE ese_read_kv 超时使 UI 初始化停约 42s（㉟）。
 
 - **2026-10-09 (3)（触摸 + I2C 总线化，commits ba1b73bd2e..）**：
   ㉜**bes_i2c 改为真正的 QEMU I2C 总线主控**：首字节（空闲/STOP/RESTART 之后）发起 start_send/start_recv，逐字节 i2c_send/i2c_recv，STOP 结束；只有无模型应答的地址才退回通用 256B 寄存器文件（板上大量未建模芯片：传感器、充电、NFC……）。

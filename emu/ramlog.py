@@ -66,6 +66,8 @@ def main():
             clusters.append([h, h, 1])
     start, end, _ = max(clusters, key=lambda c: c[2])
     end = data.find(b"\n", end)
+    if end < 0:
+        end = len(data) - 1
     text = data[start:end + 1].replace(b"\0", b"").decode("latin1")
     print("# ring buffer around 0x%08x..0x%08x" % (a.base + start, a.base + end),
           file=sys.stderr)
