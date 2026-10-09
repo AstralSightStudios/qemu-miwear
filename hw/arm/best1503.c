@@ -322,8 +322,9 @@ static void best1503_init(MachineState *machine)
      * 205-208：cached 0x2C/NC 0x28/XIP 0x0C/FLASHX_NC 0x08），固件经不同
      * 窗口访问代码与数据，故按 bes_image 解析出的三基址挂三个别名。
      * 固件写入后端偏移 OTA_CODE_OFFSET（真机 flash 布局，解析自 boot
-     * info）；若经 -M flash-image=<file> 提供完整 flash 镜像，则镜像
-     * 文件即后端内容（含 BL2/AP/参数区），不再单独写入固件。 */
+     * info）；-M flash-image=<file> 提供其余内容（BL2、参数区、nv/mode
+     * 分区的出厂数据，见 emu/mknor.py），-kernel 固件每次启动照样装入
+     * AP 分区（等同 OTA 升级），同一镜像可跨固件版本使用。 */
     DeviceState *fc = qdev_new(TYPE_BES_FLASH);
     {
         uint32_t flash_xip_start = g_img.xip_base - g_img.ota_code_offset;
@@ -337,10 +338,8 @@ static void best1503_init(MachineState *machine)
         sysbus_realize_and_unref(SYS_BUS_DEVICE(fc), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(fc), 0, BEST1503_FLASH_CTRL_BASE);
 
-        if (!g_flash_image) {
-            memcpy(bes_flash_data(BES_FLASH(fc)) + g_img.ota_code_offset,
-                   g_img.data, g_img.size);
-        }
+        memcpy(bes_flash_data(BES_FLASH(fc)) + g_img.ota_code_offset,
+               g_img.data, g_img.size);
 
         memory_region_init_alias(&flash, NULL, "best1503.flash_xip",
                                  bes_flash_storage(BES_FLASH(fc)), 0,
@@ -684,7 +683,9 @@ static void best1503_machine_init(MachineClass *mc)
     object_class_property_set_description(OBJECT_CLASS(mc), "flash-image",
                                           "backing image file for the 16MB "
                                           "boot flash (loaded at startup, "
-                                          "written back on exit)");
+                                          "written back on exit; the "
+                                          "-kernel firmware is installed "
+                                          "into its AP partition)");
     object_class_property_add_str(OBJECT_CLASS(mc), "nand-image",
                                   best1503_get_nand_image,
                                   best1503_set_nand_image);
