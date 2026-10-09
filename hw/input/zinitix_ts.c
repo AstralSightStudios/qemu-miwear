@@ -25,17 +25,29 @@
  *     mask, time stamp, x, y (u16), width, sub status; sub status bit 1
  *     down, bits 0/2 present/move, bit 3 up; status bit 4 palm
  *   - interrupt: active-low line, asserted while a report is pending
+ *   - screen off (ztw662_ts_suspend sub_C3F6D6C): gesture enable mask to
+ *     0x00AF (0x0002 / 0x0004 / 0x0010 / 0x0016 by display state),
+ *     command 0x0003, then command 0x0005 (sleep).  Asleep, the controller
+ *     only reports wake gestures: the interrupt handler (sub_C3F5F94, while
+ *     suspended) reads the gesture code at 0x0126, 1 = double tap,
+ *     4 = slide up (honoured per the touch_double_click / touch_slide_up
+ *     settings; with both off the firmware forces double tap on), then
+ *     clears the interrupt with 0x0003.  Resume (sub_C3F67BC) reruns the
+ *     power-up sequence, which wakes the controller.
  * Real hardware (Xiaomi Smart Band 10 Pro log): chip id 0xE623, hardware
  * id 0x4702, firmware 0x9 / 0x0 / 0x12.
  *
  * Touches come from the host pointer (absolute pointer device): the left
- * button is the finger.
+ * button is the finger.  While asleep the model plays the controller's
+ * gesture engine: two taps within 500 ms are a double tap, a lift-off a
+ * quarter of the panel above the touch-down is a slide up.
  *
  * This code is licensed under the GPL version 2 or later.
  */
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/input/zinitix_ts.h"
@@ -45,7 +57,9 @@
 #define ZT_REG_COUNT            0x10000
 
 #define ZT_CMD_SWRESET          0x0000
+#define ZT_CMD_WAKEUP           0x0001
 #define ZT_CMD_CLEAR_INT        0x0003
+#define ZT_CMD_SLEEP            0x0005
 #define ZT_REG_FW_VERSION       0x0012
 #define ZT_REG_REG_VERSION      0x0013
 #define ZT_REG_HW_ID            0x0014
@@ -55,11 +69,19 @@
 #define ZT_REG_POINT_STATUS     0x0080
 #define ZT_REG_X_RESOLUTION     0x00C0
 #define ZT_REG_Y_RESOLUTION     0x00C1
+#define ZT_REG_GESTURE_EN       0x00AF
 #define ZT_REG_MINOR_FW_VERSION 0x0121
+#define ZT_REG_GESTURE          0x0126
 #define ZT_REG_CHECKSUM_RESULT  0x012C
 #define ZT_CHECKSUM_OK          0x55AA
 #define ZT_REG_INFO             0x09D2      /* 12 bytes, hw id at +8 */
 #define ZT_REG_CHIP_ID          0xCC00
+#define ZT_REG_VENDOR_CMD       0xC000      /* first step of power-up */
+
+#define ZT_GESTURE_DOUBLE_TAP   1
+#define ZT_GESTURE_SLIDE_UP     4
+#define ZT_DOUBLE_TAP_MS        500
+#define ZT_TAP_SLOP             24          /* pixels */
 
 /* status / sub status bits (Linux zinitix.c) */
 #define ZT_ST_PT_CNT_CHANGE     (1u << 0)
@@ -102,6 +124,13 @@ struct ZinitixTsState {
     ZinitixEvent q[ZT_QUEUE];
     unsigned q_head, q_count;
 
+    /* sleep (screen off): wake-gesture detection only */
+    bool asleep;
+    uint16_t gesture;           /* pending gesture code, 0 = none */
+    int down_x, down_y;
+    int64_t last_tap_ms;
+    int last_tap_x, last_tap_y;
+
     /* host pointer */
     int abs_x, abs_y;
     bool btn, btn_reported;
@@ -110,7 +139,7 @@ struct ZinitixTsState {
 
 static void zt_update_irq(ZinitixTsState *s)
 {
-    qemu_set_irq(s->irq, s->q_count == 0);      /* active low */
+    qemu_set_irq(s->irq, !s->q_count && !s->gesture);   /* active low */
 }
 
 static void zt_push(ZinitixTsState *s, uint16_t status, uint8_t sub,
@@ -156,9 +185,21 @@ static uint16_t zt_reg_read(ZinitixTsState *s, uint16_t reg)
         return e ? e->y : 0;
     case ZT_REG_POINT_STATUS + 4:       /* width | sub status */
         return e ? (e->sub << 8) | (e->sub & ZT_SUB_UP ? 0 : 8) : 0;
+    case ZT_REG_GESTURE:
+        return s->gesture;
     default:
         return s->regs[reg];
     }
+}
+
+static void zt_set_asleep(ZinitixTsState *s, bool asleep)
+{
+    s->asleep = asleep;
+    s->gesture = 0;
+    s->q_head = s->q_count = 0;
+    s->last_tap_ms = INT64_MIN;
+    s->btn_reported = s->btn;
+    zt_update_irq(s);
 }
 
 static void zt_command(ZinitixTsState *s, uint16_t cmd)
@@ -166,6 +207,10 @@ static void zt_command(ZinitixTsState *s, uint16_t cmd)
     trace_zinitix_ts_command(cmd);
     switch (cmd) {
     case ZT_CMD_CLEAR_INT:
+        if (s->gesture) {
+            s->gesture = 0;
+            qemu_irq_raise(s->irq);
+        }
         if (s->q_count) {
             s->q_head = (s->q_head + 1) % ZT_QUEUE;
             s->q_count--;
@@ -175,8 +220,11 @@ static void zt_command(ZinitixTsState *s, uint16_t cmd)
         zt_update_irq(s);
         break;
     case ZT_CMD_SWRESET:
-        s->q_head = s->q_count = 0;
-        zt_update_irq(s);
+    case ZT_CMD_WAKEUP:
+        zt_set_asleep(s, false);
+        break;
+    case ZT_CMD_SLEEP:
+        zt_set_asleep(s, true);
         break;
     default:
         break;                          /* wake-up / mode / vendor */
@@ -220,6 +268,9 @@ static int zt_send(I2CSlave *i2c, uint8_t data)
         s->regs[reg] = deposit32(s->regs[reg], ((n - 2) & 1) * 8, 8, data);
         if ((n - 2) & 1) {
             trace_zinitix_ts_write(reg, s->regs[reg]);
+            if (reg == ZT_REG_VENDOR_CMD && s->asleep) {
+                zt_set_asleep(s, false);
+            }
         }
     }
     return 0;
@@ -268,12 +319,55 @@ static void zt_input_event(DeviceState *dev, QemuConsole *src,
     }
 }
 
+/* asleep: only a finished double tap or slide up wakes the host */
+static void zt_gesture_sync(ZinitixTsState *s, int x, int y)
+{
+    int64_t now;
+
+    if (s->btn == s->btn_reported) {
+        return;
+    }
+    s->btn_reported = s->btn;
+    if (s->btn) {
+        s->down_x = x;
+        s->down_y = y;
+        return;
+    }
+    if (!s->regs[ZT_REG_GESTURE_EN] || s->gesture) {
+        return;
+    }
+    if (s->down_y - y >= (int)s->height / 4) {
+        s->gesture = ZT_GESTURE_SLIDE_UP;
+    } else if (ABS(x - s->down_x) <= ZT_TAP_SLOP &&
+               ABS(y - s->down_y) <= ZT_TAP_SLOP) {
+        now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
+        if (now - s->last_tap_ms <= ZT_DOUBLE_TAP_MS &&
+            ABS(x - s->last_tap_x) <= ZT_TAP_SLOP * 2 &&
+            ABS(y - s->last_tap_y) <= ZT_TAP_SLOP * 2) {
+            s->gesture = ZT_GESTURE_DOUBLE_TAP;
+            s->last_tap_ms = INT64_MIN;
+        } else {
+            s->last_tap_ms = now;
+            s->last_tap_x = x;
+            s->last_tap_y = y;
+        }
+    }
+    if (s->gesture) {
+        trace_zinitix_ts_gesture(s->gesture);
+        zt_update_irq(s);
+    }
+}
+
 static void zt_input_sync(DeviceState *dev)
 {
     ZinitixTsState *s = ZINITIX_TS(dev);
     int x = MIN(s->abs_x, (int)s->width - 1);
     int y = MIN(s->abs_y, (int)s->height - 1);
 
+    if (s->asleep) {
+        zt_gesture_sync(s, x, y);
+        return;
+    }
     if (s->btn != s->btn_reported) {
         if (s->btn) {
             zt_push(s, ZT_ST_PT_CNT_CHANGE | ZT_ST_DOWN | ZT_ST_PT_EXIST,
@@ -321,9 +415,7 @@ static void zt_reset(DeviceState *dev)
     s->ptr = 0;
     s->nsent = 0;
     s->rd_off = 0;
-    s->q_head = s->q_count = 0;
-    s->btn_reported = s->btn;
-    zt_update_irq(s);
+    zt_set_asleep(s, false);
 }
 
 static void zt_realize(DeviceState *dev, Error **errp)
