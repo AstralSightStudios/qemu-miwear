@@ -52,6 +52,7 @@
 #include "hw/misc/bes_psram.h"
 #include "hw/misc/bes_dma.h"
 #include "hw/misc/bes_btss.h"
+#include "hw/misc/vsi_vglite.h"
 #include "hw/misc/bes_i2c.h"
 #include "hw/i2c/i2c.h"
 #include "hw/misc/bes_stub.h"
@@ -210,6 +211,18 @@
 
 static const int best1700_bt_tx_irq[] = { 102, 103, 29, 30 };
 static const int best1700_bt_rx_irq[] = { 104, 105, 43, 119 };
+
+/* GPU：VeriSilicon VGLite（GCNanoUltraV，hw/misc/vsi_vglite.c，与 best1503
+ * 同一型号）。AP 的 sub_108ACBD8 以 {寄存器 0x401F0000, 显存池 0x22500000,
+ * 0x80000} 注册设备、中断挂 NVIC 33（优先级 0xA0）；vg_lite_init 核对芯片
+ * ID 0x265、版本 0x2002、0x30 号寄存器 0x420（ITCM 0x13E3EC，best1503 的
+ * 是 0x424）。显存池（命令缓冲等）是一块独立 RAM，大小取池的大小。
+ * 没有 GPU 时上电流程无限等空闲位，miwear 初始化停在状态 0，约 145 秒后
+ * 被它的看门狗复位。 */
+#define BEST1700_GPU_BASE        0x401F0000
+#define BEST1700_GPU_IRQ         33
+#define BEST1700_GPU_RAM_BASE    0x22500000
+#define BEST1700_GPU_RAM_SIZE    0x00080000
 
 /* 第二颗 M55（M55C1，即固件里的 "cp"）：跑 cp_image 分区的 vela_cp.bin
  * （蓝牙 host 服务 + WiFi 协议栈，见其字符串）。本核 ITCM（0x0 起 2MB）、
@@ -1312,6 +1325,23 @@ static void best1700_init(MachineState *machine, BesImage *img,
                               qdev_get_gpio_in_named(dsi, "te", 0));
         qdev_connect_gpio_out_named(lcdc, "te", 0,
                                     qdev_get_gpio_in(te_split, 0));
+    }
+
+    /* ---- GPU（见宏注释） ---- */
+    {
+        static MemoryRegion gpu_ram;
+        DeviceState *gpu = qdev_new(TYPE_VSI_VGLITE);
+
+        memory_region_init_ram(&gpu_ram, NULL, "best1700.gpu_ram",
+                               BEST1700_GPU_RAM_SIZE, &error_fatal);
+        memory_region_add_subregion(sysmem, BEST1700_GPU_RAM_BASE, &gpu_ram);
+        qdev_prop_set_uint32(gpu, "chip-cid", 0x420);
+        object_property_set_link(OBJECT(gpu), "downstream", OBJECT(sysmem),
+                                 &error_fatal);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(gpu), &error_fatal);
+        best1700_map(SYS_BUS_DEVICE(gpu), 0, BEST1700_GPU_BASE);
+        sysbus_connect_irq(SYS_BUS_DEVICE(gpu), 0,
+                           qdev_get_gpio_in(armv7m, BEST1700_GPU_IRQ));
     }
 
     /* ---- eMMC 主控 + 卡（见宏注释） ---- */
