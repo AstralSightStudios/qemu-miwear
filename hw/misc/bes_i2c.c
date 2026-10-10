@@ -36,6 +36,7 @@
 #include "hw/core/irq.h"
 #include "hw/i2c/i2c.h"
 #include "hw/misc/bes_i2c.h"
+#include "trace.h"
 
 /* DATA_CMD bits */
 #define DCMD_DATA(x)    ((x) & 0xFF)
@@ -164,6 +165,7 @@ static void bes_i2c_start(BesI2cState *s, bool recv)
 {
     uint8_t addr = s->tar & 0x7F;
 
+    trace_bes_i2c_start(s->iomem.addr, addr, recv);
     if (s->xfer == XFER_IDLE) {
         s->fallback = i2c_start_transfer(s->bus, addr, recv) != 0;
     } else if (s->fallback) {
