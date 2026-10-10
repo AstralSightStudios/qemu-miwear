@@ -12,6 +12,8 @@
 #define TYPE_BES_ISPI "bes.ispi"
 OBJECT_DECLARE_SIMPLE_TYPE(BesIspiState, BES_ISPI)
 
+#define BES_ISPI_PMU_GPIOS  32      /* "pmu-gpio" lines: PMU GPIO 99..130 */
+
 struct BesIspiState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;         /* register window (0x1000) */
@@ -28,6 +30,8 @@ struct BesIspiState {
 
     /* ISPI slaves (PMU, analog PHYs): a register file per chip select */
     uint16_t regs_slave[16][0x400];
+
+    uint32_t pmu_gpio_in;       /* PMU GPIO input levels, survive reset */
 };
 
 #endif

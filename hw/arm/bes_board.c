@@ -82,6 +82,14 @@ static const BesBoard bes_boards[] = {
          * Its bus number matches the BTH hal_i2c controller ID. */
         .sensor_switch = { TYPE_SGM25062, 2, 0x18, -1 },
         .nfc_ven_gpio = -1,
+        /* 两个侧键接 PMU GPIO，按下接地：AP 板级按键初始化
+         * sub_1081D65C 的按键表（PSRAM 0x185F0C0C，8 字节一项：键号、
+         * 引脚、iomux 配置、有效电平 0）= {键 2: 114, 键 1: 113}。
+         * 键 1 / 2 与 HOME / DOWN 的对应待按键中断建模后实测。 */
+        .keys = {
+            { "home", Q_KEY_CODE_HOME, 113, true },
+            { "down", Q_KEY_CODE_PGDN, 114, true },
+        },
     },
 };
 

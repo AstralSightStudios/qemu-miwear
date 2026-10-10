@@ -56,6 +56,12 @@
  *   reg 0x4F：pmu_boot_init（pmu_best1700.o）写 bit15|bit13（0xA000）
  *   启动 DCDC 校准，50ms 内轮询 bit[7:6] == 01 为完成，超时死循环。
  *   校准即刻完成：写入带 bit15 时 bit[7:6] 置 01。
+ *   reg 0xBC / 0xBD：PMU GPIO 99..114 / 115..130 的输入电平（bit n =
+ *   99 + n / 115 + n 号脚），只读。q63 AP 的 hal_gpio_pin_get_val
+ *   （sub_108BB5AC）把 99..164 号脚交给 PMU GPIO 驱动（ITCM 0x138F74），
+ *   1806P（reg 0x202C3CD6 记的 PMU 类型 6）上 ≤130 号脚读这两个寄存器；
+ *   方向/输出等配置走其他寄存器（ITCM 0x139060）。电平由 "pmu-gpio"
+ *   输入线给出（第 n 根 = 99 + n 号脚），板上的按键接在这里。
  *
  * PSRAM 模拟 PHY（片选 5，psramphy_best1700.o 以 0x5051/0x5052 访问，
  * 高 4 位即片选）：reg 0x51 为 DLL 状态，bit6 = 锁定、bit7 = 全 0、
@@ -83,6 +89,9 @@
 #define ISPI_CS_PSRAM_PHY     5
 #define ISPI_CS_CHIPID        7
 
+#define PMU_REG_GPIO_IN0      0xBC    /* PMU GPIO 99..114 */
+#define PMU_REG_GPIO_IN1      0xBD    /* PMU GPIO 115..130 */
+
 static void bes_ispi_tx(BesIspiState *s, uint32_t value, unsigned size)
 {
     /* 命令字按小端字节流收集，满 4 字节立即执行（全双工，应答同时入 RX） */
@@ -103,6 +112,10 @@ static void bes_ispi_tx(BesIspiState *s, uint32_t value, unsigned size)
                 v = s->regs_slave[ISPI_CS(s)][reg];
                 if (ISPI_CS(s) == ISPI_CS_PSRAM_PHY && reg == 0x51) {
                     v = (v & ~0x1FF) | 0x40 | 0x10;
+                } else if (ISPI_CS(s) == ISPI_CS_PMU &&
+                           (reg == PMU_REG_GPIO_IN0 ||
+                            reg == PMU_REG_GPIO_IN1)) {
+                    v = s->pmu_gpio_in >> (reg == PMU_REG_GPIO_IN1 ? 16 : 0);
                 }
                 s->rx = (uint32_t)v << 2;
                 qemu_log_mask(LOG_UNIMP, "bes.ispi: cs%u read reg 0x%03x -> "
@@ -125,6 +138,14 @@ static void bes_ispi_tx(BesIspiState *s, uint32_t value, unsigned size)
             s->tx_cnt = 0;
         }
     }
+}
+
+/* PMU GPIO input line n = pin 99 + n */
+static void bes_ispi_pmu_gpio_in(void *opaque, int n, int level)
+{
+    BesIspiState *s = BES_ISPI(opaque);
+
+    s->pmu_gpio_in = deposit32(s->pmu_gpio_in, n, 1, level != 0);
 }
 
 static uint64_t bes_ispi_read(void *opaque, hwaddr offset, unsigned size)
@@ -224,6 +245,8 @@ static void bes_ispi_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->iomem, OBJECT(dev), &bes_ispi_ops, s,
                           "bes.ispi", 0x1000);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
+    qdev_init_gpio_in_named(dev, bes_ispi_pmu_gpio_in, "pmu-gpio",
+                            BES_ISPI_PMU_GPIOS);
 }
 
 static void bes_ispi_class_init(ObjectClass *klass, const void *data)

@@ -290,6 +290,8 @@ static const int best1700_bt_rx_irq[] = { 104, 105, 43, 119 };
  * recv 固定用控制器 0；固件运行时在 SRAM 0x202C2280 自建的基址表
  * 与之一致（实测 dump）。PMU（片选 7）寄存器 0 经此读芯片标识。 */
 #define BEST1700_ISPI_BASE       0x4000A000
+/* hal_gpio 的 99..164 号脚是 PMU GPIO（见 bes_ispi.c） */
+#define BEST1700_PMU_GPIO_FIRST  99
 
 /* UART = PL011（BES reg_uart，与 best1503 同 IP）。基址与中断号：
  * BSP hal_uart.o .rodata.uart = {0x4000B000 .. irq 22}, {0x4000C000 ..
@@ -1523,11 +1525,26 @@ static void best1700_init(MachineState *machine, BesImage *img,
     }
 
     /* ---- ISPI 主控 @0x4000A000（q63 实证，见上方宏注释） ---- */
-    {
-        DeviceState *ispi = qdev_new(TYPE_BES_ISPI);
+    DeviceState *ispi = qdev_new(TYPE_BES_ISPI);
 
-        sysbus_realize_and_unref(SYS_BUS_DEVICE(ispi), &error_fatal);
-        best1700_map(SYS_BUS_DEVICE(ispi), 0, BEST1700_ISPI_BASE);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(ispi), &error_fatal);
+    best1700_map(SYS_BUS_DEVICE(ispi), 0, BEST1700_ISPI_BASE);
+
+    /* 板上的按键：宿主按键 → GPIO 输入；99 号起是 PMU GPIO（经 ISPI） */
+    {
+        DeviceState *keys = bes_board_create_keys(board);
+        int n;
+
+        for (n = 0; keys && n < BES_BOARD_MAX_KEYS && board->keys[n].name;
+             n++) {
+            int pin = board->keys[n].gpio;
+
+            qdev_connect_gpio_out_named(keys, "key", n,
+                pin >= BEST1700_PMU_GPIO_FIRST ?
+                qdev_get_gpio_in_named(ispi, "pmu-gpio",
+                                       pin - BEST1700_PMU_GPIO_FIRST) :
+                qdev_get_gpio_in(gpio, pin));
+        }
     }
 
     /*

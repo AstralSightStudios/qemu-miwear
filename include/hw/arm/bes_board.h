@@ -29,7 +29,8 @@
 typedef struct BesBoardKey {
     const char *name;
     QKeyCode qcode;             /* host key that presses it */
-    int gpio;                   /* SoC GPIO line it drives */
+    int gpio;                   /* GPIO it drives, firmware hal_gpio
+                                 * numbering (best1700: 99.. = PMU GPIO) */
     bool active_low;
 } BesBoardKey;
 
