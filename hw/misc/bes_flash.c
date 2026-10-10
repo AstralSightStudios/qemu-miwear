@@ -189,6 +189,7 @@
 #define FLASH_REG_010   0x010   /* RX FIFO data */
 #define FLASH_REG_018   0x018   /* FIFO clear (self-clearing) */
 #define FLASH_REG_01C   0x01C   /* DMA control */
+#define FLASH_REG_030   0x030   /* address bits [31:24] of NOR commands */
 #define FLASH_REG_204   0x204   /* dual-chip / data copy / reorder config */
 
 /* REG_000 fields (reg_norflaship_v2.h:131-152) */
@@ -832,7 +833,12 @@ static void bes_flash_exec(BesFlashState *s, uint32_t reg000)
     if (bes_flash_is_nand(s)) {
         bes_nand_exec(s, cmd, ext ? 0 : addr, ext, tx_len, rx_len);
     } else {
-        bes_nor_exec(s, cmd, addr, tx_len, rx_len);
+        /* REG_000 carries 24 address bits; beyond 16 MB (best1700's
+         * 2 x 16 MB dual-chip device) the driver puts address bits
+         * [31:24] in REG_030 first (q63 TEE norflaship helper: REG_030 =
+         * addr >> 24, then REG_000 = addr << 8 | cmd) */
+        bes_nor_exec(s, cmd, addr | s->regs[FLASH_REG_030 / 4] << 24,
+                     tx_len, rx_len);
     }
 }
 
