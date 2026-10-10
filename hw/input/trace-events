@@ -59,3 +59,8 @@ zinitix_ts_event(uint16_t status, uint8_t sub, int x, int y) "status=0x%04x sub=
 zinitix_ts_command(uint16_t cmd) "command 0x%04x"
 zinitix_ts_write(uint16_t reg, uint16_t val) "reg 0x%04x = 0x%04x"
 zinitix_ts_gesture(uint16_t code) "wake gesture %u"
+
+# raydium_ts.c
+raydium_ts_event(uint8_t state, int x, int y) "state=%u x=%d y=%d"
+raydium_ts_read(uint32_t addr, uint8_t val) "addr=0x%08x val=0x%02x"
+raydium_ts_write(uint32_t addr, uint8_t val) "addr=0x%08x val=0x%02x"

@@ -1176,6 +1176,7 @@ static void best1700_init(MachineState *machine, BesImage *img,
     }
 
     /* ---- I2C（见宏注释） ---- */
+    I2CBus *ap_i2c_bus[BEST1700_NUM_I2C];
     {
         static const struct {
             uint32_t base;
@@ -1184,7 +1185,6 @@ static void best1700_init(MachineState *machine, BesImage *img,
             { 0x40006000, 50 }, { 0x40007000, 51 }, { 0x40075000, 52 },
             { 0x40076000, 53 }, { 0x40077000, 54 },
         };
-        I2CBus *bus[BEST1700_NUM_I2C];
         int i;
 
         for (i = 0; i < ARRAY_SIZE(i2cs); i++) {
@@ -1194,13 +1194,13 @@ static void best1700_init(MachineState *machine, BesImage *img,
             best1700_map(SYS_BUS_DEVICE(i2c), 0, i2cs[i].base);
             sysbus_connect_irq(SYS_BUS_DEVICE(i2c), 0,
                                qdev_get_gpio_in(armv7m, i2cs[i].irq));
-            bus[i] = I2C_BUS(qdev_get_child_bus(i2c, "i2c"));
+            ap_i2c_bus[i] = I2C_BUS(qdev_get_child_bus(i2c, "i2c"));
         }
 
         /* 板级 I2C 器件（profile） */
         if (board->gauge.type) {
-            i2c_slave_create_simple(bus[board->gauge.bus], board->gauge.type,
-                                    board->gauge.addr);
+            i2c_slave_create_simple(ap_i2c_bus[board->gauge.bus],
+                                    board->gauge.type, board->gauge.addr);
         }
     }
 
@@ -1226,6 +1226,22 @@ static void best1700_init(MachineState *machine, BesImage *img,
         best1700_map(SYS_BUS_DEVICE(gpio), 3, BEST1700_PSC_BASE);
         sysbus_connect_irq(SYS_BUS_DEVICE(gpio), 0,
                            qdev_get_gpio_in(armv7m, BEST1700_GPIO_IRQ));
+    }
+
+    /* 板上的触摸控制器：报点坐标系 = 面板尺寸，中断脚接 GPIO */
+    if (board->touch.type) {
+        I2CSlave *tp = i2c_slave_new(board->touch.type,
+                                     board->touch.addr);
+
+        qdev_prop_set_uint32(DEVICE(tp), "width", board->panel_width);
+        qdev_prop_set_uint32(DEVICE(tp), "height", board->panel_height);
+        i2c_slave_realize_and_unref(tp, ap_i2c_bus[board->touch.bus],
+                                    &error_fatal);
+        if (board->touch.irq_gpio >= 0) {
+            qdev_connect_gpio_out_named(DEVICE(tp), "irq", 0,
+                                        qdev_get_gpio_in(gpio,
+                                                    board->touch.irq_gpio));
+        }
     }
 
     /* ---- 显示：LCDC + DSI0（见宏注释），面板尺寸来自板级 profile ---- */

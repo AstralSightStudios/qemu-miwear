@@ -19,6 +19,7 @@
 #include "hw/arm/machines-qom.h"
 #include "hw/input/gpio_keys.h"
 #include "hw/input/zinitix_ts.h"
+#include "hw/input/raydium_ts.h"
 #include "hw/misc/cw2215.h"
 #include "hw/misc/sgm25062.h"
 #include "hw/misc/nci_nfcc.h"
@@ -70,7 +71,9 @@ static const BesBoard bes_boards[] = {
         .panel_width = 466,
         .panel_height = 466,
         .lcd_te_gpio = -1,
-        .touch = { .irq_gpio = -1 },
+        /* Raydium RM6D03x：挂载在 AP I2C0 (0x40006000)，从机地址 0x39，
+         * 中断 GPIO 73（实测 AP 日志与驱动反汇编） */
+        .touch = { TYPE_RAYDIUM_TS, 0, 0x39, 73 },
         .nfc = { .irq_gpio = -1 },
         /* CW2215：AP 电池驱动 board_cw2215_initialize 在 I2C 3
          * （0x40076000）地址 0x64 读芯片 ID（实测 I2C 访问） */
