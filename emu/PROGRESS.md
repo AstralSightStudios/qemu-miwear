@@ -197,6 +197,53 @@ AONCMU/CMU 魔术值 → UART（console, qemu chardev 直通终端）→ TIMER/S
 
 ## 7. 最新变更
 
+- **2026-10-11（q63：卡死/重启的连环原因查清，卡在 GPU）**：
+  用户现象：MI logo → 黑屏 → 再 logo → HyperOS 图标 → 卡死。逐个查清：
+  ①**内存被冲**（sensor 向量表清零 / TEE 向量表填满 0x75 → lockup 或
+  TEE SecureFault 复位）：best1700_bthrom 的超级调用分三步（写参数指针、
+  写调用号、读返回值）共用窗口状态，sensor 线程在两步之间被切换，另一
+  线程的调用覆盖了参数指针，于是 memcpy/memset 用了失效栈上的垃圾参数
+  （实抓 memcpy(0, 0x2305b55c, 0x2305b55c)）。改为一条 STRD 传指针+调用
+  号、返回值写回调用者栈上 r0/r1 槽位、POP 取回，完全可重入。
+  ②**卡在 connmand**（AP 100% "busy" 实为空闲循环）：链条是 nsh_main
+  做 boardctl(FINALINIT)→触摸初始化→pm_relax→LCD pm_notify 等 LCD 锁；
+  hpwork 持锁在关屏流程里读属性 persist.screen.touch_double_click，等
+  kvdbd；kvdbd 打开 /misc 等 sensor 的 rpmsgfs 端点；sensor 的 rptun 线程
+  和 AppBringUp 都睡在 usleep 里醒不来——sensor 的 tickless 定时器
+  （SP804 @0x4008B000，one-shot）到期停住后驱动只写 Load 重装，QEMU 的
+  arm_timer 不会因写 Load 重启停住的 one-shot 计数器（TRM 要求会）。
+  修 hw/timer/arm_timer.c。
+  ③**约 60 秒 sensor panic → 整机复位**：sensor 断言 rpmsg_virtio.c:386
+  （等发往 cp 的 TX 缓冲超时）。cp 卡在 btdrv_SendData 里忙等"蓝牙核已
+  取走"中断，cp 的 rpmsg 停摆。实现 cp↔蓝牙核邮箱：MCU_CMU 0x140/0x144
+  （best1700_cmu.c）、BT RAM 0x68000000、指针表 0x68004000、BT_CMU
+  0x6E030000，复用 bes.btss（新属性 rx-head-direct / data-done-shift /
+  hci-channel / hci-revision，详见提交说明）。现在 cp 跑完厂商初始化，
+  bluetoothd 把适配器开到 BLE+BR/EDR On。
+  ④**约 145 秒 miwear 初始化看门狗 panic**（miwear_init.c:152，"wdt cb"）：
+  miwear 初始化状态机停在 0；状态 1 的回调 sub_10BFF9DC（UI 框架初始化）
+  里 vg_lite_init(480,480) 的 GPU 上电流程无限等待：
+  `do { 延时 2,4,8…ms } while (0xB05 & ~读(0x04))`。GPU 是 VeriSilicon
+  VGLite（GCNanoUltraV）：寄存器 0x401F0000，NVIC 33，命令/显存池
+  0x22500000 起 512KB（sub_108ACBD8），vg_lite_init 核对芯片 ID
+  （寄存器 0x20=0x265、0x24=0x2002、0x30=0x420，ITCM 0x13E3EC）。
+  **下一步：VGLite 模型**（至少初始化通过、命令缓冲执行完回中断；要看
+  到界面还需清屏/贴图/路径填充）。
+  ⑤其它：TE 同时接 DSI0（显示线程在 DSI0 中断里等 TE）；Raydium RM6D03x
+  触摸模型（探测通过，报点格式未验证，CC 校准握手超时 3 秒）；PL011 加
+  RX DMA 请求，q63 控制台可输入（驱动没开 UART0 的 NVIC 22，目前凑满
+  128 字节的 DMA 段才送达；23 号不是 UART，是 ISPI/PMU 一类）；
+  emu/nsh.py 支持 q63（名字在 PSRAM 的 .rodata 副本里，自动推导别名）。
+  ⑥仍未解决：TEE 打印 "Start pmu reboot" 后模拟器不真正复位（停在那里，
+  这就是用户看到的"卡死"的最后形态）；sensor 的 /misc littlefs 挂载失败
+  （NOR 里没有文件系统，"Corrupted dir pair"）；cp 经 DMA 写 BT RAM
+  0x68400000 的控制器代码不执行。
+  调试手段（本轮好用的）：emu/nsh.py inject + 凑满 128 字节的命令跑 ps /
+  dumpstack <pid> / rptun dump all（输出在 RAM 日志，pmemsave PSRAM 后用
+  "[MM/DD hh:mm:ss]" 正则提取）；sensor 日志在 BTH RAM（同样提取）；在
+  TCB 里找指向自身栈的指针即保存的上下文（+0 为 SP），从 SP 往上扫返回
+  地址得到真实调用链；-trace best1700_bth_log 看 sensor 早期 hal_trace。
+
 - **2026-10-10 (5)（q63：eMMC、显示、cp 与 sensor 核；偶发重启查清）**：
   ①**存储**：SDHCI 0x40150000（NVIC 26，与 UART2 线或）+ QEMU eMMC
   （`-drive if=sd,index=0`）；emu/mkemmc.py 从固件包生成 GPT 镜像，
