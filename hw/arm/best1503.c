@@ -34,6 +34,7 @@
 #include "hw/misc/bes_btss.h"
 #include "hw/misc/bes_gpio.h"
 #include "hw/misc/bes_psc.h"
+#include "hw/misc/nci_nfcc.h"
 #include "hw/input/zinitix_ts.h"
 #include "hw/misc/vsi_vglite.h"
 #include "system/address-spaces.h"
@@ -117,6 +118,13 @@
 #define BEST1503_TP_I2C_BUS       5
 #define BEST1503_TP_I2C_ADDR      0x20
 #define BEST1503_TP_INT_GPIO      76
+/* NFC 控制器：bes sn110 驱动 nfc_driver_p67_initialize（sub_C713784）：
+ * I2C 总线 6、地址 0x28、400kHz，ioexpander 引脚 VEN=69、中断(数据就绪)=77、
+ * 下载使能=68。 */
+#define BEST1503_NFC_I2C_BUS      6
+#define BEST1503_NFC_I2C_ADDR     0x28
+#define BEST1503_NFC_VEN_GPIO     69
+#define BEST1503_NFC_IRQ_GPIO     77
 #define BEST1503_PANEL_W          336
 #define BEST1503_PANEL_H          480
 /* 2D GPU（VeriSilicon VGLite，GCNanoUltraV 类）：寄存器 0x40220000
@@ -588,6 +596,20 @@ static void best1503_init(MachineState *machine)
             qdev_connect_gpio_out_named(DEVICE(tp), "irq", 0,
                                         qdev_get_gpio_in(gpio,
                                                     BEST1503_TP_INT_GPIO));
+        }
+
+        {
+            I2CSlave *nfc = i2c_slave_new(TYPE_NCI_NFCC,
+                                          BEST1503_NFC_I2C_ADDR);
+
+            i2c_slave_realize_and_unref(nfc, i2c_bus[BEST1503_NFC_I2C_BUS],
+                                        &error_fatal);
+            qdev_connect_gpio_out_named(DEVICE(nfc), "data-ready", 0,
+                                        qdev_get_gpio_in(gpio,
+                                                    BEST1503_NFC_IRQ_GPIO));
+            qdev_connect_gpio_out(gpio, BEST1503_NFC_VEN_GPIO,
+                                  qdev_get_gpio_in_named(DEVICE(nfc), "ven",
+                                                         0));
         }
     }
 

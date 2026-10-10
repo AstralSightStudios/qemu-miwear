@@ -226,6 +226,10 @@ config BES_GPIO
 config BES_PSC
     bool
 
+config NCI_NFCC
+    bool
+    select I2C
+
 config VSI_VGLITE
     bool
 
