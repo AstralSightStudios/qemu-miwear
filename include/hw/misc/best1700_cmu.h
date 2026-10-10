@@ -49,6 +49,10 @@ struct Best1700CmuState {
     qemu_irq isys_rx[BEST1700_ISYS_GROUPS];
     qemu_irq isys_tx[BEST1700_ISYS_GROUPS];
 
+    /* MCU_CMU: TrustZone trigger between the M55C0 security states */
+    uint32_t tz_word;
+    qemu_irq tz_trigger[32];
+
     /* MCU_CMU: mailbox to the Bluetooth core */
     uint32_t bt_word;           /* indications 4+ch, enables 8+ch / 12+ch */
     uint32_t bt_raw;            /* BT data 24+ch, BT took MCU data 28+ch */

@@ -1419,6 +1419,15 @@ static void best1700_init(MachineState *machine, BesImage *img,
             qdev_connect_gpio_out_named(cmu, "ipc", 12 + c,
                 qdev_get_gpio_in(DEVICE(g_cp), BEST1700_IPC_TX_IRQ + c));
         }
+        /* TrustZone trigger（hal_tz_trigger）：TEE 置 bit 12 → AP 的
+         * NVIC 75（AP sub_108BFB64 挂 75、写 0x1E8 bit 12 应答）；AP 置
+         * bit 13 → TEE 的 NVIC 74（TEE 0x101161C4 挂 74、应答 bit 13）。
+         * 没有它 AP 收不到 TEE 的 rpmsg，optee 客户端
+         * （TEEC_InitializeContext）永远等不到回复。 */
+        qdev_connect_gpio_out_named(cmu, "tz-trigger", 12,
+                                    qdev_get_gpio_in(armv7m, 75));
+        qdev_connect_gpio_out_named(cmu, "tz-trigger", 13,
+                                    qdev_get_gpio_in(armv7m, 74));
         g_aoncmu = aoncmu;
         qdev_connect_gpio_out_named(aoncmu, "cpu-run", 0,
                                     qemu_allocate_irq(best1700_cp_run,

@@ -48,6 +48,11 @@
  *    BTH_CMU 0x174; tx done: MCU_CMU 0x224, BTH_CMU 0x170), raw in bit g
  *    and masked in bit 16+g. Every group drives an "intersys-rx" and an
  *    "intersys-tx" line.
+ *  - TrustZone trigger (hal_tz_trigger, both halves of M55C0): set
+ *    0x1E4 / clear 0x1E8. The TEE raises bit 12 for the non-secure AP
+ *    and acknowledges bit 13, the AP the other way round; every bit
+ *    drives a "tz-trigger" line (the board takes 12 to NVIC 75 and 13
+ *    to NVIC 74).
  *  - mailbox to the Bluetooth core (the M55C1 firmware's hal_intersys,
  *    4 channels), set 0x140 / clear 0x144: bit 4+ch the M55's data
  *    indication (the doorbell), bit 8+ch / 12+ch enable the receive and
@@ -124,6 +129,8 @@ struct Best1700CmuInfo {
     hwaddr isys_tx_stat;
     hwaddr bt_set;              /* 0: no mailbox to the Bluetooth core */
     hwaddr bt_clr;
+    hwaddr tz_set;              /* 0: no TrustZone trigger */
+    hwaddr tz_clr;
 };
 
 static const Best1700CmuPair cmu_pairs[] = {
@@ -164,6 +171,8 @@ static const Best1700CmuInfo cmu_info = {
     .isys_tx_stat = 0x224,
     .bt_set = 0x140,
     .bt_clr = 0x144,
+    .tz_set = 0x1E4,
+    .tz_clr = 0x1E8,
 };
 
 static const Best1700CmuPair aoncmu_pairs[] = {
@@ -353,6 +362,15 @@ static void bt_write(Best1700CmuState *s, bool set, uint32_t value)
     }
 }
 
+static void tz_update(Best1700CmuState *s)
+{
+    int i;
+
+    for (i = 0; i < 32; i++) {
+        qemu_set_irq(s->tz_trigger[i], (s->tz_word >> i) & 1);
+    }
+}
+
 static void cmu_update_ipc(Best1700CmuState *s, uint32_t word)
 {
     int i;
@@ -373,6 +391,9 @@ static uint64_t best1700_cmu_read(void *opaque, hwaddr offset, unsigned size)
 
     if (info->bt_set && (offset == info->bt_set || offset == info->bt_clr)) {
         v = s->bt_word | s->bt_raw;
+    } else if (info->tz_set &&
+               (offset == info->tz_set || offset == info->tz_clr)) {
+        v = s->tz_word;
     } else if (info->isys_set && (offset == info->isys_set ||
                                   offset == info->isys_clr)) {
         v = s->isys_word;
@@ -431,6 +452,12 @@ static void best1700_cmu_write(void *opaque, hwaddr offset, uint64_t value,
 
     if (info->bt_set && (offset == info->bt_set || offset == info->bt_clr)) {
         bt_write(s, offset == info->bt_set, value);
+    } else if (info->tz_set && offset == info->tz_set) {
+        s->tz_word |= value;
+        tz_update(s);
+    } else if (info->tz_set && offset == info->tz_clr) {
+        s->tz_word &= ~value;
+        tz_update(s);
     } else if (info->isys_set && offset == info->isys_set) {
         s->isys_word |= value;
         isys_update(s);
@@ -512,6 +539,7 @@ static void best1700_cmu_reset(DeviceState *dev)
     s->isys_mask = 0;
     s->bt_word = 0;
     s->bt_raw = 0;
+    s->tz_word = 0;
 }
 
 static void best1700_cmu_realize(DeviceState *dev, Error **errp)
@@ -532,6 +560,9 @@ static void best1700_cmu_realize(DeviceState *dev, Error **errp)
                                  BEST1700_ISYS_GROUPS);
         qdev_init_gpio_out_named(dev, s->isys_tx, "intersys-tx",
                                  BEST1700_ISYS_GROUPS);
+    }
+    if (cmu_info_of(s)->tz_set) {
+        qdev_init_gpio_out_named(dev, s->tz_trigger, "tz-trigger", 32);
     }
     if (cmu_info_of(s)->bt_set) {
         qdev_init_gpio_out_named(dev, s->bt_doorbell, "bt-doorbell",
