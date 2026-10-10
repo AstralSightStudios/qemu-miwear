@@ -24,8 +24,7 @@ struct Best1700BthRomState {
     uint32_t hc_base;
     uint32_t flash_size;
 
-    uint32_t args;
-    uint32_t ret[2];
+    uint32_t args;              /* set by the dispatcher's STRD */
     GString *line;              /* trace output not yet ended by '\n' */
 };
 

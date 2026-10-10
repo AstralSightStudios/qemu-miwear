@@ -47,8 +47,6 @@
 #define ROM_DISPATCH        0xF000      /* hypercall dispatcher */
 #define HC_ARGS             0x00        /* guest: pointer to r0..r3, stack */
 #define HC_CALL             0x04        /* guest: function id, runs it */
-#define HC_RET0             0x08
-#define HC_RET1             0x0C
 
 #define AON_SYS_TIMER       0x40080050  /* hal_sys_timer_get */
 #define SYS_TIMER_HZ        16000
@@ -170,19 +168,23 @@ static void bthrom_build(Best1700BthRomState *s, uint8_t *rom)
         rom_put16(rom, i, 0xDEFE);              /* udf #0xfe */
     }
 
-    /* dispatcher: push {r0-r3}; r2 = window; window.args = sp;
-     * window.call = r12; r0/r1 = window.ret; add sp, #16; bx lr */
+    /* dispatcher: push {r0-r3}; r3 = sp; r2 = window;
+     * strd r3, r12, [r2] (window.args = sp, window.call = r12);
+     * pop {r0-r3}; bx lr.
+     * The firmware's threads and interrupt handlers all call the ROM, so
+     * the window keeps no state between instructions: one STRD hands
+     * over the argument pointer and runs the function (an exception
+     * cannot split an instruction), and the results come back in the
+     * r0/r1 slots of the caller's own stack frame. */
     rom_put16(rom, d + 0x00, 0xB40F);
-    rom_put_ldr_lit(rom, d + 0x02, 2, d + 0x14);
-    rom_put16(rom, d + 0x04, 0x466B);
-    rom_put16(rom, d + 0x06, 0x6013);
-    rom_put16(rom, d + 0x08, 0xF8C2);
-    rom_put16(rom, d + 0x0A, 0xC000 | HC_CALL);
-    rom_put16(rom, d + 0x0C, 0x6890);
-    rom_put16(rom, d + 0x0E, 0x68D1);
-    rom_put16(rom, d + 0x10, 0xB004);
-    rom_put16(rom, d + 0x12, 0x4770);
-    stl_le_p(rom + d + 0x14, s->hc_base);
+    rom_put16(rom, d + 0x02, 0x466B);
+    rom_put_ldr_lit(rom, d + 0x04, 2, d + 0x10);
+    rom_put16(rom, d + 0x06, 0xE9C2);
+    rom_put16(rom, d + 0x08, 0x3C00 | (HC_ARGS >> 2));
+    rom_put16(rom, d + 0x0A, 0xBC0F);
+    rom_put16(rom, d + 0x0C, 0x4770);
+    rom_put16(rom, d + 0x0E, 0xBF00);
+    stl_le_p(rom + d + 0x10, s->hc_base);
 
     for (i = 0; i < ARRAY_SIZE(rom_entries); i++) {
         const RomEntry *e = &rom_entries[i];
@@ -513,22 +515,13 @@ static void bthrom_call(Best1700BthRomState *s, unsigned idx)
                                g_ld32(s, a + 12));
         break;
     }
-    s->ret[0] = ret;
-    s->ret[1] = 0;
+    g_write(s, a, &ret, 4);
+    g_write(s, a + 4, &(uint32_t){ 0 }, 4);
 }
 
 static uint64_t bthrom_hc_read(void *opaque, hwaddr offset, unsigned size)
 {
-    Best1700BthRomState *s = opaque;
-
-    switch (offset) {
-    case HC_RET0:
-        return s->ret[0];
-    case HC_RET1:
-        return s->ret[1];
-    default:
-        return 0;
-    }
+    return 0;
 }
 
 static void bthrom_hc_write(void *opaque, hwaddr offset, uint64_t value,
