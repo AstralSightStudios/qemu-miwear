@@ -59,6 +59,7 @@
 #include "hw/misc/best1700_dsi.h"
 #include "hw/misc/best1700_bthrom.h"
 #include "hw/core/or-irq.h"
+#include "hw/core/split-irq.h"
 #include "hw/sd/sdhci.h"
 #include "hw/sd/sd.h"
 #include "system/blockdev.h"
@@ -1231,6 +1232,7 @@ static void best1700_init(MachineState *machine, BesImage *img,
     if (board->panel_width) {
         DeviceState *lcdc = qdev_new(TYPE_BES_LCDC);
         DeviceState *dsi = qdev_new(TYPE_BEST1700_DSI);
+        DeviceState *te_split = qdev_new(TYPE_SPLIT_IRQ);
 
         qdev_prop_set_uint32(lcdc, "panel-width", board->panel_width);
         qdev_prop_set_uint32(lcdc, "panel-height", board->panel_height);
@@ -1245,9 +1247,17 @@ static void best1700_init(MachineState *machine, BesImage *img,
         best1700_map(SYS_BUS_DEVICE(dsi), 0, BEST1700_DSI0_BASE);
         sysbus_connect_irq(SYS_BUS_DEVICE(dsi), 0,
                            qdev_get_gpio_in(armv7m, BEST1700_DSI0_IRQ));
+        /* 面板 TE 既到 GPIO 47，也到 DSI0：AP 的显示线程在 DSI0 中断里
+         * 等 TE（lcdc_wait_frame_done 的信号量由 DSI0 中断处理 post） */
+        qdev_prop_set_uint32(te_split, "num-lines", 2);
+        qdev_realize_and_unref(te_split, NULL, &error_fatal);
+        qdev_connect_gpio_out(te_split, 0,
+                              qdev_get_gpio_in(gpio,
+                                               BEST1700_LCD_TE_GPIO));
+        qdev_connect_gpio_out(te_split, 1,
+                              qdev_get_gpio_in_named(dsi, "te", 0));
         qdev_connect_gpio_out_named(lcdc, "te", 0,
-                                    qdev_get_gpio_in(gpio,
-                                                     BEST1700_LCD_TE_GPIO));
+                                    qdev_get_gpio_in(te_split, 0));
     }
 
     /* ---- eMMC 主控 + 卡（见宏注释） ---- */
