@@ -45,6 +45,7 @@ struct BesFlashState {
     /* ---- SPI NAND chip model (enabled by nand-image) ---- */
     char *nand_image;           /* backing file, (page + oob) per page */
     FILE *nand_fp;
+    uint32_t jedec_id;          /* NOR die JEDEC ID, MSB first on the wire */
     uint32_t nand_id;           /* 3 ID bytes, MSB first on the wire */
     uint32_t nand_page;         /* data bytes per page */
     uint32_t nand_oob;          /* spare bytes per page */

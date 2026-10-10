@@ -51,7 +51,8 @@
  *   - TX_DATA_COPY (REG_204 bit21) duplicates TX bytes to both dies
  *     (register writes); no effect on the logical-view model
  *   Die model: GigaDevice GD25LQ64C (8MB per die), JEDEC ID c8-60-17
- *   (SDK norflash_gd25lq32c.c:240-241). Command set: SDK
+ *   (SDK norflash_gd25lq32c.c:240-241); property "jedec-id" picks
+ *   another die (best1700: GD25LQ128, see best1700.c). Command set: SDK
  *   platform/drivers/norflash/norflash_gd25q32c.h:57-96. Storage backend:
  *   RAM with NOR semantics, optionally loaded from / written back to an
  *   image file (property "image"); shared with the XIP windows.
@@ -208,7 +209,7 @@
 #define R204_DUAL_CHIP_MODE     (1 << 19)
 
 /* JEDEC ID of each GD25LQ64C die (SDK norflash_gd25lq32c.c:241) */
-static const uint8_t bes_flash_jedec_id[3] = { 0xC8, 0x60, 0x17 };
+#define BES_FLASH_JEDEC_ID_LEN  3
 
 /* Unique ID: GD dies report 18 bytes (SDK norflash_drv.c:56
  * GD_UNIQUE_ID_LEN). Per-unit values are not published; model a fixed
@@ -413,10 +414,13 @@ static void bes_nor_exec(BesFlashState *s, uint8_t cmd, uint32_t addr,
 {
     switch (cmd) {
     case FLASH_CMD_ID: {
+        const uint8_t id[BES_FLASH_JEDEC_ID_LEN] = {
+            s->jedec_id >> 16, s->jedec_id >> 8, s->jedec_id,
+        };
         uint32_t n = rx_len ? MIN(rx_len / (bes_flash_dual(s) ? 2 : 1),
-                                  (uint32_t)sizeof(bes_flash_jedec_id))
-                            : (uint32_t)sizeof(bes_flash_jedec_id);
-        bes_flash_respond_reg(s, bes_flash_jedec_id, n);
+                                  (uint32_t)sizeof(id))
+                            : (uint32_t)sizeof(id);
+        bes_flash_respond_reg(s, id, n);
         break;
     }
     case FLASH_CMD_UNIQUE_ID: {
@@ -1158,6 +1162,8 @@ static void bes_flash_reset(DeviceState *dev)
 
 static const Property bes_flash_props[] = {
     DEFINE_PROP_UINT32("size", BesFlashState, size, 0),
+    /* NOR die JEDEC ID; default GD25LQ64C (8MB) */
+    DEFINE_PROP_UINT32("jedec-id", BesFlashState, jedec_id, 0xC86017),
     DEFINE_PROP_STRING("image", BesFlashState, image),
     DEFINE_PROP_STRING("nand-image", BesFlashState, nand_image),
     DEFINE_PROP_UINT32("nand-id", BesFlashState, nand_id, 0),
