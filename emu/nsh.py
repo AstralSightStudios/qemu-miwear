@@ -70,6 +70,33 @@ class Image:
         return self.d[o:self.d.find(b"\0", o)]
 
 
+def rodata_alias(img, names):
+    """Base of a run-time copy of the image that holds the strings at
+    `names`, or None.  Some firmwares (q63) copy .rodata to PSRAM and their
+    tables point there; the copy keeps the image layout, so the names'
+    spacing is found once in the image."""
+    ptrs = sorted(set(names))
+    # search with the longest run of closely packed names, check all
+    run, best = [ptrs[0]], []
+    for a, b in zip(ptrs, ptrs[1:]):
+        run = run + [b] if b - a < 64 else [b]
+        if len(run) > len(best):
+            best = run
+    if len(best) < 3:
+        return None
+    pat = rb"(?=" + b"".join(
+        rb"[\x21-\x7e]{%d}\x00" % (b - a - 1)
+        for a, b in zip(best, best[1:])) + rb"[\x21-\x7e])"
+    name = re.compile(rb"[\x21-\x7e]{1,64}\x00")     # may be tail-merged
+    hits = set()
+    for m in re.finditer(pat, img.d):
+        base = best[0] - m.start()
+        if all(0 <= p - base < len(img.d) and
+               name.match(img.d, p - base) for p in ptrs):
+            hits.add(base)
+    return hits.pop() if len(hits) == 1 else None
+
+
 def builtin(img, name):
     """main and name pointer of builtin `name` (NuttX g_builtins table:
     {name, priority, stack size, main} per entry)."""
@@ -77,11 +104,22 @@ def builtin(img, name):
            rb"[\s\S]{3}" + re.escape(bytes([img.xip >> 24])))
     for m in re.finditer(rb"(?:%s){8,}" % ent, img.d):
         off = m.start() + (-m.start() % 4)
+        ents = []
         while off + 16 <= m.end():
             nm, _, _, main = struct.unpack_from("<IIII", img.d, off)
-            if main & 1 and img.cstr(nm) == name.encode():
-                return main, nm
+            if main & 1:
+                ents.append((nm, main))
             off += 16
+        aliases = img.aliases
+        if ents and all(img.off(nm) is None for nm, _ in ents):
+            base = rodata_alias(img, [nm for nm, _ in ents])
+            if base is None:
+                continue
+            img.aliases = aliases + (base,)
+        for nm, main in ents:
+            if img.cstr(nm) == name.encode():
+                return main, nm
+        img.aliases = aliases
     sys.exit("nsh: builtin %r not found" % name)
 
 
