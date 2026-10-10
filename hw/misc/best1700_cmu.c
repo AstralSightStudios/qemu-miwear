@@ -34,6 +34,13 @@
  *  - fast system timer, 6 MHz (hal_sys_timer_delay_ns: 6 ticks/us),
  *    64 bits at 0x288/0x28C; writing bit 24 of 0x74 loads it from
  *    0x290/0x294 (hal_fast_sys_timer64_set, hal_cmu_fast_timer_load).
+ *  - inter-core interrupts between the two M55 cores, set 0x90 / clear
+ *    0x94 (hal_m55c0_2_m55c1_best1700.o, built for either core). Per
+ *    channel c (0, 1): bit 15+c M55C0 data for M55C1, bit 12+c M55C0 done
+ *    with M55C1's data, bit 21+c M55C1 data for M55C0, bit 18+c M55C1
+ *    done with M55C0's data. Every bit drives its own "ipc" line; the
+ *    board routes them to the NVIC lines 88/89 (data) and 91/92 (done)
+ *    of the receiving core.
  *
  * AON_CMU:
  *  - clocks of devices 165..201: 0x40/0x44  0x180/0x184
@@ -44,6 +51,10 @@
  *  - system timer, 16 kHz (hal_sys_timer_systick_hz: 16000.0f), 64 bits
  *    at 0x50/0x54 (hal_sys_timer64_get)
  *  - boot mode at 0x38 (hal_hw_bootmode_get): plain storage, cold boot 0
+ *  - M55C1 start (hal_cmu_m55c1_cpu_reset_clear / hal_cmu_m55c1_start_cpu,
+ *    hal_maincmu_best1700.o): its vector table address in bits [31:7] of
+ *    0xB4, and bit 1 of 0x1A4 holds the core; the first release after a
+ *    hold raises "cpu-run", a new hold lowers it.
  *
  * Everything else is plain storage; accesses are logged with -d unimp.
  *
@@ -53,6 +64,7 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/timer.h"
+#include "hw/core/irq.h"
 #include "hw/misc/best1700_cmu.h"
 
 typedef struct Best1700CmuPair {
@@ -77,6 +89,9 @@ struct Best1700CmuInfo {
     uint32_t timer_load_bit;
     hwaddr lp_req;              /* 0: no bus low-power handshake */
     hwaddr lp_ack;
+    hwaddr ipc_set;             /* 0: no inter-core interrupt pair */
+    hwaddr hold;                /* 0: no second core to start */
+    uint32_t hold_bit;
 };
 
 static const Best1700CmuPair cmu_pairs[] = {
@@ -84,7 +99,7 @@ static const Best1700CmuPair cmu_pairs[] = {
     { 0x160, 0x164 }, { 0x244, 0x248 }, { 0x178, 0x17C },
     { 0x034, 0x038 }, { 0x03C, 0x040 }, { 0x044, 0x048 },
     { 0x170, 0x174 }, { 0x254, 0x258 }, { 0x188, 0x18C },
-    { 0x0E4, 0x0E8 },
+    { 0x0E4, 0x0E8 }, { 0x090, 0x094 },
 };
 
 static const uint16_t cmu_pulses[] = {
@@ -108,6 +123,7 @@ static const Best1700CmuInfo cmu_info = {
     .timer_load_bit = 1u << 24,
     .lp_req = 0x1A0,
     .lp_ack = 0x1AC,
+    .ipc_set = 0x090,
 };
 
 static const Best1700CmuPair aoncmu_pairs[] = {
@@ -130,6 +146,8 @@ static const Best1700CmuInfo aoncmu_info = {
     .memsc_avail = 0x140,
     .timer = 0x50,
     .timer_hz = 16000,
+    .hold = 0x1A4,
+    .hold_bit = 1u << 1,
 };
 
 static const Best1700CmuInfo *cmu_info_of(Best1700CmuState *s)
@@ -167,6 +185,15 @@ static uint64_t cmu_ticks(const Best1700CmuInfo *info)
 {
     return muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), info->timer_hz,
                     NANOSECONDS_PER_SECOND);
+}
+
+static void cmu_update_ipc(Best1700CmuState *s, uint32_t word)
+{
+    int i;
+
+    for (i = 0; i < 32; i++) {
+        qemu_set_irq(s->ipc[i], (word >> i) & 1);
+    }
 }
 
 static uint64_t best1700_cmu_read(void *opaque, hwaddr offset, unsigned size)
@@ -236,6 +263,17 @@ static void best1700_cmu_write(void *opaque, hwaddr offset, uint64_t value,
         } else {
             s->pair_state[pair] &= ~value;
         }
+        if (info->ipc_set && info->pairs[pair].set == info->ipc_set) {
+            cmu_update_ipc(s, s->pair_state[pair]);
+        }
+    } else if (info->hold && offset == info->hold) {
+        s->regs[offset / 4] = value;
+        if (value & info->hold_bit) {
+            s->cpu_held = true;
+            qemu_set_irq(s->cpu_run, 0);
+        } else if (s->cpu_held) {
+            qemu_set_irq(s->cpu_run, 1);
+        }
     } else if (info->timer_load && offset == info->timer_load_ctrl &&
                (value & info->timer_load_bit)) {
         uint64_t load = s->regs[info->timer_load / 4] |
@@ -266,6 +304,7 @@ static void best1700_cmu_reset(DeviceState *dev)
     memset(s->pair_state, 0, sizeof(s->pair_state));
     s->memsc_taken = 0;
     s->timer_offset = 0;
+    s->cpu_held = false;
 }
 
 static void best1700_cmu_realize(DeviceState *dev, Error **errp)
@@ -275,6 +314,12 @@ static void best1700_cmu_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->iomem, OBJECT(dev), &best1700_cmu_ops, s,
                           cmu_info_of(s)->name, BEST1700_CMU_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
+    if (cmu_info_of(s)->ipc_set) {
+        qdev_init_gpio_out_named(dev, s->ipc, "ipc", 32);
+    }
+    if (cmu_info_of(s)->hold) {
+        qdev_init_gpio_out_named(dev, &s->cpu_run, "cpu-run", 1);
+    }
 }
 
 static void best1700_cmu_class_init(ObjectClass *klass, const void *data)
