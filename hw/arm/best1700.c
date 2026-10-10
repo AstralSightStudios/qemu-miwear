@@ -36,6 +36,8 @@
 #include "hw/arm/bes_board.h"
 #include "hw/misc/bes_image.h"
 #include "hw/misc/bes_flash.h"
+#include "hw/misc/bes_cmu.h"
+#include "hw/misc/bes_ispi.h"
 #include "system/address-spaces.h"
 #include "system/reset.h"
 #include "system/system.h"
@@ -52,6 +54,18 @@
  */
 #define BEST1700_NUM_IRQ         80
 #define BEST1700_NUM_PRIO_BITS   3
+
+/* MCU_CMU @0x40000000：q63 实证——BSP hal_cmu_best1700.o 的
+ * hal_cmu_clock_enable/disable/reset_set 等函数直接以此基址访问
+ * HCLK/PCLK/OCLK ENABLE/DISABLE 三件套；boot ROM 亦经 CMU+0xC0+dev*4
+ * 查询设备时钟状态、经 CMU+0x288 读自由运行计数器作延时。 */
+#define BEST1700_CMU_BASE        0x40000000
+
+/* ISPI 主控（控制器 0）@0x4000A000：q63 实证——hal_spi.o
+ * .rodata.spi = {0x4000A000, 0x40008000, 0x40009000}，hal_ispi_send/
+ * recv 固定用控制器 0；固件运行时在 SRAM 0x202C2280 自建的基址表
+ * 与之一致（实测 dump）。PMU（片选 7）寄存器 0 经此读芯片标识。 */
+#define BEST1700_ISPI_BASE       0x4000A000
 
 /* CPU 时钟：频率值未实证（仅影响 SysTick 计数速率，不影响取指执行） */
 #define BEST1700_SYSCLK_FRQ      208000000ULL
@@ -204,12 +218,29 @@ static void best1700_init(MachineState *machine, BesImage *img,
     qemu_register_reset(best1700_bootvec_reset, NULL);
     qemu_register_reset(best1700_cpu_reset, g_cpu);
 
+    /* ---- MCU_CMU @0x40000000（q63 实证，见上方宏注释） ----
+     * intersys/BT 邮箱线未连接：BT 子系统未建模，用到再实证。 */
+    {
+        DeviceState *cmu = qdev_new(TYPE_BES_CMU);
+
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(cmu), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(cmu), 0, BEST1700_CMU_BASE);
+    }
+
+    /* ---- ISPI 主控 @0x4000A000（q63 实证，见上方宏注释） ---- */
+    {
+        DeviceState *ispi = qdev_new(TYPE_BES_ISPI);
+
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(ispi), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(ispi), 0, BEST1700_ISPI_BASE);
+    }
+
     /*
-     * 外设：一律不挂。q63 固件上尚未实证任何外设的地址/型号/中断号。
-     * 待办（查实后才允许添加）：
-     *   - 0x40000000 是什么设备（chip id 校验读 0x40000000+0x000，
-     *     待从 contest 源码 libnx_bestbsp_ap.a 的 .o 里确认）
-     *   - UART / TIMER / CMU / NAND 控制器等
+     * 其余外设：一律不挂。除 CMU / ISPI 外尚未实证任何外设的
+     * 地址/型号/中断号。待办（查实后才允许添加）：
+     *   - ISPI 控制器 1/2（0x40008000/0x40009000，同表实证，
+     *     固件用到时再挂）
+     *   - UART / TIMER / NAND 控制器等
      */
 }
 

@@ -207,6 +207,9 @@ config BES_CMU
 config BES_PMU
     bool
 
+config BES_ISPI
+    bool
+
 config BES_I2C
     bool
     select I2C
