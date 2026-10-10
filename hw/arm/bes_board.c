@@ -19,6 +19,7 @@
 #include "hw/arm/machines-qom.h"
 #include "hw/input/gpio_keys.h"
 #include "hw/input/zinitix_ts.h"
+#include "hw/misc/cw2215.h"
 #include "hw/misc/nci_nfcc.h"
 #include "system/reset.h"
 #include "target/arm/cpu-qom.h"
@@ -70,6 +71,9 @@ static const BesBoard bes_boards[] = {
         .lcd_te_gpio = -1,
         .touch = { .irq_gpio = -1 },
         .nfc = { .irq_gpio = -1 },
+        /* CW2215：AP 电池驱动 board_cw2215_initialize 在 I2C 3
+         * （0x40076000）地址 0x64 读芯片 ID（实测 I2C 访问） */
+        .gauge = { TYPE_CW2215, 3, 0x64, -1 },
         .nfc_ven_gpio = -1,
     },
 };

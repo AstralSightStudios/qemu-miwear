@@ -48,6 +48,7 @@ config BEST1700
     select SD
     select BEST1700_CMU
     select BEST1700_DSI
+    select CW2215
     select BES_GPIO
     select BES_ISPI
 

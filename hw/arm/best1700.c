@@ -52,6 +52,7 @@
 #include "hw/misc/bes_psram.h"
 #include "hw/misc/bes_dma.h"
 #include "hw/misc/bes_i2c.h"
+#include "hw/i2c/i2c.h"
 #include "hw/misc/bes_stub.h"
 #include "hw/misc/bes_lcdc.h"
 #include "hw/misc/bes_gpio.h"
@@ -988,6 +989,7 @@ static void best1700_init(MachineState *machine, BesImage *img,
             { 0x40006000, 50 }, { 0x40007000, 51 }, { 0x40075000, 52 },
             { 0x40076000, 53 }, { 0x40077000, 54 },
         };
+        I2CBus *bus[BEST1700_NUM_I2C];
         int i;
 
         for (i = 0; i < ARRAY_SIZE(i2cs); i++) {
@@ -997,6 +999,13 @@ static void best1700_init(MachineState *machine, BesImage *img,
             best1700_map(SYS_BUS_DEVICE(i2c), 0, i2cs[i].base);
             sysbus_connect_irq(SYS_BUS_DEVICE(i2c), 0,
                                qdev_get_gpio_in(armv7m, i2cs[i].irq));
+            bus[i] = I2C_BUS(qdev_get_child_bus(i2c, "i2c"));
+        }
+
+        /* 板级 I2C 器件（profile） */
+        if (board->gauge.type) {
+            i2c_slave_create_simple(bus[board->gauge.bus], board->gauge.type,
+                                    board->gauge.addr);
         }
     }
 

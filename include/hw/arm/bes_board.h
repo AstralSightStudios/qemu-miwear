@@ -4,8 +4,9 @@
  *
  * A device is a chip plus a board. The chip (best1503, best1700) fixes the
  * CPU, the memory map and the on-chip peripherals; the board fixes what is
- * soldered around it -- panel, touch and NFC controllers, the SPI NAND,
- * push buttons -- and how it is wired (I2C bus and address, GPIO lines).
+ * soldered around it -- panel, touch and NFC controllers, fuel gauge, the
+ * SPI NAND, push buttons -- and how it is wired (I2C bus and address, GPIO
+ * lines).
  * Devices sharing a chip run different firmware and differ only in their
  * board profile.
  *
@@ -53,6 +54,7 @@ typedef struct BesBoard {
 
     BesBoardI2C touch;
     BesBoardI2C nfc;
+    BesBoardI2C gauge;          /* battery fuel gauge */
     int nfc_ven_gpio;           /* NFC enable, SoC output */
 
     /* SPI NAND on the second flash controller; nand_blocks 0 = none */
