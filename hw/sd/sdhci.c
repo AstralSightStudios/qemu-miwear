@@ -809,10 +809,12 @@ static void sdhci_do_adma(SDHCIState *s)
             return;
         }
 
-        length = dscr.length ? dscr.length : 64 * KiB;
+        /* only transfer descriptors move data; a NOP or LINK carries none */
+        length = 0;
 
         switch (dscr.attr & SDHC_ADMA_ATTR_ACT_MASK) {
         case SDHC_ADMA_ATTR_ACT_TRAN:  /* data transfer */
+            length = dscr.length ? dscr.length : 64 * KiB;
             s->prnsts |= SDHC_DATA_INHIBIT | SDHC_DAT_LINE_ACTIVE;
             if (s->trnmod & SDHC_TRNS_READ) {
                 s->prnsts |= SDHC_DOING_READ;
@@ -1188,8 +1190,14 @@ sdhci_write(void *opaque, hwaddr offset, uint64_t val, unsigned size)
         if (!TRANSFERRING_DATA(s->prnsts)) {
             s->sdmasysad = (s->sdmasysad & mask) | value;
             MASKED_WRITE(s->sdmasysad, mask, value);
-            /* Writing to last byte of sdmasysad might trigger transfer */
+            /*
+             * Writing to last byte of sdmasysad might trigger transfer, but
+             * only for a data command that owns the DAT line: drivers set the
+             * address before issuing the command, when blkcnt may still hold
+             * a stale value from an earlier transfer.
+             */
             if (!(mask & 0xFF000000) && s->blkcnt &&
+                (s->prnsts & SDHC_DATA_INHIBIT) &&
                 (s->blksize & BLOCK_SIZE_MASK) &&
                 SDHC_DMA_TYPE(s->hostctl1) == SDHC_CTRL_SDMA) {
                 sdhci_sdma_transfer(s);
