@@ -7,10 +7,19 @@
  * 格式依据（实测自 vela_ap.bin v3.101.043 / vela_bl2.bin）：
  *   [0x00] magic 0xFFFFFFFF / [0x04] version 0x00050000 / [0x08] 保留
  *   [0x0C] boot info 指针（NC 闪存别名地址）
- *   [0x64] mapped 入口指针（奇数 Thumb 指针），XIP 基址 = (ptr & ~1) - 0x14
+ *   [0x10] 入口 stub：ldr r0,[pc,#imm]; bx r0
+ *   [0x64] stub 取的 mapped 入口指针（奇数 Thumb 指针，指向 stub 之后），
+ *          XIP 基址 = (ptr & ~1) - 0x14
  *   [0x68..0x80] MSP / MSPLIM / data LMA / data VMA / data end / bss 范围
  *   文件尾 4 字节：NC 别名映射基址（用于定位 boot info 文件偏移）
  *   boot info 为 KEY=value 文本，提供 FLASH_BASE/FLASH_NC_BASE/OTA_CODE_OFFSET
+ *
+ * 签名镜像（version 0x00050001，q63 vela_tee.bin）：头后插入签名块
+ * （[0x498] 长度 + RSA-3072 签名等），入口 stub 及其后各字段整体后移
+ * （q63 TEE：stub @0x628、mapped 指针 @0x680）；文件末尾另有 AVB 尾
+ * （最后 64 字节以 "AVBf" 开头，+0x0C 为大端 64 位原始镜像长度），NC
+ * 基址在原始镜像的最后 4 字节。故 stub 位置按指令形态查找：mapped
+ * 指针必须恰好指向 stub 之后、且所得 XIP 基址 4KB 对齐。
  *
  * This code is licensed under the GPL version 2 or later.
  */
@@ -18,23 +27,24 @@
 #include "qemu/osdep.h"
 #include "hw/misc/bes_image.h"
 #include "qemu/error-report.h"
+#include "qemu/bswap.h"
 
 #define BES_HDR_MAGIC    0xFFFFFFFFu
 #define BES_HDR_VERSION  0x00050000u
+#define BES_HDR_VERSION_SIGNED 0x00050001u
 
 #define BES_OFF_BOOTINFO_PTR  0x0C
-#define BES_OFF_MAPPED_PTR    0x64
-#define BES_OFF_MSP           0x68
-#define BES_OFF_MSPLIM        0x6C
-#define BES_OFF_DATA_LMA      0x70
-#define BES_OFF_DATA_START    0x74
-#define BES_OFF_DATA_END      0x78
-#define BES_OFF_BSS_START     0x7C
-#define BES_OFF_BSS_END       0x80
+/* 以下相对 mapped 入口指针所在偏移 */
+#define BES_OFF_MSP           0x04
+#define BES_OFF_MSPLIM        0x08
+#define BES_OFF_DATA_LMA      0x0C
+#define BES_OFF_DATA_START    0x10
+#define BES_OFF_DATA_END      0x14
+#define BES_OFF_BSS_START     0x18
+#define BES_OFF_BSS_END       0x1C
 
-/* 入口 stub 相对 XIP 基址的偏移（ldr r0,[pc,#0x50]; bx r0） */
-#define BES_ENTRY_OFFSET      0x10
-#define BES_MAPPED_OFFSET     0x14
+#define BES_STUB_SEARCH       0x1000    /* stub 在镜像头 4KB 内 */
+#define BES_AVB_FOOTER_SIZE   64
 
 static uint32_t bes_ldl(const uint8_t *p)
 {
@@ -100,27 +110,64 @@ bool bes_image_load(BesImage *img, const char *path, Error **errp)
             return false;
         }
     }
-    if (img->size < BES_OFF_BSS_END + 4) {
+    if (img->size < BES_STUB_SEARCH) {
         error_setg(errp, "%s: file too small", path);
         goto fail;
     }
 
     uint32_t magic = bes_ldl(img->data);
     uint32_t version = bes_ldl(img->data + 0x04);
-    if (magic != BES_HDR_MAGIC || version != BES_HDR_VERSION) {
+    if (magic != BES_HDR_MAGIC || (version != BES_HDR_VERSION &&
+                                   version != BES_HDR_VERSION_SIGNED)) {
         error_setg(errp, "%s: not a BES image (magic=0x%08x ver=0x%08x)",
                    path, magic, version);
         goto fail;
     }
 
+    /* AVB 尾：只看原始镜像部分 */
+    {
+        const uint8_t *f = img->data + img->size - BES_AVB_FOOTER_SIZE;
+
+        if (!memcmp(f, "AVBf", 4)) {
+            uint64_t orig = ldq_be_p(f + 0x0C);
+
+            if (orig < BES_STUB_SEARCH || orig > img->size) {
+                error_setg(errp, "%s: bad AVB footer", path);
+                goto fail;
+            }
+            img->size = orig;
+        }
+    }
+
     uint32_t boot_info_ptr = bes_ldl(img->data + BES_OFF_BOOTINFO_PTR);
-    uint32_t mapped_ptr = bes_ldl(img->data + BES_OFF_MAPPED_PTR);
-    if (!(mapped_ptr & 1)) {
-        error_setg(errp, "%s: mapped entry pointer is not Thumb", path);
+    uint32_t mapped_off = 0, mapped_ptr = 0;
+    uint32_t stub;
+
+    for (stub = 0x10; stub < BES_STUB_SEARCH; stub += 2) {
+        const uint8_t *p = img->data + stub;
+        uint32_t lit;
+
+        /* ldr r0,[pc,#imm8*4] (0x48xx); bx r0 (0x4700) */
+        if (p[1] != 0x48 || p[2] != 0x00 || p[3] != 0x47) {
+            continue;
+        }
+        lit = ((stub + 4) & ~3u) + p[0] * 4;
+        if (lit + BES_OFF_BSS_END + 4 > img->size) {
+            continue;
+        }
+        mapped_ptr = bes_ldl(img->data + lit);
+        if ((mapped_ptr & 1) &&
+            !(((mapped_ptr & ~1u) - (stub + 4)) & 0xFFF)) {
+            mapped_off = lit;
+            break;
+        }
+    }
+    if (!mapped_off) {
+        error_setg(errp, "%s: no entry stub", path);
         goto fail;
     }
-    img->xip_base = (mapped_ptr & ~1u) - BES_MAPPED_OFFSET;
-    img->entry = img->xip_base + BES_ENTRY_OFFSET;
+    img->xip_base = (mapped_ptr & ~1u) - (stub + 4);
+    img->entry = img->xip_base + stub;
 
     /* last 4 bytes = NC-alias mapped base, used to locate boot info */
     uint32_t mapped_nc = bes_ldl(img->data + img->size - 4);
@@ -148,13 +195,13 @@ bool bes_image_load(BesImage *img, const char *path, Error **errp)
         goto fail;
     }
 
-    img->msp        = bes_ldl(img->data + BES_OFF_MSP);
-    img->msplim     = bes_ldl(img->data + BES_OFF_MSPLIM);
-    img->data_lma   = bes_ldl(img->data + BES_OFF_DATA_LMA);
-    img->data_start = bes_ldl(img->data + BES_OFF_DATA_START);
-    img->data_end   = bes_ldl(img->data + BES_OFF_DATA_END);
-    img->bss_start  = bes_ldl(img->data + BES_OFF_BSS_START);
-    img->bss_end    = bes_ldl(img->data + BES_OFF_BSS_END);
+    img->msp        = bes_ldl(img->data + mapped_off + BES_OFF_MSP);
+    img->msplim     = bes_ldl(img->data + mapped_off + BES_OFF_MSPLIM);
+    img->data_lma   = bes_ldl(img->data + mapped_off + BES_OFF_DATA_LMA);
+    img->data_start = bes_ldl(img->data + mapped_off + BES_OFF_DATA_START);
+    img->data_end   = bes_ldl(img->data + mapped_off + BES_OFF_DATA_END);
+    img->bss_start  = bes_ldl(img->data + mapped_off + BES_OFF_BSS_START);
+    img->bss_end    = bes_ldl(img->data + mapped_off + BES_OFF_BSS_END);
 
     if (!(img->msplim < img->msp &&
           img->data_start < img->data_end &&
