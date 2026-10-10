@@ -820,7 +820,7 @@ static void hci_ese_msg(NciNfccState *s, uint8_t pipe, uint8_t type,
 {
     HciPipe *p = &s->pipes[pipe];
     uint8_t gate = p->src_host == HCI_HOST_ESE ? p->src_gate : p->dst_gate;
-    uint8_t rsp[HCI_MSG_MAX];
+    uint8_t rsp[HCI_MSG_MAX] = { 0 };
     unsigned rlen = 0;
     uint8_t code = HCI_ANY_OK;
 
