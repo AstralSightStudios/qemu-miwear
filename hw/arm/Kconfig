@@ -47,6 +47,8 @@ config BEST1700
     select SDHCI
     select SD
     select BEST1700_CMU
+    select BEST1700_DSI
+    select BES_GPIO
     select BES_ISPI
 
 config ARM_VIRT

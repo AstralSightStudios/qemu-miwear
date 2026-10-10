@@ -56,11 +56,17 @@ static const BesBoard bes_boards[] = {
         /* 无实体按键 */
     },
     {
-        /* best1700 的板级外设尚未在 q63 固件上查实，逐个查实后补入 */
+        /* 板级外设逐个查实后补入 */
         .name = "q63",
-        .desc = "Xiaomi q63 (best1700)",
+        .desc = "Xiaomi Watch S5 (best1700)",
         .chip = "best1700",
         .product = "q63",
+        /* rm6d031 圆形 AMOLED，DSI 命令模式：AP 日志 "DSI0 init:
+         * width:466"、"lcdc_periphconfig: rel_screen_w = 466,
+         * rel_screen_h = 466"（实测）；TE 固定接 GPIO 47，由
+         * best1700.c 直接连线，不经此处的 lcd_te_gpio */
+        .panel_width = 466,
+        .panel_height = 466,
         .lcd_te_gpio = -1,
         .touch = { .irq_gpio = -1 },
         .nfc = { .irq_gpio = -1 },

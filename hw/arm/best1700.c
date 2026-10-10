@@ -50,6 +50,9 @@
 #include "hw/misc/bes_dma.h"
 #include "hw/misc/bes_i2c.h"
 #include "hw/misc/bes_stub.h"
+#include "hw/misc/bes_lcdc.h"
+#include "hw/misc/bes_gpio.h"
+#include "hw/misc/best1700_dsi.h"
 #include "hw/core/or-irq.h"
 #include "hw/sd/sdhci.h"
 #include "hw/sd/sd.h"
@@ -124,6 +127,29 @@
  * 由 emu/mkemmc.py 生成（GPT，各分区名即 /dev/<name>）。 */
 #define BEST1700_EMMC_BASE       0x40150000
 #define BEST1700_EMMC_IRQ        26
+
+/* 显示：LCDC @0x401C0000（与 best1503 同一 IP：图层寄存器、帧启动
+ * 0x224、中断 0x1C0/0x1C4 一致，hal_lcdc.o；hal_lcdc_irqn = 27）经
+ * DSI0 @0x401D0000（hal_dsi.o dsi_base，hal_dsi_irqn = 28）接面板；面板
+ * TE 接 GPIO 47（见下）。 */
+#define BEST1700_LCDC_BASE       0x401C0000
+#define BEST1700_LCDC_IRQ        27
+#define BEST1700_DSI0_BASE       0x401D0000
+#define BEST1700_DSI0_IRQ        28
+
+/* GPIO v2 ×3 bank（bes_gpio，与 best1503 同 IP；BSP hal_gpio_v2.o 引用
+ * 0x40081000/0x40089000/0x4008A000，_hal_gpio_irq_handler 挂 NVIC 2）。
+ * GPIO 中断经 PSC 路由，best1700 的各 bank 使能/状态字分散在 PSC 内：
+ * hal_psc_best1700.o m55c0_gpio_irq_mask = {0x400850FC, 0x400851A4,
+ * 0x400851C8}、m55c0_gpio_irq_status = {0x40085108, 0x400851A8,
+ * 0x400851CC}；PSC 其余寄存器暂按普通存储。面板 TE 接 GPIO 47
+ * （q63 hal_dsi 的 dsi_ctrl[0].te_gpio = 47，运行时读出）。 */
+#define BEST1700_GPIO0_BASE      0x40081000
+#define BEST1700_GPIO1_BASE      0x40089000
+#define BEST1700_GPIO2_BASE      0x4008A000
+#define BEST1700_PSC_BASE        0x40085000
+#define BEST1700_GPIO_IRQ        2
+#define BEST1700_LCD_TE_GPIO     47
 
 /* 通用 DMA ×3（PL080 兼容 + BES 2D 扩展，bes_dma）：BSP hal_dma.o
  * .rodata.dma = {0x401A0000, 0x401A8000, 0x40260000}、irq_type =
@@ -803,6 +829,53 @@ static void best1700_init(MachineState *machine, BesImage *img,
             sysbus_connect_irq(SYS_BUS_DEVICE(i2c), 0,
                                qdev_get_gpio_in(armv7m, i2cs[i].irq));
         }
+    }
+
+    /* ---- GPIO + PSC GPIO 中断块（见宏注释） ---- */
+    DeviceState *gpio = qdev_new(TYPE_BES_GPIO);
+    {
+        static const uint32_t en[] = { 0x0FC, 0x1A4, 0x1C8 };
+        static const uint32_t st[] = { 0x108, 0x1A8, 0x1CC };
+        int i;
+
+        qdev_prop_set_uint32(gpio, "psc-size", 0x200);
+        for (i = 0; i < 3; i++) {
+            g_autofree char *pe = g_strdup_printf("psc-en%d", i);
+            g_autofree char *ps = g_strdup_printf("psc-st%d", i);
+
+            qdev_prop_set_uint32(gpio, pe, en[i]);
+            qdev_prop_set_uint32(gpio, ps, st[i]);
+        }
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(gpio), &error_fatal);
+        best1700_map(SYS_BUS_DEVICE(gpio), 0, BEST1700_GPIO0_BASE);
+        best1700_map(SYS_BUS_DEVICE(gpio), 1, BEST1700_GPIO1_BASE);
+        best1700_map(SYS_BUS_DEVICE(gpio), 2, BEST1700_GPIO2_BASE);
+        best1700_map(SYS_BUS_DEVICE(gpio), 3, BEST1700_PSC_BASE);
+        sysbus_connect_irq(SYS_BUS_DEVICE(gpio), 0,
+                           qdev_get_gpio_in(armv7m, BEST1700_GPIO_IRQ));
+    }
+
+    /* ---- 显示：LCDC + DSI0（见宏注释），面板尺寸来自板级 profile ---- */
+    if (board->panel_width) {
+        DeviceState *lcdc = qdev_new(TYPE_BES_LCDC);
+        DeviceState *dsi = qdev_new(TYPE_BEST1700_DSI);
+
+        qdev_prop_set_uint32(lcdc, "panel-width", board->panel_width);
+        qdev_prop_set_uint32(lcdc, "panel-height", board->panel_height);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(lcdc), &error_fatal);
+        best1700_map(SYS_BUS_DEVICE(lcdc), 0, BEST1700_LCDC_BASE);
+        sysbus_connect_irq(SYS_BUS_DEVICE(lcdc), 0,
+                           qdev_get_gpio_in(armv7m, BEST1700_LCDC_IRQ));
+
+        object_property_set_link(OBJECT(dsi), "panel", OBJECT(lcdc),
+                                 &error_fatal);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dsi), &error_fatal);
+        best1700_map(SYS_BUS_DEVICE(dsi), 0, BEST1700_DSI0_BASE);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dsi), 0,
+                           qdev_get_gpio_in(armv7m, BEST1700_DSI0_IRQ));
+        qdev_connect_gpio_out_named(lcdc, "te", 0,
+                                    qdev_get_gpio_in(gpio,
+                                                     BEST1700_LCD_TE_GPIO));
     }
 
     /* ---- eMMC 主控 + 卡（见宏注释） ---- */
