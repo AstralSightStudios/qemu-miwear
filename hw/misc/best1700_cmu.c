@@ -1,5 +1,6 @@
 /*
- * BES best1700 clock units: MCU_CMU @0x40000000 and AON_CMU @0x40080000
+ * BES best1700 clock units: MCU_CMU @0x40000000 and AON_CMU @0x40080000,
+ * and the intersys half of BTH_CMU @0x50000000
  *
  * Layout from the best1700 BSP objects (open-vela vendor_bes,
  * boards/best1700_ep/aos_evb/configs/ap/libnx_bestbsp_ap.a); the q63
@@ -34,6 +35,19 @@
  *  - fast system timer, 6 MHz (hal_sys_timer_delay_ns: 6 ticks/us),
  *    64 bits at 0x288/0x28C; writing bit 24 of 0x74 loads it from
  *    0x290/0x294 (hal_fast_sys_timer64_set, hal_cmu_fast_timer_load).
+ *  - intersys mailbox to the BTH subsystem (hal_m55c0_2_bthc0_best1700.o,
+ *    hal_m55c1_2_bthc0 and the sensor firmware's side of both): each side
+ *    has a word, MCU_CMU set 0x98 / clear 0x9C and BTH_CMU set 0x134 /
+ *    clear 0x138. In it bit 16+g carries data to the other side for group
+ *    g (M55C0 channels 0/1 are groups 0/1, M55C1 channels 0/1 groups 2/3)
+ *    and bit g says the other side took it: the receiver clears the data
+ *    bit in the sender's word and the hardware sets the done bit, which
+ *    the sender then clears. Each side masks its interrupts (MCU_CMU set
+ *    0x1F4 / clear 0x1F8, BTH_CMU 0x168 / 0x16C: rx enable g, tx done
+ *    enable 16+g) and reads two status words (receive: MCU_CMU 0xEC,
+ *    BTH_CMU 0x174; tx done: MCU_CMU 0x224, BTH_CMU 0x170), raw in bit g
+ *    and masked in bit 16+g. Every group drives an "intersys-rx" and an
+ *    "intersys-tx" line.
  *  - inter-core interrupts between the two M55 cores, set 0x90 / clear
  *    0x94 (hal_m55c0_2_m55c1_best1700.o, built for either core). Per
  *    channel c (0, 1): bit 15+c M55C0 data for M55C1, bit 12+c M55C0 done
@@ -92,6 +106,12 @@ struct Best1700CmuInfo {
     hwaddr ipc_set;             /* 0: no inter-core interrupt pair */
     hwaddr hold;                /* 0: no second core to start */
     uint32_t hold_bit;
+    hwaddr isys_set;            /* 0: no intersys mailbox */
+    hwaddr isys_clr;
+    hwaddr isys_mask_set;
+    hwaddr isys_mask_clr;
+    hwaddr isys_rx_stat;
+    hwaddr isys_tx_stat;
 };
 
 static const Best1700CmuPair cmu_pairs[] = {
@@ -124,6 +144,12 @@ static const Best1700CmuInfo cmu_info = {
     .lp_req = 0x1A0,
     .lp_ack = 0x1AC,
     .ipc_set = 0x090,
+    .isys_set = 0x098,
+    .isys_clr = 0x09C,
+    .isys_mask_set = 0x1F4,
+    .isys_mask_clr = 0x1F8,
+    .isys_rx_stat = 0x0EC,
+    .isys_tx_stat = 0x224,
 };
 
 static const Best1700CmuPair aoncmu_pairs[] = {
@@ -148,6 +174,17 @@ static const Best1700CmuInfo aoncmu_info = {
     .timer_hz = 16000,
     .hold = 0x1A4,
     .hold_bit = 1u << 1,
+};
+
+/* BTH_CMU @0x50000000: only the intersys half is modelled */
+static const Best1700CmuInfo bthcmu_info = {
+    .name = "best1700.bthcmu",
+    .isys_set = 0x134,
+    .isys_clr = 0x138,
+    .isys_mask_set = 0x168,
+    .isys_mask_clr = 0x16C,
+    .isys_rx_stat = 0x174,
+    .isys_tx_stat = 0x170,
 };
 
 static const Best1700CmuInfo *cmu_info_of(Best1700CmuState *s)
@@ -187,6 +224,52 @@ static uint64_t cmu_ticks(const Best1700CmuInfo *info)
                     NANOSECONDS_PER_SECOND);
 }
 
+#define ISYS_G_MASK MAKE_64BIT_MASK(0, BEST1700_ISYS_GROUPS)
+
+static uint32_t isys_rx_raw(Best1700CmuState *s)
+{
+    return s->isys_peer ? (s->isys_peer->isys_word >> 16) & ISYS_G_MASK : 0;
+}
+
+static uint32_t isys_rx_stat(Best1700CmuState *s)
+{
+    uint32_t raw = isys_rx_raw(s);
+
+    return raw | (raw & s->isys_mask & ISYS_G_MASK) << 16;
+}
+
+static uint32_t isys_tx_stat(Best1700CmuState *s)
+{
+    uint32_t raw = s->isys_word & ISYS_G_MASK;
+
+    return raw | (raw & (s->isys_mask >> 16)) << 16;
+}
+
+static void isys_update_one(Best1700CmuState *s)
+{
+    uint32_t rx = isys_rx_stat(s) >> 16, tx = isys_tx_stat(s) >> 16;
+    int g;
+
+    for (g = 0; g < BEST1700_ISYS_GROUPS; g++) {
+        qemu_set_irq(s->isys_rx[g], (rx >> g) & 1);
+        qemu_set_irq(s->isys_tx[g], (tx >> g) & 1);
+    }
+}
+
+static void isys_update(Best1700CmuState *s)
+{
+    isys_update_one(s);
+    if (s->isys_peer) {
+        isys_update_one(s->isys_peer);
+    }
+}
+
+void best1700_cmu_link_intersys(Best1700CmuState *mcu, Best1700CmuState *bth)
+{
+    mcu->isys_peer = bth;
+    bth->isys_peer = mcu;
+}
+
 static void cmu_update_ipc(Best1700CmuState *s, uint32_t word)
 {
     int i;
@@ -205,14 +288,26 @@ static uint64_t best1700_cmu_read(void *opaque, hwaddr offset, unsigned size)
     bool is_set;
     int pair;
 
-    if (offset >= info->memsc && offset < memsc_end && !(offset & 3)) {
+    if (info->isys_set && (offset == info->isys_set ||
+                           offset == info->isys_clr)) {
+        v = s->isys_word;
+    } else if (info->isys_set && (offset == info->isys_mask_set ||
+                                  offset == info->isys_mask_clr)) {
+        v = s->isys_mask;
+    } else if (info->isys_set && offset == info->isys_rx_stat) {
+        v = isys_rx_stat(s);
+    } else if (info->isys_set && offset == info->isys_tx_stat) {
+        v = isys_tx_stat(s);
+    } else if (info->num_memsc && offset >= info->memsc &&
+               offset < memsc_end && !(offset & 3)) {
         uint32_t bit = 1u << ((offset - info->memsc) / 4);
 
         v = !(s->memsc_taken & bit);
         s->memsc_taken |= bit;
-    } else if (offset == info->memsc_avail) {
+    } else if (info->num_memsc && offset == info->memsc_avail) {
         v = ~s->memsc_taken & MAKE_64BIT_MASK(0, info->num_memsc);
-    } else if (offset == info->timer || offset == info->timer + 4) {
+    } else if (info->timer_hz &&
+               (offset == info->timer || offset == info->timer + 4)) {
         uint64_t t = cmu_ticks(info) + s->timer_offset;
 
         v = offset == info->timer ? (uint32_t)t : (uint32_t)(t >> 32);
@@ -249,12 +344,33 @@ static void best1700_cmu_write(void *opaque, hwaddr offset, uint64_t value,
     qemu_log_mask(LOG_UNIMP, "%s: write off=0x%03x = 0x%08x\n",
                   info->name, (unsigned)offset, (unsigned)value);
 
-    if (offset >= info->memsc && offset < memsc_end && !(offset & 3)) {
+    if (info->isys_set && offset == info->isys_set) {
+        s->isys_word |= value;
+        isys_update(s);
+    } else if (info->isys_set && offset == info->isys_clr) {
+        /* clearing a data bit tells the sender it was taken */
+        uint32_t taken = (s->isys_word & value) >> 16;
+
+        s->isys_word &= ~value;
+        s->isys_word |= taken & ~value & ISYS_G_MASK;
+        isys_update(s);
+    } else if (info->isys_set && offset == info->isys_mask_set) {
+        s->isys_mask |= value;
+        isys_update(s);
+    } else if (info->isys_set && offset == info->isys_mask_clr) {
+        s->isys_mask &= ~value;
+        isys_update(s);
+    } else if (info->isys_set && (offset == info->isys_rx_stat ||
+                                  offset == info->isys_tx_stat)) {
+        /* read-only */
+    } else if (info->num_memsc && offset >= info->memsc &&
+               offset < memsc_end && !(offset & 3)) {
         if (value & 1) {
             s->memsc_taken &= ~(1u << ((offset - info->memsc) / 4));
         }
-    } else if (offset == info->memsc_avail ||
-               offset == info->timer || offset == info->timer + 4 ||
+    } else if ((info->num_memsc && offset == info->memsc_avail) ||
+               (info->timer_hz &&
+                (offset == info->timer || offset == info->timer + 4)) ||
                cmu_is_pulse(info, offset)) {
         /* read-only, or a pulse with nothing to reset here */
     } else if ((pair = cmu_find_pair(info, offset, &is_set)) >= 0) {
@@ -305,6 +421,8 @@ static void best1700_cmu_reset(DeviceState *dev)
     s->memsc_taken = 0;
     s->timer_offset = 0;
     s->cpu_held = false;
+    s->isys_word = 0;
+    s->isys_mask = 0;
 }
 
 static void best1700_cmu_realize(DeviceState *dev, Error **errp)
@@ -319,6 +437,12 @@ static void best1700_cmu_realize(DeviceState *dev, Error **errp)
     }
     if (cmu_info_of(s)->hold) {
         qdev_init_gpio_out_named(dev, &s->cpu_run, "cpu-run", 1);
+    }
+    if (cmu_info_of(s)->isys_set) {
+        qdev_init_gpio_out_named(dev, s->isys_rx, "intersys-rx",
+                                 BEST1700_ISYS_GROUPS);
+        qdev_init_gpio_out_named(dev, s->isys_tx, "intersys-tx",
+                                 BEST1700_ISYS_GROUPS);
     }
 }
 
@@ -345,6 +469,11 @@ static const TypeInfo best1700_cmu_types[] = {
         .parent = TYPE_BEST1700_CMU,
         .class_init = best1700_cmu_class_init,
         .class_data = &aoncmu_info,
+    }, {
+        .name = TYPE_BEST1700_BTHCMU,
+        .parent = TYPE_BEST1700_CMU,
+        .class_init = best1700_cmu_class_init,
+        .class_data = &bthcmu_info,
     },
 };
 

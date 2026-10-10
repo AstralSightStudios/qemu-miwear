@@ -11,6 +11,7 @@
 
 #define TYPE_BEST1700_CMU       "best1700.cmu"
 #define TYPE_BEST1700_AONCMU    "best1700.aoncmu"
+#define TYPE_BEST1700_BTHCMU    "best1700.bthcmu"
 
 typedef struct Best1700CmuInfo Best1700CmuInfo;
 
@@ -18,6 +19,9 @@ OBJECT_DECLARE_TYPE(Best1700CmuState, Best1700CmuClass, BEST1700_CMU)
 
 #define BEST1700_CMU_SIZE       0x1000
 #define BEST1700_CMU_MAX_PAIRS  16
+
+/* intersys mailbox groups: M55C0 channels 0/1, M55C1 channels 0/1, ... */
+#define BEST1700_ISYS_GROUPS    8
 
 /* AON_CMU: boot address of the M55C1 core, bits [31:7] (its own view) */
 #define BEST1700_AONCMU_M55C1_VTOR  0xB4
@@ -34,7 +38,17 @@ struct Best1700CmuState {
     qemu_irq ipc[32];           /* MCU_CMU: one line per inter-core bit */
     qemu_irq cpu_run;           /* AON_CMU: M55C1 released from hold */
     bool cpu_held;              /* hold bit seen set since reset */
+
+    /* intersys mailbox (MCU_CMU and BTH_CMU) */
+    uint32_t isys_word;         /* data to the peer 16+g, peer done with it g */
+    uint32_t isys_mask;         /* rx enable g, tx done enable 16+g */
+    Best1700CmuState *isys_peer;
+    qemu_irq isys_rx[BEST1700_ISYS_GROUPS];
+    qemu_irq isys_tx[BEST1700_ISYS_GROUPS];
 };
+
+/* pair the intersys mailbox halves of the MCU_CMU and the BTH_CMU */
+void best1700_cmu_link_intersys(Best1700CmuState *mcu, Best1700CmuState *bth);
 
 struct Best1700CmuClass {
     SysBusDeviceClass parent_class;
