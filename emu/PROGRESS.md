@@ -197,6 +197,40 @@ AONCMU/CMU 魔术值 → UART（console, qemu chardev 直通终端）→ TIMER/S
 
 ## 7. 最新变更
 
+- **2026-10-10 (4)（q63/best1700：TEE 启动并拉起 AP）**：
+  BSP 来源：open-vela/vendor_bes 的 dev-ai-contest-2026 分支，
+  boards/best1700_ep/aos_evb/configs/ap/{libnx_bestbsp_ap.a,
+  libbeschip_ap.a,libbesboard_ap.a,_best1000.lds}（目标文件带符号与
+  重定位，无调试信息；llvm-objdump 反汇编即可对照）。q63 = 小米手表
+  S5（TEE 版本串 "NuttX Xiaomi Watch S5"）。
+  ①**启动链**：AP 的 NuttX 按 TrustZone 非安全编译（新任务
+  EXC_RETURN=0xFFFFFFAC），并经 NSC veneer 调 0x10165xxx 的安全服务；
+  那里是 vela_tee.bin（签名镜像 v0x00050001 + AVB 尾，
+  OTA_CODE_OFFSET=0xC0000，NuttX + OP-TEE）。现从 TEE 入口安全启动
+  （-kernel 旁的 vela_tee.bin 自动装入，或 -M tee-image=），TEE 配好
+  SAU/MPC/TGU 后拉起 AP。bes_image 支持签名头（按入口 stub 形态定位
+  字段）和 AVB 尾。
+  ②**地址位 26 = 安全别名**（0x04/0x24/0x44/0x54…），IDAU 按此报
+  安全；TEE 的 SAU 只划 NS 区，靠 IDAU 留在安全态。SRAM、ITCM/boot
+  RAM、外设容器都映射两份。新增 RAM：BTH RAM 0x23000000（TEE 启动栈
+  0x23020000–0x23040000）、AON 邮箱 RAM 0x23C00000、PSRAM 0x18000000
+  （NC 0x38000000，.data/.psram_data 在此）。
+  ③**外设**：MCU_CMU/AON_CMU 新模型 best1700_cmu.c（时钟/复位 set/clr
+  对、MEMSC 试锁、PLL 锁定 0xE4/0xE8、AXI 低功耗握手 0x1A0/0x1AC、
+  6MHz 快定时器 CMU+0x288、16kHz 系统定时器 AON+0x50）；UART=PL011
+  0x4000B000/0x4000C000/0x40011000（中断 22/24/26）；TIMER=SP804
+  0x40083000（16kHz，58/59）/0x40005000（6MHz，72/73）；NOR 控制器
+  0x40190000（bes_flash，GD25LQ128 双片 32MB）；PSRAM MC v6 0x40320000
+  + PHY 0x40328000（bes_psram v6）；SIE-200 MPC 寄存器（不过滤）；
+  M55 TGU 配置（0xE001E504/604）。NVIC 120 个外部中断。
+  ④**ISPI 帧格式更正**：读 (reg<<18)|0x10000000、写
+  (reg<<18)|(val<<2)、10 位地址，按片选（+0x04 bit[10:7]）分开寄存器；
+  PMU=片选 0（1806P：reg0=0x18F0、reg1=0x0650），片选 7 reg0=0x1700，
+  PSRAM 模拟 PHY=片选 5（reg 0x51 DLL 锁定），PMU reg 0x4F DCDC 校准
+  即刻完成。
+  现状：串口 0 出 "[tee] … before nx_start" 与 "[ap] … before nx_start"，
+  AP 继续初始化（尚未出 AP 的 syslog）。
+
 - **2026-10-10 (3)（设备 profile 抽象 + best1700 IDA loader）**：
   设备 = 芯片 + 板子。芯片文件（best1503.c/best1700.c）只放芯片事实并以
   BesSoc 注册；板级外设（面板尺寸/TE 脚、触摸与 NFC 控制器的总线/地址/
