@@ -21,3 +21,5 @@ GTAGS
 *.patch
 *.gcov
 /miwear.watch.*
+out
+*.DS_Store
