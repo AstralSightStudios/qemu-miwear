@@ -34,9 +34,13 @@ config BEST1700
     depends on TCG && ARM
     select BES_BOARD
     select ARM_V7M
+    select UNIMP
+    select PL011
+    select ARM_TIMER
     select BES_IMAGE
     select BES_FLASH
-    select BES_CMU
+    select BES_PSRAM
+    select BEST1700_CMU
     select BES_ISPI
 
 config ARM_VIRT

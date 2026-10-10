@@ -20,6 +20,7 @@
 #include "hw/input/gpio_keys.h"
 #include "hw/input/zinitix_ts.h"
 #include "hw/misc/nci_nfcc.h"
+#include "system/reset.h"
 #include "target/arm/cpu-qom.h"
 
 static const BesBoard bes_boards[] = {
@@ -234,7 +235,18 @@ static void bes_machine_init(MachineState *ms)
                 chip, board->name, board->desc, img->xip_base,
                 img->cached_base, img->nc_base, img->entry, img->msp,
                 img->size);
+    bms->soc = soc;
     soc->init(ms, img, board);
+}
+
+static void bes_machine_reset(MachineState *ms, ResetType type)
+{
+    BesMachineState *bms = BES_MACHINE(ms);
+
+    qemu_devices_reset(type);
+    if (bms->soc->reset) {
+        bms->soc->reset(ms);
+    }
 }
 
 static char *bes_get_profile(Object *obj, Error **errp)
@@ -270,6 +282,35 @@ static void bes_set_nand_image(Object *obj, const char *val, Error **errp)
     BES_MACHINE(obj)->nand_image = g_strdup(val);
 }
 
+static char *bes_get_tee_image(Object *obj, Error **errp)
+{
+    return g_strdup(BES_MACHINE(obj)->tee_image);
+}
+
+static void bes_set_tee_image(Object *obj, const char *val, Error **errp)
+{
+    g_free(BES_MACHINE(obj)->tee_image);
+    BES_MACHINE(obj)->tee_image = g_strdup(val);
+}
+
+char *bes_machine_tee_image(MachineState *ms)
+{
+    BesMachineState *bms = BES_MACHINE(ms);
+    g_autofree char *dir = NULL;
+    char *path;
+
+    if (bms->tee_image) {
+        return *bms->tee_image ? g_strdup(bms->tee_image) : NULL;
+    }
+    dir = g_path_get_dirname(ms->kernel_filename);
+    path = g_build_filename(dir, "vela_tee.bin", NULL);
+    if (g_file_test(path, G_FILE_TEST_IS_REGULAR)) {
+        return path;
+    }
+    g_free(path);
+    return NULL;
+}
+
 static void bes_machine_finalize(Object *obj)
 {
     BesMachineState *bms = BES_MACHINE(obj);
@@ -277,6 +318,7 @@ static void bes_machine_finalize(Object *obj)
     g_free(bms->profile);
     g_free(bms->flash_image);
     g_free(bms->nand_image);
+    g_free(bms->tee_image);
 }
 
 static void bes_machine_class_init(ObjectClass *oc, const void *data)
@@ -284,6 +326,7 @@ static void bes_machine_class_init(ObjectClass *oc, const void *data)
     MachineClass *mc = MACHINE_CLASS(oc);
 
     mc->init = bes_machine_init;
+    mc->reset = bes_machine_reset;
     mc->ignore_memory_transaction_failures = true;
 
     object_class_property_add_str(oc, "profile", bes_get_profile,
@@ -307,6 +350,14 @@ static void bes_machine_class_init(ObjectClass *oc, const void *data)
                                           "NAND (resource romfs + /data); "
                                           "default emu/nand.img, created "
                                           "erased if missing");
+    object_class_property_add_str(oc, "tee-image", bes_get_tee_image,
+                                  bes_set_tee_image);
+    object_class_property_set_description(oc, "tee-image",
+                                          "secure-world (TEE) image booted "
+                                          "before the AP on chips that have "
+                                          "one; default: vela_tee.bin next "
+                                          "to the -kernel firmware, empty "
+                                          "for none");
 }
 
 static void miwear_machine_class_init(ObjectClass *oc, const void *data)
