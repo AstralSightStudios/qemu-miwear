@@ -163,6 +163,7 @@ struct SDState {
 
     uint8_t spec_version;
     uint64_t boot_part_size;
+    uint32_t psn;           /* eMMC product serial number (CID) */
     uint64_t rpmb_part_size;
     BlockBackend *blk;
     uint8_t boot_config;
@@ -491,7 +492,7 @@ static void emmc_set_cid(SDState *sd)
     sd->cid[7] = PNM[4];
     sd->cid[8] = PNM[4];
     sd->cid[9] = PRV;       /* Fake product revision (PRV) */
-    stl_be_p(&sd->cid[10], 0xdeadbeef); /* Fake serial number (PSN) */
+    stl_be_p(&sd->cid[10], sd->psn); /* Product serial number (PSN) */
     sd->cid[14] = (MDT_MON << 4) | (MDT_YR - 1997); /* Manufacture date (MDT) */
     sd->cid[15] = (sd_crc7(sd->cid, 15) << 1) | 1;
 }
@@ -3217,6 +3218,7 @@ static const Property emmc_properties[] = {
     DEFINE_PROP_UINT8("boot-config", SDState, boot_config, 0x0),
     DEFINE_PROP_UINT64("rpmb-partition-size", SDState, rpmb_part_size, 0),
     DEFINE_PROP_STRING("auth-key", SDState, preset_auth_key),
+    DEFINE_PROP_UINT32("serial", SDState, psn, 0xdeadbeef),
 };
 
 static void sdmmc_common_class_init(ObjectClass *klass, const void *data)
