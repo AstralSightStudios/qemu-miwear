@@ -1,4 +1,5 @@
 arm_common_ss = ss.source_set()
+arm_common_ss.add(when: 'CONFIG_BES_BOARD', if_true: files('bes_board.c'))
 arm_common_ss.add(when: 'CONFIG_BEST1503', if_true: files('best1503.c'))
 arm_common_ss.add(when: 'CONFIG_BEST1700', if_true: files('best1700.c'))
 arm_common_ss.add(when: 'CONFIG_ARM_VIRT', if_true: files('virt.c'))

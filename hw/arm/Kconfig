@@ -1,7 +1,12 @@
+config BES_BOARD
+    bool
+    select GPIO_KEYS
+
 config BEST1503
     bool
     default y
     depends on TCG && ARM
+    select BES_BOARD
     select ARM_V7M
     select UNIMP
     select PL011
@@ -27,6 +32,7 @@ config BEST1700
     bool
     default y
     depends on TCG && ARM
+    select BES_BOARD
     select ARM_V7M
     select UNIMP
     select PL011

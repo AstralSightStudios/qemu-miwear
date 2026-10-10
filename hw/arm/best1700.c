@@ -1,5 +1,6 @@
 /*
- * BEST1700 machine —— q63 AP 固件（Vela/NuttX）模拟
+ * BEST1700 SoC —— q63 AP 固件（Vela/NuttX）模拟（machine 与板级 profile
+ * 见 bes_board.c）
  *
  * 当前进度：boot 早期，卡在固件 chip id 校验（0x101C22B0 死循环）。
  *
@@ -23,6 +24,7 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
+#include "qemu/module.h"
 #include "qemu/units.h"
 #include "hw/core/boards.h"
 #include "hw/core/cpu.h"
@@ -31,7 +33,7 @@
 #include "hw/arm/armv7m.h"
 #include "target/arm/cpu.h"
 #include "hw/arm/boot.h"
-#include "hw/arm/machines-qom.h"
+#include "hw/arm/bes_board.h"
 #include "hw/misc/bes_image.h"
 #include "hw/misc/bes_flash.h"
 #include "system/address-spaces.h"
@@ -61,26 +63,9 @@
  * 是 rehosting 中模拟 boot ROM 跳转效果的标准替代手段，不修改固件
  * 任何字节。
  */
-static BesImage g_img;
+static BesImage *g_img;
 static MemoryRegion g_bootvec;
 static ARMCPU *g_cpu;
-
-/* -M best1700,flash-image=<file>：完整 flash 镜像作为 bes_flash 后端
- * 并在退出时写回；缺省则由 -kernel 固件按 OTA_CODE_OFFSET 构造后端
- * 内容。 */
-static char *g_flash_image;
-
-static char *best1700_get_flash_image(Object *obj, Error **errp)
-{
-    return g_strdup(g_flash_image);
-}
-
-static void best1700_set_flash_image(Object *obj, const char *val,
-                                     Error **errp)
-{
-    g_free(g_flash_image);
-    g_flash_image = g_strdup(val);
-}
 
 /*
  * CPU 对象不随系统 reset 自动复位（hw/arm/boot.c:1186 注释），
@@ -105,32 +90,21 @@ static void best1700_bootvec_reset(void *opaque)
     /* 每次系统 reset 重填（在 CPU reset 之前执行），等效真机 boot ROM */
     uint32_t *vec = memory_region_get_ram_ptr(&g_bootvec);
 
-    vec[0] = g_img.msp;
-    vec[1] = g_img.entry | 1;   /* Thumb */
+    vec[0] = g_img->msp;
+    vec[1] = g_img->entry | 1;  /* Thumb */
 }
 
-static void best1700_init(MachineState *machine)
+static void best1700_init(MachineState *machine, BesImage *img,
+                          const BesBoard *board)
 {
+    BesMachineState *bms = BES_MACHINE(machine);
     MemoryRegion *sysmem = get_system_memory();
     static MemoryRegion flash, flash_cached, flash_nc, sram, ramx;
     Clock *sysclk;
-    Error *err = NULL;
     DeviceState *armv7m;
 
-    /* ---- parse firmware (single source of truth for all layout) ---- */
-    if (!machine->kernel_filename) {
-        error_report("best1700: -kernel <firmware image> is required "
-                     "(e.g. vela_ap.bin)");
-        exit(1);
-    }
-    if (!bes_image_load(&g_img, machine->kernel_filename, &err)) {
-        error_report_err(err);
-        exit(1);
-    }
-    info_report("best1700: firmware: xip=0x%08x cached=0x%08x nc=0x%08x "
-                "entry=0x%08x msp=0x%08x size=0x%zx",
-                g_img.xip_base, g_img.cached_base, g_img.nc_base,
-                g_img.entry, g_img.msp, g_img.size);
+    /* firmware layout: parsed by the machine (single source of truth) */
+    g_img = img;
 
     sysclk = clock_new(OBJECT(machine), "SYSCLK");
     clock_set_hz(sysclk, BEST1700_SYSCLK_FRQ);
@@ -156,30 +130,30 @@ static void best1700_init(MachineState *machine)
      * 装入 AP 分区（等同 OTA 升级），同一镜像可跨固件版本使用。 */
     DeviceState *fc = qdev_new(TYPE_BES_FLASH);
     {
-        uint32_t flash_xip_start = g_img.xip_base - g_img.ota_code_offset;
-        uint32_t flash_cached_start = g_img.cached_base - g_img.ota_code_offset;
-        uint32_t flash_nc_start = g_img.nc_base - g_img.ota_code_offset;
+        uint32_t flash_xip_start = g_img->xip_base - g_img->ota_code_offset;
+        uint32_t flash_cached_start = g_img->cached_base - g_img->ota_code_offset;
+        uint32_t flash_nc_start = g_img->nc_base - g_img->ota_code_offset;
 
-        qdev_prop_set_uint32(fc, "size", g_img.flash_size);
-        if (g_flash_image) {
-            qdev_prop_set_string(fc, "image", g_flash_image);
+        qdev_prop_set_uint32(fc, "size", g_img->flash_size);
+        if (bms->flash_image) {
+            qdev_prop_set_string(fc, "image", bms->flash_image);
         }
         sysbus_realize_and_unref(SYS_BUS_DEVICE(fc), &error_fatal);
 
-        memcpy(bes_flash_data(BES_FLASH(fc)) + g_img.ota_code_offset,
-               g_img.data, g_img.size);
+        memcpy(bes_flash_data(BES_FLASH(fc)) + g_img->ota_code_offset,
+               g_img->data, g_img->size);
 
         memory_region_init_alias(&flash, NULL, "best1700.flash_xip",
                                  bes_flash_storage(BES_FLASH(fc)), 0,
-                                 g_img.flash_size);
+                                 g_img->flash_size);
         memory_region_add_subregion(sysmem, flash_xip_start, &flash);
         memory_region_init_alias(&flash_cached, NULL, "best1700.flash_cached",
                                  bes_flash_storage(BES_FLASH(fc)), 0,
-                                 g_img.flash_size);
+                                 g_img->flash_size);
         memory_region_add_subregion(sysmem, flash_cached_start, &flash_cached);
         memory_region_init_alias(&flash_nc, NULL, "best1700.flash_nc",
                                  bes_flash_storage(BES_FLASH(fc)), 0,
-                                 g_img.flash_size);
+                                 g_img->flash_size);
         memory_region_add_subregion(sysmem, flash_nc_start, &flash_nc);
     }
 
@@ -203,12 +177,12 @@ static void best1700_init(MachineState *machine)
      * 真机 BL2 跳转入库前已完成 .data 重定位。地址全部来自镜像头
      * 解析（data_start/data_end/data_lma），不写死。 */
     {
-        uint32_t cached_start = g_img.cached_base - g_img.ota_code_offset;
+        uint32_t cached_start = g_img->cached_base - g_img->ota_code_offset;
         memcpy(memory_region_get_ram_ptr(&sram) +
-               (g_img.data_start - BEST1700_SRAM_BASE),
+               (g_img->data_start - BEST1700_SRAM_BASE),
                bes_flash_data(BES_FLASH(fc)) +
-               (g_img.data_lma - cached_start),
-               g_img.data_end - g_img.data_start);
+               (g_img->data_lma - cached_start),
+               g_img->data_end - g_img->data_start);
     }
 
     /* ---- 伪 boot 向量表 @0x0（模拟 boot ROM 跳转，不碰固件） ---- */
@@ -239,28 +213,14 @@ static void best1700_init(MachineState *machine)
      */
 }
 
-static void best1700_machine_init(MachineClass *mc)
+static const BesSoc best1700_soc = {
+    .chip = "best1700",
+    .init = best1700_init,
+};
+
+static void best1700_register(void)
 {
-    static const char * const valid_cpu_types[] = {
-        ARM_CPU_TYPE_NAME("cortex-m55"),
-        NULL
-    };
-
-    mc->desc = "BEST1700 (Cortex-M55, Vela AP, q63)";
-    mc->init = best1700_init;
-    mc->valid_cpu_types = valid_cpu_types;
-    mc->default_cpu_type = ARM_CPU_TYPE_NAME("cortex-m55");
-    mc->ignore_memory_transaction_failures = true;
-
-    object_class_property_add_str(OBJECT_CLASS(mc), "flash-image",
-                                  best1700_get_flash_image,
-                                  best1700_set_flash_image);
-    object_class_property_set_description(OBJECT_CLASS(mc), "flash-image",
-                                          "backing image file for the boot "
-                                          "flash (loaded at startup, written "
-                                          "back on exit; the -kernel firmware "
-                                          "is installed into its AP "
-                                          "partition)");
+    bes_soc_register(&best1700_soc);
 }
 
-DEFINE_MACHINE_ARM("best1700", best1700_machine_init)
+type_init(best1700_register)

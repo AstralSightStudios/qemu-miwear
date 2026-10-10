@@ -11,6 +11,9 @@
 #   BT_PORT=<port> listens there for the peer Bluetooth host (H4 HCI).
 #   NOR=<file> backs the NOR flash with that image (factory data, see
 #   emu/mknor.py); written back on exit.
+#   FW=<dir> picks the firmware (its vela_ap.bin); the machine follows its
+#   chip, and the board profile its product. PROFILE=<name> forces a board
+#   (PROFILE=help lists them).
 # Must be run from the repository root (machine paths are relative).
 OUT=$1; SECS=$2; shift 2
 FW=${FW:-miwear.watch.p67tc_v3.101.043_full_a4ce8564}
@@ -33,9 +36,12 @@ fi
 if [ -n "$NOR" ]; then
     NOR_ARGS="-M flash-image=$NOR"
 fi
+if [ -n "$PROFILE" ]; then
+    PROFILE_ARGS="-M profile=$PROFILE"
+fi
 mkdir -p "$OUT"
-build/qemu-system-arm -M best1503 -kernel "$FW/vela_ap.bin" \
-    $DISPLAY_ARGS $BT_ARGS $NOR_ARGS -monitor none \
+build/qemu-system-arm -M miwear -kernel "$FW/vela_ap.bin" \
+    $DISPLAY_ARGS $BT_ARGS $NOR_ARGS $PROFILE_ARGS -monitor none \
     -serial file:"$OUT/uart0.log" -serial file:"$OUT/uart1.log" \
     $UART2_ARGS -D "$OUT/qemu.log" "$@" > "$OUT/stdout.log" 2>&1 &
 PID=$!

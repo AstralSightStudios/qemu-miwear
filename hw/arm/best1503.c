@@ -1,10 +1,12 @@
 /*
- * BEST1503 (BES2700iMP) machine —— 小米手环10 AP 固件（Vela/NuttX）模拟
+ * BEST1503 (BES2700iMP) SoC —— Vela/NuttX AP 固件模拟（小米手环 10 Pro 等）
  *
  * 设计约束（DESIGN.md）：
  *   - 所有固件布局来自 bes_image 解析，本文件不写死固件地址
  *   - 外设基地址集中在下方地址表（出处：SDK plat_addr_map_best1503.h）
  *   - 未实现外设一律 unimp 占位打日志，严禁猜值
+ *   - 只放芯片事实；板级外设（屏、触摸、NFC、NAND、按键）及其接线来自
+ *     设备 profile（bes_board.c），machine 注册也在那里
  *
  * This code is licensed under the GPL version 2 or later.
  */
@@ -13,6 +15,7 @@
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "qemu/log.h"
+#include "qemu/module.h"
 #include "qemu/units.h"
 #include "hw/core/boards.h"
 #include "hw/core/cpu.h"
@@ -20,7 +23,8 @@
 #include "hw/core/qdev-clock.h"
 #include "hw/arm/armv7m.h"
 #include "hw/arm/boot.h"
-#include "hw/arm/machines-qom.h"
+#include "hw/arm/bes_board.h"
+#include "hw/i2c/i2c.h"
 #include "hw/misc/unimp.h"
 #include "hw/misc/bes_image.h"
 #include "hw/misc/bes_aoncmu.h"
@@ -34,8 +38,6 @@
 #include "hw/misc/bes_btss.h"
 #include "hw/misc/bes_gpio.h"
 #include "hw/misc/bes_psc.h"
-#include "hw/misc/nci_nfcc.h"
-#include "hw/input/zinitix_ts.h"
 #include "hw/misc/vsi_vglite.h"
 #include "system/address-spaces.h"
 #include "system/reset.h"
@@ -65,18 +67,6 @@
 /* flash1 NC 窗口：NAND 驱动经 0x30000000 + column 直读页缓存（坏块标记
  * sub_C2215FC、非对齐尾部 sub_C221680 里的立即数 0x30000000）。 */
 #define BEST1503_FLASH1_NC_BASE   0x30000000
-/* SPI NAND 芯片：固件 ID 表 0x2CCD4134 第 1 项（0x2CCD3FE4）：
- * ID c8-f4-c8，2048+64B 页，128KB 块，512MB。选 512MB 的依据：
- * bes_board_nand_initialize（sub_C20AB44）按容量选分区表，只有 512MB 表
- * 的 resource 分区（0x19000 页 = 200MB，表 0x2CCC72C0）装得下
- * vela_resource.bin（romfs 头标 171754096 字节）；128/256MB 表只有
- * 0x10E00 页 = 141.5MB。整机实际贴片型号未知，表中 512MB/2KB 页的
- * 候选里取首项。 */
-#define BEST1503_NAND_ID          0xC8F4C8
-#define BEST1503_NAND_PAGE        2048
-#define BEST1503_NAND_OOB         64
-#define BEST1503_NAND_PPB         64
-#define BEST1503_NAND_BLOCKS      4096
 /* 通用 DMA ×2：固件 hal_dma 基址表 0x2CCDA91C、NVIC 号表 0x2CCDA918
  * （hal_dma_open sub_C22E8D0 装向量）。flash1 的 DMA 请求 = 外设号 28
  * → DMA1 请求线 6（外设表 0x2CCDA924 下标 6，数据口 0x40500008）。 */
@@ -105,28 +95,9 @@
  * MCU 掉电/唤醒见 bes_psc.c；+0x80 起的 GPIO 中断块由 bes_gpio 覆盖映射 */
 #define BEST1503_PSC_BASE         0x40085000
 #define BEST1503_GPIO_IRQ         44
-/* LCDC：NVIC 67（sub_C231DE4）；面板 TE 接 GPIO 47（板级：固件
- * LCD TE 引脚配置 sub_C0E3DF0 返回 47，经 sub_C232740 配成边沿中断）；
- * 面板 336x480（固件 LCDC 初始化 sub_C225BA4 的层/输出尺寸）。 */
+/* LCDC：NVIC 67（sub_C231DE4）。面板尺寸、TE 脚是板级（profile）。 */
 #define BEST1503_LCDC_BASE        0x40200000
 #define BEST1503_LCDC_IRQ         67
-#define BEST1503_LCD_TE_GPIO      47
-
-/* 触摸：Zinitix ZTW662（真机日志 chip id 0xE623）。bes_ts_zinitix_setup
- * (sub_C3F84CC) 打开 I2C 总线 5；板级配置 0x2CD0605C = {I2C 地址 0x20,
- * 400kHz, INT pinset 0x1004C (GPIO 76), RESET pinset 0x1404E (GPIO 78)}。 */
-#define BEST1503_TP_I2C_BUS       5
-#define BEST1503_TP_I2C_ADDR      0x20
-#define BEST1503_TP_INT_GPIO      76
-/* NFC 控制器：bes sn110 驱动 nfc_driver_p67_initialize（sub_C713784）：
- * I2C 总线 6、地址 0x28、400kHz，ioexpander 引脚 VEN=69、中断(数据就绪)=77、
- * 下载使能=68。 */
-#define BEST1503_NFC_I2C_BUS      6
-#define BEST1503_NFC_I2C_ADDR     0x28
-#define BEST1503_NFC_VEN_GPIO     69
-#define BEST1503_NFC_IRQ_GPIO     77
-#define BEST1503_PANEL_W          336
-#define BEST1503_PANEL_H          480
 /* 2D GPU（VeriSilicon VGLite，GCNanoUltraV 类）：寄存器 0x40220000
  * （固件 VGLite HAL 基址 0x200C8C30 初值），NVIC 70（ISR 0xC224C28 装在
  * 向量偏移 0x158）。芯片标识是驱动 vg_lite_options 要求的值
@@ -233,42 +204,9 @@
  * 无法真实模拟 boot ROM；0x0 伪向量表（初始 MSP + 固件入口）是 rehosting
  * 中模拟 boot ROM 跳转效果的标准替代手段，不修改固件任何字节。
  */
-static BesImage g_img;
+static BesImage *g_img;
 static MemoryRegion g_bootvec;
 static ARMCPU *g_cpu;
-
-/* -M best1503,flash-image=<file>：完整 16MB flash 镜像（含 BL2/AP/参数区），
- * 作为 bes_flash 后端并在退出时写回；缺省则由 -kernel 固件按
- * OTA_CODE_OFFSET 构造后端内容。 */
-static char *g_flash_image;
-/* -M best1503,nand-image=<file>：SPI NAND 后端（每页 page+oob 字节，
- * 页序排列）。缺省 emu/nand.img；不存在时创建全擦除镜像。出厂内容
- * （resource romfs）由 emu/mknand.py 生成。 */
-static char *g_nand_image;
-
-static char *best1503_get_flash_image(Object *obj, Error **errp)
-{
-    return g_strdup(g_flash_image);
-}
-
-static void best1503_set_flash_image(Object *obj, const char *val,
-                                     Error **errp)
-{
-    g_free(g_flash_image);
-    g_flash_image = g_strdup(val);
-}
-
-static char *best1503_get_nand_image(Object *obj, Error **errp)
-{
-    return g_strdup(g_nand_image);
-}
-
-static void best1503_set_nand_image(Object *obj, const char *val,
-                                    Error **errp)
-{
-    g_free(g_nand_image);
-    g_nand_image = g_strdup(val);
-}
 
 /*
  * CPU 对象不随系统 reset 自动复位（hw/arm/boot.c:1186 注释），
@@ -285,34 +223,23 @@ static void best1503_bootvec_reset(void *opaque)
     /* 每次系统 reset 重填（在 CPU reset 之前执行），等效真机 boot ROM */
     uint32_t *vec = memory_region_get_ram_ptr(&g_bootvec);
 
-    vec[0] = g_img.msp;
-    vec[1] = g_img.entry | 1;   /* Thumb */
+    vec[0] = g_img->msp;
+    vec[1] = g_img->entry | 1;  /* Thumb */
 }
 
-static void best1503_init(MachineState *machine)
+static void best1503_init(MachineState *machine, BesImage *img,
+                          const BesBoard *board)
 {
+    BesMachineState *bms = BES_MACHINE(machine);
     MemoryRegion *sysmem = get_system_memory();
     I2CBus *i2c_bus[7];
     static MemoryRegion flash, flash_cached, flash_nc, flash_xnc, sram, ramx;
     static MemoryRegion psram, psram_nc, psramx;
     Clock *sysclk;
-    Error *err = NULL;
-    DeviceState *armv7m;
+    DeviceState *armv7m, *gpio, *fc1 = NULL;
 
-    /* ---- parse firmware (single source of truth for all layout) ---- */
-    if (!machine->kernel_filename) {
-        error_report("best1503: -kernel <firmware image> is required "
-                     "(e.g. vela_ap.bin)");
-        exit(1);
-    }
-    if (!bes_image_load(&g_img, machine->kernel_filename, &err)) {
-        error_report_err(err);
-        exit(1);
-    }
-    info_report("best1503: firmware: xip=0x%08x cached=0x%08x nc=0x%08x "
-                "entry=0x%08x msp=0x%08x size=0x%zx",
-                g_img.xip_base, g_img.cached_base, g_img.nc_base,
-                g_img.entry, g_img.msp, g_img.size);
+    /* firmware layout: parsed by the machine (single source of truth) */
+    g_img = img;
 
     sysclk = clock_new(OBJECT(machine), "SYSCLK");
     clock_set_hz(sysclk, BEST1503_SYSCLK_FRQ);
@@ -341,31 +268,31 @@ static void best1503_init(MachineState *machine)
      * AP 分区（等同 OTA 升级），同一镜像可跨固件版本使用。 */
     DeviceState *fc = qdev_new(TYPE_BES_FLASH);
     {
-        uint32_t flash_xip_start = g_img.xip_base - g_img.ota_code_offset;
-        uint32_t flash_cached_start = g_img.cached_base - g_img.ota_code_offset;
-        uint32_t flash_nc_start = g_img.nc_base - g_img.ota_code_offset;
+        uint32_t flash_xip_start = g_img->xip_base - g_img->ota_code_offset;
+        uint32_t flash_cached_start = g_img->cached_base - g_img->ota_code_offset;
+        uint32_t flash_nc_start = g_img->nc_base - g_img->ota_code_offset;
 
-        qdev_prop_set_uint32(fc, "size", g_img.flash_size);
-        if (g_flash_image) {
-            qdev_prop_set_string(fc, "image", g_flash_image);
+        qdev_prop_set_uint32(fc, "size", g_img->flash_size);
+        if (bms->flash_image) {
+            qdev_prop_set_string(fc, "image", bms->flash_image);
         }
         sysbus_realize_and_unref(SYS_BUS_DEVICE(fc), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(fc), 0, BEST1503_FLASH_CTRL_BASE);
 
-        memcpy(bes_flash_data(BES_FLASH(fc)) + g_img.ota_code_offset,
-               g_img.data, g_img.size);
+        memcpy(bes_flash_data(BES_FLASH(fc)) + g_img->ota_code_offset,
+               g_img->data, g_img->size);
 
         memory_region_init_alias(&flash, NULL, "best1503.flash_xip",
                                  bes_flash_storage(BES_FLASH(fc)), 0,
-                                 g_img.flash_size);
+                                 g_img->flash_size);
         memory_region_add_subregion(sysmem, flash_xip_start, &flash);
         memory_region_init_alias(&flash_cached, NULL, "best1503.flash_cached",
                                  bes_flash_storage(BES_FLASH(fc)), 0,
-                                 g_img.flash_size);
+                                 g_img->flash_size);
         memory_region_add_subregion(sysmem, flash_cached_start, &flash_cached);
         memory_region_init_alias(&flash_nc, NULL, "best1503.flash_nc",
                                  bes_flash_storage(BES_FLASH(fc)), 0,
-                                 g_img.flash_size);
+                                 g_img->flash_size);
         memory_region_add_subregion(sysmem, flash_nc_start, &flash_nc);
 
         /* 第四窗口 FLASHX_NC：SDK plat_addr_map_best1503.h:207-208
@@ -375,7 +302,7 @@ static void best1503_init(MachineState *machine)
          * 会被当作"首次启动"而走完整 early-init 路径。 */
         memory_region_init_alias(&flash_xnc, NULL, "best1503.flash_xnc",
                                  bes_flash_storage(BES_FLASH(fc)), 0,
-                                 g_img.flash_size);
+                                 g_img->flash_size);
         memory_region_add_subregion(sysmem, flash_xip_start - 0x4000000,
                                     &flash_xnc);
     }
@@ -396,12 +323,12 @@ static void best1503_init(MachineState *machine)
      * TR_INFO -> NuttX syslog -> circbuf UDIV(tail % size, size=0) 会在
      * SCB_CCR.DIV_0_TRP（sub_C0C09CC 置位）下直接 HardFault。 */
     {
-        uint32_t cached_start = g_img.cached_base - g_img.ota_code_offset;
+        uint32_t cached_start = g_img->cached_base - g_img->ota_code_offset;
         memcpy(memory_region_get_ram_ptr(&sram) +
-               (g_img.data_start - BEST1503_SRAM_BASE),
+               (g_img->data_start - BEST1503_SRAM_BASE),
                bes_flash_data(BES_FLASH(fc)) +
-               (g_img.data_lma - cached_start),
-               g_img.data_end - g_img.data_start);
+               (g_img->data_lma - cached_start),
+               g_img->data_end - g_img->data_start);
     }
 
     /* ---- PSRAM：cached 窗口 + NC 别名（固件 sub_C0C0AC8 段复制证实） ---- */
@@ -434,18 +361,25 @@ static void best1503_init(MachineState *machine)
                            BEST1503_BT_EXCH_SIZE, &error_fatal);
     memory_region_add_subregion(sysmem, BEST1503_BT_EXCH_BASE, &bt_exch);
 
-    /* ---- flash1：SPI NAND（resource romfs + yaffs /data） ---- */
-    DeviceState *fc1 = qdev_new(TYPE_BES_FLASH);
-    qdev_prop_set_string(fc1, "nand-image",
-                         g_nand_image ? g_nand_image : "emu/nand.img");
-    qdev_prop_set_uint32(fc1, "nand-id", BEST1503_NAND_ID);
-    qdev_prop_set_uint32(fc1, "nand-page-size", BEST1503_NAND_PAGE);
-    qdev_prop_set_uint32(fc1, "nand-oob-size", BEST1503_NAND_OOB);
-    qdev_prop_set_uint32(fc1, "nand-pages-per-block", BEST1503_NAND_PPB);
-    qdev_prop_set_uint32(fc1, "nand-blocks", BEST1503_NAND_BLOCKS);
-    sysbus_realize_and_unref(SYS_BUS_DEVICE(fc1), &error_fatal);
-    sysbus_mmio_map(SYS_BUS_DEVICE(fc1), 0, BEST1503_FLASH1_CTRL_BASE);
-    sysbus_mmio_map(SYS_BUS_DEVICE(fc1), 1, BEST1503_FLASH1_NC_BASE);
+    /* ---- flash1：板上的 SPI NAND（resource romfs + yaffs /data）；
+     * 后端 -M nand-image=<file>（每页 page+oob 字节，页序排列），缺省
+     * emu/nand.img，不存在时创建全擦除镜像；出厂内容由 emu/mknand.py
+     * 生成 ---- */
+    if (board->nand_blocks) {
+        fc1 = qdev_new(TYPE_BES_FLASH);
+        qdev_prop_set_string(fc1, "nand-image",
+                             bms->nand_image ? bms->nand_image
+                                             : "emu/nand.img");
+        qdev_prop_set_uint32(fc1, "nand-id", board->nand_id);
+        qdev_prop_set_uint32(fc1, "nand-page-size", board->nand_page_size);
+        qdev_prop_set_uint32(fc1, "nand-oob-size", board->nand_oob_size);
+        qdev_prop_set_uint32(fc1, "nand-pages-per-block",
+                             board->nand_pages_per_block);
+        qdev_prop_set_uint32(fc1, "nand-blocks", board->nand_blocks);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(fc1), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(fc1), 0, BEST1503_FLASH1_CTRL_BASE);
+        sysbus_mmio_map(SYS_BUS_DEVICE(fc1), 1, BEST1503_FLASH1_NC_BASE);
+    }
 
     /* ---- 伪 boot 向量表 @0x0（模拟 boot ROM 跳转，不碰固件） ---- */
     memory_region_init_ram(&g_bootvec, NULL, "best1503.bootvec", 0x1000,
@@ -564,8 +498,11 @@ static void best1503_init(MachineState *machine)
     /* GPIO + LCDC @0x40200000（SDK plat_addr_map_best1503.h:283）：QSPI
      * 面板命令通道、TE、帧合成输出到图形控制台、帧完成中断。 */
     {
-        DeviceState *gpio = qdev_new(TYPE_BES_GPIO);
         DeviceState *lcdc = qdev_new(TYPE_BES_LCDC);
+        DeviceState *keys;
+        int n;
+
+        gpio = qdev_new(TYPE_BES_GPIO);
 
         sysbus_realize_and_unref(SYS_BUS_DEVICE(gpio), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(gpio), 0, BEST1503_GPIO0_BASE);
@@ -575,41 +512,54 @@ static void best1503_init(MachineState *machine)
         sysbus_connect_irq(SYS_BUS_DEVICE(gpio), 0,
                            qdev_get_gpio_in(armv7m, BEST1503_GPIO_IRQ));
 
-        qdev_prop_set_uint32(lcdc, "panel-width", BEST1503_PANEL_W);
-        qdev_prop_set_uint32(lcdc, "panel-height", BEST1503_PANEL_H);
+        /* 面板尺寸与 TE 脚来自板级 profile */
+        qdev_prop_set_uint32(lcdc, "panel-width", board->panel_width);
+        qdev_prop_set_uint32(lcdc, "panel-height", board->panel_height);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(lcdc), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(lcdc), 0, BEST1503_LCDC_BASE);
         sysbus_connect_irq(SYS_BUS_DEVICE(lcdc), 0,
                            qdev_get_gpio_in(armv7m, BEST1503_LCDC_IRQ));
-        qdev_connect_gpio_out_named(lcdc, "te", 0,
-                                    qdev_get_gpio_in(gpio,
-                                                     BEST1503_LCD_TE_GPIO));
+        if (board->lcd_te_gpio >= 0) {
+            qdev_connect_gpio_out_named(lcdc, "te", 0,
+                                        qdev_get_gpio_in(gpio,
+                                                    board->lcd_te_gpio));
+        }
 
-        {
-            I2CSlave *tp = i2c_slave_new(TYPE_ZINITIX_TS,
-                                         BEST1503_TP_I2C_ADDR);
+        /* 板上的触摸控制器：报点坐标系 = 面板尺寸，中断脚接 GPIO */
+        if (board->touch.type) {
+            I2CSlave *tp = i2c_slave_new(board->touch.type,
+                                         board->touch.addr);
 
-            qdev_prop_set_uint32(DEVICE(tp), "width", BEST1503_PANEL_W);
-            qdev_prop_set_uint32(DEVICE(tp), "height", BEST1503_PANEL_H);
-            i2c_slave_realize_and_unref(tp, i2c_bus[BEST1503_TP_I2C_BUS],
+            qdev_prop_set_uint32(DEVICE(tp), "width", board->panel_width);
+            qdev_prop_set_uint32(DEVICE(tp), "height", board->panel_height);
+            i2c_slave_realize_and_unref(tp, i2c_bus[board->touch.bus],
                                         &error_fatal);
             qdev_connect_gpio_out_named(DEVICE(tp), "irq", 0,
                                         qdev_get_gpio_in(gpio,
-                                                    BEST1503_TP_INT_GPIO));
+                                                    board->touch.irq_gpio));
         }
 
-        {
-            I2CSlave *nfc = i2c_slave_new(TYPE_NCI_NFCC,
-                                          BEST1503_NFC_I2C_ADDR);
+        /* 板上的 NFC 控制器：数据就绪脚入、VEN 脚出 */
+        if (board->nfc.type) {
+            I2CSlave *nfc = i2c_slave_new(board->nfc.type, board->nfc.addr);
 
-            i2c_slave_realize_and_unref(nfc, i2c_bus[BEST1503_NFC_I2C_BUS],
+            i2c_slave_realize_and_unref(nfc, i2c_bus[board->nfc.bus],
                                         &error_fatal);
             qdev_connect_gpio_out_named(DEVICE(nfc), "data-ready", 0,
                                         qdev_get_gpio_in(gpio,
-                                                    BEST1503_NFC_IRQ_GPIO));
-            qdev_connect_gpio_out(gpio, BEST1503_NFC_VEN_GPIO,
+                                                    board->nfc.irq_gpio));
+            qdev_connect_gpio_out(gpio, board->nfc_ven_gpio,
                                   qdev_get_gpio_in_named(DEVICE(nfc), "ven",
                                                          0));
+        }
+
+        /* 板上的按键：宿主按键 → GPIO 输入 */
+        keys = bes_board_create_keys(board);
+        for (n = 0; keys && n < BES_BOARD_MAX_KEYS && board->keys[n].name;
+             n++) {
+            qdev_connect_gpio_out_named(keys, "key", n,
+                                        qdev_get_gpio_in(gpio,
+                                                    board->keys[n].gpio));
         }
     }
 
@@ -646,9 +596,11 @@ static void best1503_init(MachineState *machine)
             sysbus_connect_irq(SYS_BUS_DEVICE(dma[i]), 0,
                                qdev_get_gpio_in(armv7m, dmas[i].irq));
         }
-        sysbus_connect_irq(SYS_BUS_DEVICE(fc1), 0,
-                           qdev_get_gpio_in_named(dma[1], "dma-req",
-                                                  BEST1503_FLASH1_DMA_REQ));
+        if (fc1) {
+            sysbus_connect_irq(SYS_BUS_DEVICE(fc1), 0,
+                               qdev_get_gpio_in_named(dma[1], "dma-req",
+                                                      BEST1503_FLASH1_DMA_REQ));
+        }
     }
 
     /* PSRAM 控制器对 @0x40168000（PHY）+ @0x40160000（MC/MGR 引擎） */
@@ -699,36 +651,14 @@ static void best1503_init(MachineState *machine)
     }
 }
 
-static void best1503_machine_init(MachineClass *mc)
+static const BesSoc best1503_soc = {
+    .chip = "best1503",
+    .init = best1503_init,
+};
+
+static void best1503_register(void)
 {
-    static const char * const valid_cpu_types[] = {
-        ARM_CPU_TYPE_NAME("cortex-m33"),
-        NULL
-    };
-
-    mc->desc = "BEST1503 / BES2700iMP (Cortex-M33, Xiaomi Vela AP)";
-    mc->init = best1503_init;
-    mc->valid_cpu_types = valid_cpu_types;
-    mc->default_cpu_type = ARM_CPU_TYPE_NAME("cortex-m33");
-    mc->ignore_memory_transaction_failures = true;
-
-    object_class_property_add_str(OBJECT_CLASS(mc), "flash-image",
-                                  best1503_get_flash_image,
-                                  best1503_set_flash_image);
-    object_class_property_set_description(OBJECT_CLASS(mc), "flash-image",
-                                          "backing image file for the 16MB "
-                                          "boot flash (loaded at startup, "
-                                          "written back on exit; the "
-                                          "-kernel firmware is installed "
-                                          "into its AP partition)");
-    object_class_property_add_str(OBJECT_CLASS(mc), "nand-image",
-                                  best1503_get_nand_image,
-                                  best1503_set_nand_image);
-    object_class_property_set_description(OBJECT_CLASS(mc), "nand-image",
-                                          "backing file of the SPI NAND "
-                                          "(resource romfs + /data); "
-                                          "default emu/nand.img, created "
-                                          "erased if missing");
+    bes_soc_register(&best1503_soc);
 }
 
-DEFINE_MACHINE_ARM("best1503", best1503_machine_init)
+type_init(best1503_register)
