@@ -414,6 +414,7 @@ static void bes_lcdc_write(void *opaque, hwaddr offset, uint64_t val,
 {
     BesLcdcState *s = opaque;
 
+    trace_bes_lcdc_write(offset, val);
     s->regs[offset / 4] = val;
 
     switch (offset) {

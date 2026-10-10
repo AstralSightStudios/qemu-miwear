@@ -487,6 +487,7 @@ bes_btss_auth(int initiator, uint8_t status) "initiator side%d status=0x%02x"
 # bes_lcdc.c
 bes_lcdc_panel_cmd(uint8_t instr, uint8_t dcs, uint32_t param) "instr=0x%02x dcs=0x%02x param=0x%08x"
 bes_lcdc_frame(unsigned x, unsigned y, unsigned w, unsigned h) "frame %ux%u at %u,%u"
+bes_lcdc_write(uint64_t offset, uint64_t val) "off=0x%03" PRIx64 " val=0x%08" PRIx64
 
 # vsi_vglite.c
 vsi_vglite_submit(uint32_t addr, uint32_t size) "cmdbuf 0x%08x size %u"
