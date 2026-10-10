@@ -197,6 +197,63 @@ AONCMU/CMU 魔术值 → UART（console, qemu chardev 直通终端）→ TIMER/S
 
 ## 7. 最新变更
 
+- **2026-10-10 (5)（q63：eMMC、显示、cp 与 sensor 核；偶发重启查清）**：
+  ①**存储**：SDHCI 0x40150000（NVIC 26，与 UART2 线或）+ QEMU eMMC
+  （`-drive if=sd,index=0`）；emu/mkemmc.py 从固件包生成 GPT 镜像，
+  run.sh 用 EMMC=；emu/emmcfs.py 从宿主读 exFAT（nv/data/userlog 里有
+  log_service 的日志文件）。BES mmc 用 CID 序列号低半作 RCA，故序列号
+  以 0x0001 结尾。顺带修了 sdhci 两处 ADMA2/SDMA 边界问题。
+  ②**显示**：LCDC 0x401C0000（IRQ 27）→ DSI0 0x401D0000（IRQ 28，命令
+  模式，DCS 写入面板状态）；面板 466x466 rm6d031，TE=GPIO 47；GPIO 三组
+  0x40081000/0x40089000/0x4008A000（NVIC 2），PSC 中断字位置可配。现状：
+  只出一帧开机 logo（layer0 RGB24 fb 0x21160000，位置 1,1），随后
+  DISPOFF/SLPIN，之后不再出帧——UI 没有点亮屏幕，原因待查（1700 的
+  VGLite 基址/中断也还没确认）。
+  ③**cp = M55C1**（vela_cp.bin：BT host 服务 + WiFi 栈）：AP 把它装进
+  PSRAM，在 M55C1 DTCM（总线 0x21C00000）写向量表，AON_CMU 0xB4=VTOR、
+  0x1A4 bit1 放开即运行。核间中断字 MCU_CMU 0x90/0x94（每通道 data/done
+  各一位，NVIC 88/89 收、91/92 发）；cp 自带 SP804 0x40084000/0x40003000
+  与 DWT（cp 忙等 CYCCNT）。AP↔cp 的 hal_rmt_ipc + rptun 已通（cp 日志
+  进 AP）；WiFi 设备永远 not ready，AP 等约 70 秒后放弃（在启动关键路径上）。
+  ④**sensor = BTH 核 BTHC0**（vela_sensor.bin）：独立 8MB NOR
+  （GD25LQ64，AP 视图 0x28000000，自身视图代码 0x0C000000/数据
+  0x2C000000），入口 +0x10。没有 BTH 掩膜 ROM，自写替身
+  best1700_bthrom.c（libc、trace printf、tick 换算、晶振 24MHz、16kHz
+  系统定时器、NOR 大小与几何、睡眠=WFI，其余返回 0 并记 trace）。
+  M55↔BTH 走 intersys 邮箱（MCU_CMU 0x98/0x9C、BTH_CMU 0x134/0x138，
+  bit 16+g 数据、bit g 完成；M55 收 96/97 发 94/95，BTH 按 AP/cp 组
+  73–76/65–68）。BTH 定时器 0x4008B000（19/20，16kHz）、0x50002000、
+  0x50003000；IRQ 9 是 BTH 看门狗。AON RAM 扩到 128KB。sensor 的 syslog
+  在 BTH RAM（0x23000000 起）里，是 "[sensor] ..." 行，pmemsave 后可读。
+  AP 经 rpmsgfs 从 sensor 挂 /misc，所以没有 sensor 时 kvdbd 及其后的
+  一切都卡住；有了 sensor 后 AP 能起到 miwear、chargerd、healthd、
+  account、wpa_supplicant 等。cp↔sensor 的隧道还没起来。
+  ⑤**电量计**：CW2215 @ I2C3（0x40076000）地址 0x64；没有它 AP 的低电
+  检查会在充电循环里卡 20 分钟。
+  ⑥**偶发重启（实测 1/3～1/2 的启动在 20 多秒时整机重启）已查清**：TEE 报
+  "arm_securefault: Attribution unit violation"，其实是 AP 的
+  board_reset() 故意写安全地址 0x24200000 让 TEE 复位整机（之前先打 10
+  轮 cp/sensor/audio 的 PC/LR/SP）。AP 调 board_reset 是因为
+  M55C0_2_BTHC0 通道收到 sensor 的 panic 消息（0xFFFFFF10）。sensor
+  panic 的原因：AppBringUp 里 bes_switch_setup 在 sensor 的 I2C 总线 2
+  上探测 SGM25062（地址 0x18，400kHz，先把 ioexpander 引脚 0x44 拉高），
+  读寄存器 0x07 失败 → sgm25062_register 释放了实例，却没清全局指针
+  0x2303ebf8；之后 sgm25062 的寄存器读写函数用这个悬空指针去拿锁，
+  KASan 报 use-after-free 并断言。是否发生取决于时序，所以是偶发的。
+  修法：让探测成功——sensor 侧 I2C 控制器（hal_i2c 表：id0
+  0x50006000、id1 0x50007000、id2 0x50008000、id3 0x5000A000，每项后
+  跟两个时钟号和中断号 39–42），总线 2 用 id 2；再挂一个 SGM25062 模型
+  （0x07 读芯片 ID、0x69 写 0xAE 复位、0x02 按位配置）。奇怪的是 -d unimp
+  里看不到 sensor 访问 0x50006000–0x5000A000，传输可能在碰硬件前就失败
+  了，先查这一点。
+  调试手段：在 m_helper.c 的 AUVIOL 分支临时打印 PC/地址并
+  qemu_system_vmstop_request 暂停，再 pmemsave AP SRAM/BTH RAM 回溯。
+  AP 的 rodata 字符串被拷到 PSRAM：运行地址 0x18xxxxxx = 镜像 VA +
+  0x07FBADB4。
+  下一步：SGM25062 + sensor I2C（消除重启）；显示不出帧；触摸（Raydium
+  @ I2C0 0x40006000 地址 0x39）；cp 的 BT host → BT 控制器 → AstroBox；
+  /misc（bth_misc littlefs）里的出厂属性。
+
 - **2026-10-10 (4)（q63/best1700：TEE 启动并拉起 AP）**：
   BSP 来源：open-vela/vendor_bes 的 dev-ai-contest-2026 分支，
   boards/best1700_ep/aos_evb/configs/ap/{libnx_bestbsp_ap.a,
