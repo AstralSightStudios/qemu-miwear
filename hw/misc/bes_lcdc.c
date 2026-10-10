@@ -1,6 +1,9 @@
 /*
  * BES LCDC (LCD controller) for best1503 @ 0x40200000, driving a QSPI
- * (DBI-style) AMOLED panel through its serial panel unit (SPU).
+ * (DBI-style) AMOLED panel through its serial panel unit (SPU). best1700
+ * has the same controller at 0x401C0000 (same layer registers, frame
+ * start and IRQ status/enable, hal_lcdc.o) feeding a MIPI DSI host
+ * instead; its panel commands arrive through bes_lcdc_panel_dcs().
  *
  * Everything below is taken from the AP firmware's LCDC HAL and
  * framebuffer driver (vela_ap.bin v3.101.043):
@@ -200,17 +203,11 @@ static void bes_lcdc_te_update(BesLcdcState *s)
     }
 }
 
-static void bes_lcdc_panel_cmd(BesLcdcState *s, uint32_t cmdword)
+/* a MIPI DCS write reaching the panel; p = first four parameter bytes */
+static void bes_lcdc_dcs(BesLcdcState *s, uint8_t dcs, uint32_t p)
 {
-    uint8_t instr = cmdword >> 24;
-    uint8_t dcs = cmdword >> 8;
-    uint32_t p = lcdc_reg(s, LCDC_SPU_DATA0);
     bool was_visible = bes_lcdc_panel_visible(s);
 
-    trace_bes_lcdc_panel_cmd(instr, dcs, p);
-    if (instr != 0x02) {
-        return;                         /* reads and pixel writes */
-    }
     switch (dcs) {
     case DCS_SLPIN:
         s->sleeping = true;
@@ -243,6 +240,30 @@ static void bes_lcdc_panel_cmd(BesLcdcState *s, uint32_t cmdword)
     if (bes_lcdc_panel_visible(s) != was_visible) {
         bes_lcdc_show(s, 0, 0, s->panel_w, s->panel_h);
     }
+}
+
+static void bes_lcdc_panel_cmd(BesLcdcState *s, uint32_t cmdword)
+{
+    uint8_t instr = cmdword >> 24;
+    uint8_t dcs = cmdword >> 8;
+    uint32_t p = lcdc_reg(s, LCDC_SPU_DATA0);
+
+    trace_bes_lcdc_panel_cmd(instr, dcs, p);
+    if (instr == 0x02) {                /* reads and pixel writes ignored */
+        bes_lcdc_dcs(s, dcs, p);
+    }
+}
+
+void bes_lcdc_panel_dcs(DeviceState *dev, uint8_t dcs, const uint8_t *param,
+                        unsigned n)
+{
+    uint8_t b[4] = { 0 };
+
+    if (n) {
+        memcpy(b, param, MIN(n, 4));
+    }
+    trace_bes_lcdc_panel_cmd(0x39, dcs, ldl_be_p(b));
+    bes_lcdc_dcs(BES_LCDC(dev), dcs, ldl_be_p(b));
 }
 
 /* ---- frame composition ---- */

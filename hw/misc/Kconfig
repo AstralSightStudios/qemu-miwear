@@ -213,6 +213,10 @@ config BES_ISPI
 config BEST1700_CMU
     bool
 
+config BEST1700_DSI
+    bool
+    select BES_LCDC
+
 config BES_I2C
     bool
     select I2C
