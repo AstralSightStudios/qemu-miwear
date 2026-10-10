@@ -217,6 +217,9 @@ config BEST1700_DSI
     bool
     select BES_LCDC
 
+config BEST1700_BTHROM
+    bool
+
 config CW2215
     bool
     depends on I2C
