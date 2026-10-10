@@ -124,6 +124,18 @@ static void bes_psram_mgr_exec(BesPsramState *s, uint32_t cmd)
     case 5:   /* mode-register write */
         s->mr[addr & 0x1F] = len & 0xFF;
         break;
+    case 6:   /* mode-register read: MR[REG_008] -> RX FIFO
+               * (q66nfc v4.100.177 实证：hal_psram_polling 经此读 MR；
+               * RX 字 = (MR<<8)|MR 字节重复——SPI 两拍采样同一字节，
+               * 实证：MR1=0x0D 时固件全字&0x1F==0xD 通过，
+               * MR0=0x06 时 ldrh+rev16&0xF==6 通过） */
+        s->mgr_rx_cnt = 0;
+        s->mgr_rx_pos = 0;
+        {
+            uint32_t v = s->mr[addr & 0x1F];
+            s->mgr_rxfifo[s->mgr_rx_cnt++] = v | (v << 8);
+        }
+        break;
     default:
         /* init/reset/refresh commands (32, 255, ...): stateless here */
         break;
@@ -273,6 +285,15 @@ static void bes_psram_reset(DeviceState *dev)
     s->mgr_rx_pos = 0;
     s->mgr_tx_cnt = 0;
     memset(s->mr, 0, sizeof(s->mr));
+    /* PSRAM 设备特征（q66nfc v4.100.177 实证：hal_psram_polling
+     * 上电经 MGR cmd 6 读 MR 校验设备 ID，失败 assert(hal_psram_polling.c
+     * :2266) → panic 递归 → 主栈 STKOF）：
+     *   MR1 = 0x0D   AP Memory PSRAMUHS 厂商 ID（校验 MR1&0x1F==0xD）
+     *   MR0 = 0x06   第二特征（校验 rev16(MR0 重复字节)&0xF==6）
+     * p67tc 固件从不发 cmd 6（实测其 MGR 命令集 2/5/0x10/0x20/0xff），
+     * 预填对其无影响。 */
+    s->mr[0] = 0x06;
+    s->mr[1] = 0x0D;
 }
 
 static const Property bes_psram_props[] = {

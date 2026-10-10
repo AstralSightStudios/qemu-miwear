@@ -279,7 +279,21 @@ static void bes_pmu_realize(DeviceState *dev, Error **errp)
  * firmware's consumers: ch2 shell NTC and ch5 skin NTC (sub_C3DBCFC /
  * sub_C3DBE40), ch3 VBUS (sub_C3DC740), ch4 VBAT through a 1/4.9 divider
  * (sub_C3DC1B8). Defaults: NTCs at 250 mV (25 C on this board's divider),
- * no charger, battery at 4.0 V. */
+ * no charger, battery at 4.0 V.
+ *
+ * q66nfc (手环11 NFC) differs: VBAT is on ch2 there. Its battery path is
+ * /dev/adc_batt_voltage (boardadc_initialize sub_C358598) -> ioctl 2835 ->
+ * adc_get_voltage(2) (sub_C358428) -> hal_gpadc ch2, converted in
+ * soft_gauge get_bat_vol (sub_C6ED6D0) as vol = gain*adc + offset with the
+ * runtime-measured gain=7.0 / offset=0 (priv struct +236/+240). With the
+ * p67tc-oriented default ch2=250 mV that yields 1750 mV, below the 2950 mV
+ * validity floor in soft_gauge_worker (sub_C6F3480), so the battery level
+ * stays 0 and ~8.5 s after boot BatteryReminder (sub_C5DBD00) calls
+ * miwear_system_poweroff("battery_reminder", 1) -> boardctl
+ * BOARDIOC_POWEROFF -> PMU WDT reset. Run q66nfc with:
+ *   -global driver=bes.pmu,property=gpadc-ch2-mv,value=600
+ * (600 mV -> 4200 mV battery, full-charge region; verified: no poweroff,
+ * level non-zero). */
 static const Property bes_pmu_props[] = {
     DEFINE_PROP_UINT32("gpadc-ch0-mv", BesPmuState, gpadc_mv[0], 0),
     DEFINE_PROP_UINT32("gpadc-ch1-mv", BesPmuState, gpadc_mv[1], 0),

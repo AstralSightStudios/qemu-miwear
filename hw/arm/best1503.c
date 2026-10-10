@@ -16,6 +16,7 @@
 #include "qemu/units.h"
 #include "hw/core/boards.h"
 #include "hw/core/cpu.h"
+#include "target/arm/cpu.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/arm/armv7m.h"
@@ -105,12 +106,16 @@
  * MCU 掉电/唤醒见 bes_psc.c；+0x80 起的 GPIO 中断块由 bes_gpio 覆盖映射 */
 #define BEST1503_PSC_BASE         0x40085000
 #define BEST1503_GPIO_IRQ         44
-/* LCDC：NVIC 67（sub_C231DE4）；面板 TE 接 GPIO 47（板级：固件
- * LCD TE 引脚配置 sub_C0E3DF0 返回 47，经 sub_C232740 配成边沿中断）；
+/* LCDC：NVIC 67（sub_C231DE4）；面板 TE 引脚按板型不同：p67tc 接
+ * GPIO 47（固件 LCD TE 引脚配置 sub_C0E3DF0 返回 47，经 sub_C232740
+ * 配成边沿中断），q66nfc 接 GPIO 65（运行时 dump 其 te_gpio_pin
+ * byte_200FA7A8=65，bank2 pin1 边沿中断置位实证；不接对则 TE 中断
+ * 不到，固件永不触发 frame start，黑屏）。当前接 65 验证 q66nfc。
+ * FIXME: 双板型兼容（machine 属性或按固件识别），p67tc 需要 47。
  * 面板 336x480（固件 LCDC 初始化 sub_C225BA4 的层/输出尺寸）。 */
 #define BEST1503_LCDC_BASE        0x40200000
 #define BEST1503_LCDC_IRQ         67
-#define BEST1503_LCD_TE_GPIO      47
+#define BEST1503_LCD_TE_GPIO      65  /* 临时验证：q66nfc 实测 TE=GPIO65 */
 
 /* 触摸：Zinitix ZTW662（真机日志 chip id 0xE623）。bes_ts_zinitix_setup
  * (sub_C3F84CC) 打开 I2C 总线 5；板级配置 0x2CD0605C = {I2C 地址 0x20,
@@ -277,7 +282,18 @@ static void best1503_set_nand_image(Object *obj, const char *val,
  */
 static void best1503_cpu_reset(void *opaque)
 {
+    ARMCPU *cpu = ARM_CPU(opaque);
+    CPUARMState *env = &cpu->env;
+
     cpu_reset(CPU(opaque));
+    /* 真机 reset 后 BL2 已使能 FPU（CPACR.CP10/CP11）；固件 warm-reset
+     * 路径（PMU WDT 超时复位等）直接从固件向量表重启，不经过 BL2，
+     * 假设 FPU 已开（up_savecontext 的 vmsr FPSCR 等）。模拟器没有
+     * BL2，复位后补开（等效 BL2 遗留状态，不碰固件；固件 SystemInit
+     * 的 CPACR |= 0xF00000 幂等）。q66nfc 实证：PMU WDT 复位后
+     * CPACR=0 → vmsr FPSCR NOCP → INVSTATE/HardFault lockup。 */
+    env->v7m.cpacr[M_REG_S] |= 0x00F00000;
+    env->v7m.cpacr[M_REG_NS] |= 0x00F00000;
 }
 
 static void best1503_bootvec_reset(void *opaque)
