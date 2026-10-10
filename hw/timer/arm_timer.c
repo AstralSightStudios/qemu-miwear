@@ -107,6 +107,14 @@ static void arm_timer_write(void *opaque, hwaddr offset,
         s->limit = value;
         ptimer_transaction_begin(s->timer);
         arm_timer_recalibrate(s, 1);
+        /*
+         * An enabled counter restarts from the new value at once; that
+         * includes a one-shot counter halted at zero (SP804 TRM, one-shot
+         * mode), which tickless timer drivers rearm by writing Load only.
+         */
+        if (s->control & TIMER_CTRL_ENABLE) {
+            ptimer_run(s->timer, (s->control & TIMER_CTRL_ONESHOT) != 0);
+        }
         ptimer_transaction_commit(s->timer);
         break;
     case 1: /* TimerValue */
