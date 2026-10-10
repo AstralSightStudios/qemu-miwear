@@ -11,10 +11,18 @@
  * the events its own controller would report (the message sequence
  * charts of Vol 2 Part F).
  *
- * Nothing over the air is observable by either host, so it is not
- * modelled: procedures complete as soon as both hosts have answered, the
- * link key of a pairing is random rather than derived from the ECDH
- * exchange, encryption is a link flag and ACL payloads pass unchanged.
+ * What is not observable by either host is not modelled: procedures
+ * complete as soon as both hosts have answered, the link key of a pairing
+ * is random rather than derived from the ECDH exchange, encryption is a
+ * link flag and ACL payloads pass unchanged. The time ACL data takes on
+ * the air is observable (it paces every transfer) and is modelled: the
+ * piconet carries one baseband packet at a time, EDR 3 Mb/s packets of
+ * Vol 2 Part B 6.7 (3-DH1/3-DH3/3-DH5: at most 83/552/1021 payload
+ * octets in 1/3/5 slots of 625 us) each followed by the one-slot packet
+ * of the other direction. Without it the peer's host could hand the band
+ * any amount of data at once; hosts that send more than the receiver's
+ * window (counting on the air to pace them, as the phone apps do) then
+ * overrun the band's receive path.
  * Legacy (PIN) pairing is not modelled; both hosts here enable Secure
  * Simple Pairing.
  *
@@ -38,6 +46,7 @@
 #define BTSS_PAGE_TIMEOUT_DFLT  0x2000
 #define BTSS_MANUFACTURER       0x02B0  /* Bestechnic (Shenzhen) */
 #define BTSS_BAND_RESERVE       8       /* events one peer packet can raise */
+#define BTSS_SLOT_NS            625000  /* baseband slot, Vol 2 Part B 2.2.1 */
 
 /* events (Vol 4 Part E 7.7) */
 #define EVT_INQUIRY_COMPLETE    0x01
@@ -916,6 +925,39 @@ bool btss_link_command(BesBtssState *s, int side, uint16_t opcode,
 
 /* ---- ACL data ---- */
 
+/* air time of an ACL payload: 3-DHx packets plus one return slot each */
+static int64_t air_time_ns(unsigned len)
+{
+    int64_t slots = 0;
+    unsigned n;
+
+    do {
+        n = MIN(len, 1021u);
+        slots += (n <= 83 ? 1 : n <= 552 ? 3 : 5) + 1;
+        len -= n;
+    } while (len);
+    return slots * BTSS_SLOT_NS;
+}
+
+/* whether the channel is free now; if not, run the radio once it is */
+static bool air_ready(BesBtssState *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (now >= s->air_free_ns) {
+        return true;
+    }
+    timer_mod(s->air_timer, s->air_free_ns);
+    return false;
+}
+
+static void air_occupy(BesBtssState *s, unsigned len)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    s->air_free_ns = MAX(now, s->air_free_ns) + air_time_ns(len);
+}
+
 static void num_completed(BesBtssState *s, int side)
 {
     uint8_t p[5] = { 1 };
@@ -944,6 +986,7 @@ void btss_link_acl(BesBtssState *s, int side, const uint8_t *pkt,
                       "0x%03x (%u bytes) dropped\n", side, hf & 0x0FFF, dlen);
         return;
     }
+    air_occupy(s, dlen);
     if (side == BTSS_BAND) {
         btss_link_peer_send(s, pkt, len);
     } else {
@@ -1007,6 +1050,10 @@ static void radio_process(BesBtssState *s)
         if (avail < need || btss_band_queue_free(s) < BTSS_BAND_RESERVE) {
             break;
         }
+        /* ... and data until the air is free */
+        if (p[0] == H4_ACL && !air_ready(s)) {
+            break;
+        }
         if (p[0] == H4_CMD) {
             btss_hci_command(s, BTSS_PEER, p, need);
         } else {
@@ -1057,6 +1104,13 @@ static void radio_event(void *opaque, QEMUChrEvent event)
     }
 }
 
+static void air_free(void *opaque)
+{
+    BesBtssState *s = BES_BTSS(opaque);
+
+    btss_link_band_drained(s);
+}
+
 void btss_link_band_drained(BesBtssState *s)
 {
     if (s->rlen) {
@@ -1102,6 +1156,7 @@ void btss_link_realize(BesBtssState *s, Error **errp)
                                                 inquiry_band_expired, s);
     s->host[BTSS_PEER].inq_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                                 inquiry_peer_expired, s);
+    s->air_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, air_free, s);
     qemu_chr_fe_set_handlers(&s->radio, radio_can_receive, radio_receive,
                              radio_event, NULL, s, NULL, true);
 }

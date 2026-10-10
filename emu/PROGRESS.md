@@ -197,6 +197,23 @@ AONCMU/CMU 魔术值 → UART（console, qemu chardev 直通终端）→ TIMER/S
 
 ## 7. 最新变更
 
+- **2026-10-10 (2)（蓝牙空口时序 + 快应用安装）**：
+  ㊿**快应用传输慢（9 KB/s）的根因 = 空口没有时间**：AstroBox 的 SAR 发送
+  窗口故意超过手环通告的 TX_WIN=3（软上限 32~38 帧，手机 App 同样做法），
+  靠空口速率把数据摊开。原 bes_btss_link 把对端 ACL 瞬间交给手环，300 KB
+  一次涌入，手环接收路径丢掉大部分，主机只能逐帧重传；而手环 SAR v2 收到
+  的未确认帧数不到阈值（sub_C7D59F8：≥2·TX_WIN/3 或 >4，TX_WIN 为主机在
+  L1START_REQ 里给的值）时不立即 ACK，而是起 1200 ms 累积 ACK 定时器，于是
+  每 12 KB 一片要等 1.2 s。现按 Core v5.3 Vol 2 Part B 6.7 的 EDR 3 Mb/s
+  包计空口占用（3-DH1/3-DH3/3-DH5 最多 83/552/1021 字节、1/3/5 时隙，各加
+  1 个回程时隙，625 µs/时隙），对端→手环的 ACL 等信道空闲再送，手环→对端
+  的 ACL 也占信道。实测（AstroBox examples/emulator install）：300 KB
+  32 s → 1.8 s，1.7 MB 9.7 s（约 170 KB/s），无重传。
+  **InstallFailed** 与模拟器无关：社区资源 moe.mcns.Eclipse 261006.1 的
+  manifest.json / manifest-watch.json 与包内 META-INF/CERT → hash.json 的
+  SHA-256 不符（签名后被改过），手环日志 `app_verify_unzip failed: -1`、
+  `rpk install failed: -100`；同一应用 261002.1 摘要一致、安装成功。
+
 - **2026-10-10（NFC 控制器 + eSE，hw/misc/nci_nfcc.c）**：
   ㊻**42 秒卡顿的真正原因**：支付宝 alipay_select_channel（sub_C4D5DF4）往 NFC
   栈任务队列投消息 39（开通道）后等信号量 21 秒，csi_ese_open_channel

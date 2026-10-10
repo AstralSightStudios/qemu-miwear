@@ -126,6 +126,8 @@ struct BesBtssState {
 
     CharFrontend radio;                 /* the peer's H4 transport */
     bool radio_open;
+    int64_t air_free_ns;                /* end of the last ACL baseband packet */
+    QEMUTimer *air_timer;               /* the channel is free again */
     uint8_t rbuf[BES_BTSS_RADIO_BUF];
     unsigned rlen;
 };
