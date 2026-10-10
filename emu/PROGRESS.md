@@ -228,8 +228,19 @@ AONCMU/CMU 魔术值 → UART（console, qemu chardev 直通终端）→ TIMER/S
   PMU=片选 0（1806P：reg0=0x18F0、reg1=0x0650），片选 7 reg0=0x1700，
   PSRAM 模拟 PHY=片选 5（reg 0x51 DLL 锁定），PMU reg 0x4F DCDC 校准
   即刻完成。
-  现状：串口 0 出 "[tee] … before nx_start" 与 "[ap] … before nx_start"，
-  AP 继续初始化（尚未出 AP 的 syslog）。
+  ⑤**DMA / I2C**：AP 控制台经 DMA0 走 UART0（TX 请求 5、RX 4，实测
+  通道配置），DMA 用 TCM 的 AXI 视图地址（DTCM 0x21000000、ITCM
+  0x21800000）；三个 DMA（0x401A0000/0x401A8000/0x40260000，中断
+  37–39）与五个 I2C（hal_i2c i2c_desc）已挂。
+  现状：AP 打出启动日志、跑完 rc.sysinit（romfs/fatfs 挂载全失败：
+  没有存储），rptun 连上 TEE；执行 "rptun start /dev/rptun/audio"
+  （HiFi4 音频 DSP）时 AP 崩溃，AP 的复位路径故意写安全地址
+  0x24200000 触发 SecureFault，TEE 打印 "Panic remote cpu ap" 后
+  PMU 重启。
+  下一步：①存储——0x40150000 是 SDHCI（16 位寄存器 0x2C/0x34–0x3A，
+  CMD1 SEND_OP_COND、参数 0x40200000），q63 资源分区（vela_system/
+  app/…）在 eMMC 上，需 eMMC 模型 + 分区表；②远端核（audio DSP、
+  sensor、cp）的 rptun 启动——要么让其失败可回退，要么做最小握手。
 
 - **2026-10-10 (3)（设备 profile 抽象 + best1700 IDA loader）**：
   设备 = 芯片 + 板子。芯片文件（best1503.c/best1700.c）只放芯片事实并以
