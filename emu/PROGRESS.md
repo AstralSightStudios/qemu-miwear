@@ -197,6 +197,26 @@ AONCMU/CMU 魔术值 → UART（console, qemu chardev 直通终端）→ TIMER/S
 
 ## 7. 最新变更
 
+- **2026-10-10 (3)（设备 profile 抽象 + best1700 IDA loader）**：
+  设备 = 芯片 + 板子。芯片文件（best1503.c/best1700.c）只放芯片事实并以
+  BesSoc 注册；板级外设（面板尺寸/TE 脚、触摸与 NFC 控制器的总线/地址/
+  中断脚、SPI NAND、按键）放在 hw/arm/bes_board.c 的 profile 里：p67
+  （小米手环 10 Pro，原 best1503.c 的板级常量连同出处搬入）、q63（只含
+  已查实项）。新 machine `miwear` 按固件 boot info 的 CHIP= 选芯片、按
+  镜像里的 "miwear.watch.<产品>" 选 profile；`best1503`/`best1700` 仍可
+  强制芯片；三者都有 profile=（help 列出）/flash-image=/nand-image=。
+  emu/run.sh 改用 `-M miwear`，可设 PROFILE=。按键走新设备 gpio-keys
+  （宿主按键 / QMP send-key → GPIO 线，可设低有效）。p67 回归：自动选
+  p67、NAND/触摸/蓝牙安装均正常。
+  IDA：emu/ida/bes_vela.py 取代 best1503_vela.py（装到 ~/.idapro/loaders，
+  旧文件改名 .bak），支持 cached 别名与 XIP 重合（q63 0x101C0000）、空
+  .bss、best1700 用 ARMv8.1-M。q63 IDB：/Volumes/EXT0/Canopus/fwbins/
+  xiaomi-q63-4.101.020/vela_ap.bin.i64。q63 已知启动路径：sub_101C03D0/
+  sub_101C0474 把镜像代码拷到 0x130000/0x13C180/0x197D00（M55 ITCM 区，
+  现由 bootram 承接），sub_101C1FE4 经 hal_memsc_lock（CMU+0xC0+id*4 读=
+  试锁）与 ISPI@0x4000A000 读 0x7000 要求 bits[15:4]==0x170、读 0x0000
+  比较 0x18F；ISPI 帧格式同 1503 但偏移 10 位、读标志 bit28。
+
 - **2026-10-10 (2)（蓝牙空口时序 + 快应用安装）**：
   ㊿**快应用传输慢（9 KB/s）的根因 = 空口没有时间**：AstroBox 的 SAR 发送
   窗口故意超过手环通告的 TX_WIN=3（软上限 32~38 帧，手机 App 同样做法），
