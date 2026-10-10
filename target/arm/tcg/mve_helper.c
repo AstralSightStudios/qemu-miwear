@@ -403,7 +403,9 @@ DO_VSTR64_SG(vstrd_sg_wb_ud, ADDR_ADD, true)
  *
  * The pseudocode implements these insns with multiple memory accesses
  * of the element size, but rules R_VVVG and R_FXDM permit us to make
- * one 32-bit memory access per beat.
+ * one 32-bit memory access per beat. The alignment check stays the one
+ * of the element size: compilers emit VST2.8 to odd addresses (OP-TEE's
+ * hex string helper, for one), which must not take an UNALIGNED fault.
  */
 #define DO_VLD4B(OP, O1, O2, O3, O4)                                    \
     void HELPER(mve_##OP)(CPUARMState *env, uint32_t qnidx,             \
@@ -414,7 +416,7 @@ DO_VSTR64_SG(vstrd_sg_wb_ud, ADDR_ADD, true)
         static const uint8_t off[4] = { O1, O2, O3, O4 };               \
         uint32_t addr, data;                                            \
         int mmu_idx = arm_to_core_mmu_idx(arm_mmu_idx(env));            \
-        MemOpIdx oi = make_memop_idx(mo_endian(env) | MO_UL | MO_ALIGN, \
+        MemOpIdx oi = make_memop_idx(mo_endian(env) | MO_UL,          \
                                      mmu_idx);                          \
         for (beat = 0; beat < 4; beat++, mask >>= 4) {                  \
             if ((mask & 1) == 0) {                                      \
@@ -441,7 +443,7 @@ DO_VSTR64_SG(vstrd_sg_wb_ud, ADDR_ADD, true)
         int y; /* y counts 0 2 0 2 */                                   \
         uint16_t *qd;                                                   \
         int mmu_idx = arm_to_core_mmu_idx(arm_mmu_idx(env));            \
-        MemOpIdx oi = make_memop_idx(mo_endian(env) | MO_UL | MO_ALIGN, \
+        MemOpIdx oi = make_memop_idx(mo_endian(env) | MO_UL | MO_ALIGN_2, \
                                      mmu_idx);                          \
         for (beat = 0, y = 0; beat < 4; beat++, mask >>= 4, y ^= 2) {   \
             if ((mask & 1) == 0) {                                      \
@@ -509,7 +511,7 @@ DO_VLD4W(vld43w, 6, 7, 8, 9)
         uint32_t addr, data;                                            \
         uint8_t *qd;                                                    \
         int mmu_idx = arm_to_core_mmu_idx(arm_mmu_idx(env));            \
-        MemOpIdx oi = make_memop_idx(mo_endian(env) | MO_UL | MO_ALIGN, \
+        MemOpIdx oi = make_memop_idx(mo_endian(env) | MO_UL,          \
                                      mmu_idx);                          \
         for (beat = 0; beat < 4; beat++, mask >>= 4) {                  \
             if ((mask & 1) == 0) {                                      \
@@ -536,7 +538,7 @@ DO_VLD4W(vld43w, 6, 7, 8, 9)
         int e;                                                          \
         uint16_t *qd;                                                   \
         int mmu_idx = arm_to_core_mmu_idx(arm_mmu_idx(env));            \
-        MemOpIdx oi = make_memop_idx(mo_endian(env) | MO_UL | MO_ALIGN, \
+        MemOpIdx oi = make_memop_idx(mo_endian(env) | MO_UL | MO_ALIGN_2, \
                                      mmu_idx);                          \
         for (beat = 0; beat < 4; beat++, mask >>= 4) {                  \
             if ((mask & 1) == 0) {                                      \
@@ -594,7 +596,7 @@ DO_VLD2W(vld21w, 8, 12, 16, 20)
         static const uint8_t off[4] = { O1, O2, O3, O4 };               \
         uint32_t addr, data;                                            \
         int mmu_idx = arm_to_core_mmu_idx(arm_mmu_idx(env));            \
-        MemOpIdx oi = make_memop_idx(mo_endian(env) | MO_UL | MO_ALIGN, \
+        MemOpIdx oi = make_memop_idx(mo_endian(env) | MO_UL,          \
                                      mmu_idx);                          \
         for (beat = 0; beat < 4; beat++, mask >>= 4) {                  \
             if ((mask & 1) == 0) {                                      \
@@ -622,7 +624,7 @@ DO_VLD2W(vld21w, 8, 12, 16, 20)
         int y; /* y counts 0 2 0 2 */                                   \
         uint16_t *qd;                                                   \
         int mmu_idx = arm_to_core_mmu_idx(arm_mmu_idx(env));            \
-        MemOpIdx oi = make_memop_idx(mo_endian(env) | MO_UL | MO_ALIGN, \
+        MemOpIdx oi = make_memop_idx(mo_endian(env) | MO_UL | MO_ALIGN_2, \
                                      mmu_idx);                          \
         for (beat = 0, y = 0; beat < 4; beat++, mask >>= 4, y ^= 2) {   \
             if ((mask & 1) == 0) {                                      \
@@ -689,7 +691,7 @@ DO_VST4W(vst43w, 6, 7, 8, 9)
         uint32_t addr, data;                                            \
         uint8_t *qd;                                                    \
         int mmu_idx = arm_to_core_mmu_idx(arm_mmu_idx(env));            \
-        MemOpIdx oi = make_memop_idx(mo_endian(env) | MO_UL | MO_ALIGN, \
+        MemOpIdx oi = make_memop_idx(mo_endian(env) | MO_UL,          \
                                      mmu_idx);                          \
         for (beat = 0; beat < 4; beat++, mask >>= 4) {                  \
             if ((mask & 1) == 0) {                                      \
@@ -717,7 +719,7 @@ DO_VST4W(vst43w, 6, 7, 8, 9)
         int e;                                                          \
         uint16_t *qd;                                                   \
         int mmu_idx = arm_to_core_mmu_idx(arm_mmu_idx(env));            \
-        MemOpIdx oi = make_memop_idx(mo_endian(env) | MO_UL | MO_ALIGN, \
+        MemOpIdx oi = make_memop_idx(mo_endian(env) | MO_UL | MO_ALIGN_2, \
                                      mmu_idx);                          \
         for (beat = 0; beat < 4; beat++, mask >>= 4) {                  \
             if ((mask & 1) == 0) {                                      \
