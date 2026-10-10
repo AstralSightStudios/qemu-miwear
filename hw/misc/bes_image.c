@@ -69,6 +69,8 @@ static bool bes_parse_boot_cfg(BesImage *img, const char *text, Error **errp)
                 got_ota = true;
             } else if (g_str_equal(key, "FLASH_SIZE")) {
                 img->flash_size = (uint32_t)g_ascii_strtoull(val, NULL, 0);
+            } else if (g_str_equal(key, "CHIP")) {
+                g_strlcpy(img->chip, val, sizeof(img->chip));
             }
         }
         if (!eol) {
@@ -174,4 +176,22 @@ void bes_image_unload(BesImage *img)
     g_free(img->data);
     img->data = NULL;
     img->size = 0;
+}
+
+bool bes_image_contains(const BesImage *img, const char *str)
+{
+    size_t len = strlen(str);
+    const uint8_t *p = img->data;
+    const uint8_t *end = img->data + img->size;
+
+    if (!len) {
+        return true;
+    }
+    while (end - p >= len && (p = memchr(p, str[0], end - p - len + 1))) {
+        if (!memcmp(p, str, len)) {
+            return true;
+        }
+        p++;
+    }
+    return false;
 }

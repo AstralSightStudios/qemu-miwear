@@ -31,10 +31,13 @@ typedef struct BesImage {
     uint32_t flash_nc_base;
     uint32_t flash_size;
     uint32_t ota_code_offset;
+    char chip[32];          /* CHIP=，如 "best1503"；缺省为空串 */
     bool has_boot_cfg;
 } BesImage;
 
 bool bes_image_load(BesImage *img, const char *path, Error **errp);
 void bes_image_unload(BesImage *img);
+/* 镜像里是否含有字符串 str（不含结尾 NUL），用于识别产品 */
+bool bes_image_contains(const BesImage *img, const char *str);
 
 #endif
