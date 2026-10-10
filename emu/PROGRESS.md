@@ -191,10 +191,46 @@ AONCMU/CMU 魔术值 → UART（console, qemu chardev 直通终端）→ TIMER/S
 - [x] 触摸注入（Zinitix ZTW662 I2C 模型，I2C5@0x20，INT=GPIO76；宿主鼠标=手指，emu/touch.py 脚本注入）
 - [x] CPU 掉电休眠/唤醒（PSC + AON_CMU 复位向量）、熄屏/手势亮屏、系统时钟校准
 - [x] NSH 交互 shell（调试探针式注入，emu/nsh.py；生产固件本身无 shell）
+- [x] NFC 控制器（NCI 2.0 over I2C6@0x28，VEN=GPIO69、数据就绪=GPIO77）+ eSE（HCI/ETSI 12，无 applet）；NFC 栈初始化不再卡 42 秒
 - [ ] 越过配对（未绑定 → 一直停在开机向导；见 7. ㉞。调试可用 NSH `setprop persist.setup_wizard 1`）
 - [ ] 快应用环境验证
 
 ## 7. 最新变更
+
+- **2026-10-10（NFC 控制器 + eSE，hw/misc/nci_nfcc.c）**：
+  ㊻**42 秒卡顿的真正原因**：支付宝 alipay_select_channel（sub_C4D5DF4）往 NFC
+  栈任务队列投消息 39（开通道）后等信号量 21 秒，csi_ese_open_channel
+  （sub_C4D5EBC）失败再投 41（关通道）再等 21 秒。消息只在 nfc_stack_bridge_task
+  （sub_C735A80）的主循环里处理，而主循环要等 nxp_stack_init 成功才进入，
+  **init 失败则任务直接退出、永不收消息**——所以"不模拟 eSE、让它快速失败"
+  也躲不掉 42 秒，必须让整个 NFC 栈初始化成功。
+  ㊼**NFCEE 布局**（NCI 2.0，按发现顺序）：0x01 HCI 网络（接口 HCI access）、
+  0xC0 eSE（APDU 接口）、0x10 NDEF NFCEE（上电禁用，主机 NFCEE_MODE_SET 打开）。
+  依据：SeApi_Init（sub_C71CCB8）收集 SE 时跳过接口为 HCI access 的 NFCEE；
+  HCI 的 NFCEE 配置（sub_C727430）把它算 1 个，再加 GET_CONFIG A0ED/A095/A0EC/
+  A0D4 中非 0 的个数，多于已发现个数就开定时器等 20 秒（配置项 60）——原模型把
+  eSE 报成 HCI access、A095 硬改 0、其余 NFCEE 用伪造状态 0x22 隐藏，正好踩中。
+  NFCEE 使能后发 RF_NFCEE_DISCOVERY_REQ_NTF（格式按 sub_C72DF4C 解析）；
+  EE 层 API 事件在 em_state=INIT 时被丢弃（sub_C72579C）。A0EB = eSE 的 HCI 会话
+  标识，全 FF 表示 eSE 未就绪、主机每 50ms 轮询（sub_C7275D8），模型给非 FF 值。
+  ㊽**HCI 网络（ETSI TS 102 622）**：主机控制器管理门（会话标识、白名单、
+  HOST_LIST/HOST_TYPE_LIST、CREATE/DELETE/CLEAR_ALL_PIPE）、管道表；eSE 主机
+  有身份管理门 0x05（GATES_LIST={05,30,41}）、APDU 应用门 0x30（打开管道/
+  EVT_ABORT 时发 EVT_ATR，寄存器 MAX_C-APDU_SIZE/MAX_WAIT_TIME，C-APDU →
+  R-APDU）、连接门 0x41（白名单允许后 eSE 自建到终端主机的管道，主控发
+  ADM_NOTIFY_PIPE_CREATED，sub_C72663C 接收）。ETSI12 配置流程见 sub_C726300：
+  身份管道 → GATES_LIST 含 0x30 → 建 APDU 管道 → EVT_ATR → 读寄存器 1、2 →
+  须已有连接管道 → 成功。**管道号固定**：eSE 连接 0x16、APDU 0x19（SeApi 的 HCI
+  回调 sub_C71C884、SeApi_WiredGetAtr sub_C71E67C 写死），UICC 连接 0x0A 保留。
+  eSE 上没有装任何 applet：MANAGE CHANNEL 正常，SELECT 一律 6A82，所以支付宝
+  "未开卡"并立即返回。ATR 历史字节第 8、10 字节是 nfc_exception_recovery 读的
+  版本数字（"1"、"0"）。
+  ㊾NFA 启用期间 NCI 层会写一个 32 字节、头为 `02 05 01 00` 的错位缓冲
+  （其后 SET_CONFIG 左移一字节 + 旧数据），并当作 GID2/OID5 命令等响应，
+  2 秒超时则 NFA_Enable 失败；模型按未知命令回 `42 05 01 05`。来源函数未定位。
+  **实测**：NFC 栈约 1 秒初始化完成（NFA_Enable、HCI、EeRegister、ETSI12、
+  电源链路全部无超时），ese_read_kv 在 00:00:05 返回（原 00:00:48），开机 16 秒
+  已显示表盘。调试工具（未入库）：QMP 轮询 nfa_ee_cb/nfa_hci_cb/SeApi 状态。
 
 - **2026-10-09 (5)（掉电休眠、熄屏/亮屏、时钟、NSH，未提交）**：
   ㊵**"上滑进启动器就崩溃"= CPU 掉电后永不唤醒**：空闲时 hal_sleep_deep_sleep
@@ -237,6 +273,34 @@ AONCMU/CMU 魔术值 → UART（console, qemu chardev 直通终端）→ TIMER/S
   模式下按下即抓取并下发、接受激活窗口的点击（原来后台启动的窗口前一两次
   点击会被吞掉）。emu/ramlog.py 修复日志簇贴 PSRAM 末尾时输出为空。
   仍存在：NFC eSE ese_read_kv 超时使 UI 初始化停约 42s（㉟）。
+
+- **2026-10-09 (4)（蓝牙空口端到端 + NOR 出厂数据，commit 20ce0d98fd..）**：
+  ㊱**蓝牙桥端到端跑通**（AstroBox-NG 侧的 `bluetooth::emu` + `corelib` bind）：
+  emu/run.sh `BT_PORT=<port>` 挂出 bes.btss 对端 H4 控制器；AstroBox 的
+  `examples/emulator` 作主机栈：inquiry→page→SSP 配对（NoInputNoOutput，手环
+  弹框确认）→加密→SDP 查 SPP 通道→RFCOMM→打开 SPP→miwear L1 握手，全部实测
+  通过（`bonded`, `encryption mode 2`, `SPP open ch5`, `L1StartRsp`）。配对确认
+  按钮用 emu/touch.py 点手环屏（code 一致即接受，NoInputNoOutput Just Works）。
+  ㊲**NOR 出厂数据（emu/mknor.py + flash-image 常驻）**：手环蓝牙绑定要读
+  `/misc/factory.prop`（littlefs "nv" 分区 @0xFE0000，固件自己的 mount/loader
+  sub_C6FFC58）。缺失时 `get_did_` 失败、`miwear_did_get failed`，BindInfo 无
+  设备身份。mknor.py 按固件实测几何（littlefs v2.1、8K×16、read/prog 512、
+  name_max 32）写 did/psn/mac_bt。机器改为「-kernel 固件每启动装入 AP 分区、
+  flash-image 只带 BL2+出厂分区」，一张 NOR 跨固件版本通用。实测 `/misc` 正常
+  挂载、`fac_prop not need restore`、BindInfo 含 DID。
+  ㊳**绑定模式阻塞（关键发现）**：此固件 miwear 配置 `verify=0`（.data
+  0x200DEFE0: pid=0 verify=0 oob=4），手机 SPP 链路上 BindStartV2 一律走
+  **SERVER_PSK 绑定**（sub_C7D0238：仅 conn 子类型 0x10 的板-板连接或
+  verify==1 才走 local bind）。实测手环回的 BindInfoV2 verify_mode=ServerPsk。
+  PSK 绑定要云端服务器私钥签名（sub_C7DAAC8 验签），**离线无法伪造**；AstroBox
+  只实现了 APP_LOCAL（bind.rs），对不上。verify 是固件 .data 常量、非属性，
+  不改固件本体改不了。→ 现实路线：把手环预置为「已绑定」（NV 写 miwear_token_key
+  等）+ AstroBox 用导出的 authkey 走 AUTH（主流用法，连已绑定设备），而非首绑。
+  ㊴**AstroBox 侧（/Users/searchstars/Documents/GitHub/ab/AstroBox-NG，未提交）**：
+  `bluetooth::emu`（桥）+ `router`（按地址分流到桥/平台）+ `examples/emulator`；
+  `corelib` 新增 `components/bind.rs`（P-256 ECDH + HKDF，local bind）、
+  `create_device_with_options`、auth.rs 带 app_device_id。bind.rs 的 `pb::`
+  别名与 prost 生成的 `pb` crate 撞名，已改 `proto::`（编译/单测通过）。
 
 - **2026-10-09 (3)（触摸 + I2C 总线化，commits ba1b73bd2e..）**：
   ㉜**bes_i2c 改为真正的 QEMU I2C 总线主控**：首字节（空闲/STOP/RESTART 之后）发起 start_send/start_recv，逐字节 i2c_send/i2c_recv，STOP 结束；只有无模型应答的地址才退回通用 256B 寄存器文件（板上大量未建模芯片：传感器、充电、NFC……）。

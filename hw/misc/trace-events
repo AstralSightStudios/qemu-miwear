@@ -451,6 +451,15 @@ bes_nand_page_read(uint32_t row) "row=0x%06x"
 bes_nand_program(uint32_t row) "row=0x%06x"
 bes_nand_erase(uint32_t row) "row=0x%06x"
 
+# nci_nfcc.c
+nci_nfcc_command(unsigned gid, unsigned oid, unsigned len) "gid 0x%x oid 0x%02x payload %u"
+nci_nfcc_boot(void) "boot"
+nci_nfcc_push(unsigned len, unsigned queued) "packet of %u bytes, %u queued"
+nci_nfcc_recv(unsigned off, unsigned byte) "read byte %u = 0x%02x"
+nci_nfcc_write(unsigned len) "write transaction of %u bytes"
+nci_nfcc_packet(const char *hex) "host packet %s"
+nci_nfcc_hci(unsigned pipe, unsigned type, unsigned instr, unsigned len) "pipe 0x%02x type %u instr 0x%02x data %u"
+
 # bes_psc.c
 bes_psc_mcu_power(bool on) "MCU power %d"
 
