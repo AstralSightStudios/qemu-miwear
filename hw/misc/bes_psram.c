@@ -45,6 +45,16 @@
  *            firmware sub_C0E51C0), bits[14:11] = WB fill level
  *            (firmware sub_C0E51E0 waits for 0)
  *
+ * best1700 (property "v6", BSP hal_psram_v6.o): the MC keeps the same
+ * MGR engine, REG_004 also taking 6 = mode-register read (MR[REG_008]
+ * -> RX FIFO, hal_psram_mc_set_cmd_mrr), and REG_404 adds bits[19:16]
+ * = power state (hal_psram_mc_is_sleep: 2 = sleeping). The PHY is a
+ * different block: REG_040 starts it and REG_044 bits[28:25] report its
+ * state, 3 = ready (hal_psram_phy_init polls for it); REG_050/058 are
+ * DLL reset/clock controls that software read-modify-writes
+ * (hal_psram_phy_dll_*), so the best1503 calibration hook is off. The
+ * delay lines themselves sit behind ISPI (psramphy_best1700.o).
+ *
  * Emulated behaviour: PHY delay-line calibration completes instantly on
  * REG_050 write (bit6 set, mid-range base code 0x20). MGR commands
  * execute instantly against the attached PSRAM storage; the eye-scan
@@ -62,6 +72,9 @@
 
 #define PHY_REG_050  0x050      /* calibration kickoff */
 #define PHY_REG_058  0x058      /* calibration status/result */
+
+#define PHY_V6_REG_044     0x044      /* v6 PHY state */
+#define PHY_V6_READY       (3u << 25) /* bits[28:25] = 3 */
 
 #define PHY_058_CAL_DONE   (1 << 6)
 #define PHY_058_CAL_CODE   0x10 /* mid-range delay-line code */
@@ -124,6 +137,13 @@ static void bes_psram_mgr_exec(BesPsramState *s, uint32_t cmd)
     case 5:   /* mode-register write */
         s->mr[addr & 0x1F] = len & 0xFF;
         break;
+    case 6:   /* mode-register read (v6) */
+        if (s->v6) {
+            s->mgr_rx_cnt = 0;
+            s->mgr_rx_pos = 0;
+            s->mgr_rxfifo[s->mgr_rx_cnt++] = s->mr[addr & 0x1F];
+        }
+        break;
     default:
         /* init/reset/refresh commands (32, 255, ...): stateless here */
         break;
@@ -137,6 +157,9 @@ static uint64_t bes_psram_phy_read(void *opaque, hwaddr offset, unsigned size)
 
     if ((offset >> 2) < ARRAY_SIZE(s->phy_regs)) {
         v = s->phy_regs[offset >> 2];
+    }
+    if (s->v6 && offset == PHY_V6_REG_044) {
+        v = (v & ~(0xFu << 25)) | PHY_V6_READY;
     }
     qemu_log_mask(LOG_UNIMP, "bes.psram: phy read  off=0x%03x -> 0x%0*llx\n",
                   (unsigned)offset, size * 2, (unsigned long long)v);
@@ -156,7 +179,7 @@ static void bes_psram_phy_write(void *opaque, hwaddr offset, uint64_t value,
     }
     s->phy_regs[offset >> 2] = value;
 
-    if (offset == PHY_REG_050) {
+    if (offset == PHY_REG_050 && !s->v6) {
         /* PHY delay-line calibration: on real hardware the write kicks
          * off an automatic sweep that completes after some microseconds
          * with REG_058 bit6 set and the winning code in bits[5:1]
@@ -278,6 +301,7 @@ static void bes_psram_reset(DeviceState *dev)
 static const Property bes_psram_props[] = {
     DEFINE_PROP_UINT64("psram-ptr", BesPsramState, psram, 0),
     DEFINE_PROP_UINT32("psram-size", BesPsramState, psram_size, 0),
+    DEFINE_PROP_BOOL("v6", BesPsramState, v6, false),
 };
 
 static void bes_psram_class_init(ObjectClass *klass, const void *data)
