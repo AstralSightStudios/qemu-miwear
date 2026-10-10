@@ -32,6 +32,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qapi/error.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/misc/bes_gpio.h"
@@ -228,29 +229,47 @@ static const MemoryRegionOps bes_gpio_bank_ops[BES_GPIO_BANKS] = {
 #undef OPS
 };
 
-/* PSC GPIO interrupt block: +0x00..+0x08 enable, +0x0C..+0x14 status */
+/*
+ * PSC GPIO interrupt block: per-bank enable and status words at the
+ * offsets of the "psc-en<n>" / "psc-st<n>" properties (best1503: +0x00..
+ * +0x08 enable, +0x0C..+0x14 status). Other words of the window are plain
+ * storage (best1700 maps the window over the whole PSC block).
+ */
+static int bes_gpio_psc_reg(BesGpioState *s, hwaddr offset, bool *status)
+{
+    int n;
+
+    for (n = 0; n < BES_GPIO_BANKS; n++) {
+        if (offset == s->psc_en_off[n] || offset == s->psc_st_off[n]) {
+            *status = offset == s->psc_st_off[n];
+            return n;
+        }
+    }
+    return -1;
+}
+
 static uint64_t bes_gpio_psc_read(void *opaque, hwaddr offset, unsigned size)
 {
     BesGpioState *s = BES_GPIO(opaque);
-    unsigned n = offset / 4;
+    bool status;
+    int n = bes_gpio_psc_reg(s, offset, &status);
 
-    if (n < BES_GPIO_BANKS) {
-        return s->psc_en[n];
+    if (n < 0) {
+        return s->psc_regs[offset / 4];
     }
-    if (n < 2 * BES_GPIO_BANKS) {
-        return bes_gpio_status(s, n - BES_GPIO_BANKS) &
-               s->psc_en[n - BES_GPIO_BANKS];
-    }
-    return 0;
+    return status ? bes_gpio_status(s, n) & s->psc_en[n] : s->psc_en[n];
 }
 
 static void bes_gpio_psc_write(void *opaque, hwaddr offset, uint64_t value,
                                unsigned size)
 {
     BesGpioState *s = BES_GPIO(opaque);
-    unsigned n = offset / 4;
+    bool status;
+    int n = bes_gpio_psc_reg(s, offset, &status);
 
-    if (n < BES_GPIO_BANKS) {
+    if (n < 0) {
+        s->psc_regs[offset / 4] = value;
+    } else if (!status) {
         s->psc_en[n] = value;
         bes_gpio_update(s);
     } else {
@@ -281,7 +300,31 @@ static void bes_gpio_reset(DeviceState *dev)
         s->bank[n].ext = ext;
         s->psc_en[n] = 0;
     }
+    memset(s->psc_regs, 0, sizeof(s->psc_regs));
 }
+
+static void bes_gpio_realize(DeviceState *dev, Error **errp)
+{
+    BesGpioState *s = BES_GPIO(dev);
+
+    if (s->psc_size > sizeof(s->psc_regs)) {
+        error_setg(errp, "bes.gpio: psc-size too large");
+        return;
+    }
+    memory_region_init_io(&s->psc_mr, OBJECT(dev), &bes_gpio_psc_ops, s,
+                          "bes.gpio-psc", s->psc_size);
+    sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->psc_mr);
+}
+
+static const Property bes_gpio_props[] = {
+    DEFINE_PROP_UINT32("psc-size", BesGpioState, psc_size, 0x18),
+    DEFINE_PROP_UINT32("psc-en0", BesGpioState, psc_en_off[0], 0x00),
+    DEFINE_PROP_UINT32("psc-en1", BesGpioState, psc_en_off[1], 0x04),
+    DEFINE_PROP_UINT32("psc-en2", BesGpioState, psc_en_off[2], 0x08),
+    DEFINE_PROP_UINT32("psc-st0", BesGpioState, psc_st_off[0], 0x0C),
+    DEFINE_PROP_UINT32("psc-st1", BesGpioState, psc_st_off[1], 0x10),
+    DEFINE_PROP_UINT32("psc-st2", BesGpioState, psc_st_off[2], 0x14),
+};
 
 static void bes_gpio_init(Object *obj)
 {
@@ -296,9 +339,6 @@ static void bes_gpio_init(Object *obj)
                               name, 0x100);
         sysbus_init_mmio(sbd, &s->bank_mr[n]);
     }
-    memory_region_init_io(&s->psc_mr, obj, &bes_gpio_psc_ops, s,
-                          "bes.gpio-psc", 0x18);
-    sysbus_init_mmio(sbd, &s->psc_mr);
     sysbus_init_irq(sbd, &s->irq);
     qdev_init_gpio_in(DEVICE(obj), bes_gpio_set_input, BES_GPIO_PINS);
     qdev_init_gpio_out(DEVICE(obj), s->out, BES_GPIO_PINS);
@@ -308,6 +348,8 @@ static void bes_gpio_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
+    dc->realize = bes_gpio_realize;
+    device_class_set_props(dc, bes_gpio_props);
     device_class_set_legacy_reset(dc, bes_gpio_reset);
 }
 

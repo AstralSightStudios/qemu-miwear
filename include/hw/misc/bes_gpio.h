@@ -36,6 +36,10 @@ struct BesGpioState {
 
     BesGpioBank bank[BES_GPIO_BANKS];
     uint32_t psc_en[BES_GPIO_BANKS];
+    uint32_t psc_size;              /* PSC window size */
+    uint32_t psc_en_off[BES_GPIO_BANKS];
+    uint32_t psc_st_off[BES_GPIO_BANKS];
+    uint32_t psc_regs[0x400 / 4];   /* the rest of the PSC window */
 };
 
 #endif
