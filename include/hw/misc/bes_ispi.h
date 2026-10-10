@@ -24,9 +24,10 @@ struct BesIspiState {
     uint32_t rx;                /* RX response shift register */
     int      rx_bits;           /* RX bits not yet popped */
 
-    /* ISPI slave (PMU) model */
-    uint16_t pmu_regs[256];     /* slave register file */
-    uint32_t pmu_id_seq;        /* reg0 read sequence: chip id -> metal id */
+    uint32_t ctrl;              /* +0x04: chip select in bits [10:7] */
+
+    /* ISPI slaves (PMU, analog PHYs): a register file per chip select */
+    uint16_t regs_slave[16][0x400];
 };
 
 #endif

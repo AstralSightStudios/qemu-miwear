@@ -22,23 +22,46 @@
  *
  * 事务模型（hal_analogif_best1700.o hal_analogif_reg_read/reg_write）：
  *   命令字 32 位，小端字节流逐字节/半字/字写入 DATA 收集：
- *     读：((reg & 0xFF) << 16) | 0x10000000（bit28 = 读标志，
- *          q63 运行时实证；EVB BSP hal_analogif_best1700.o 为
- *          bit24（0x01000000），boot ROM 版本差异，以固件为准）
- *     写：(reg << 16) | value16
+ *     读：(reg << 18) | 0x10000000（bit28 = 读标志）
+ *     写：(reg << 18) | (value16 << 2)
+ *   reg 10 位（bit[27:18]），值在 bit[17:2]：hal_analogif_best1700.o
+ *   hal_analogif_reg_read 的普通 ISPI 路径（reg & 0x3FF，<< 0x12，
+ *   orr 0x10000000）与 hal_analogif_rawwrite（((reg << 16) | value)
+ *   << 2）。q63 TEE 的 pmu_boot_init 与 BSP 逐条对得上（写 0x3F =
+ *   0x1100 发 0x00FC4400，读 0x4F 发 0x113C0000，实测）。另一条
+ *   bit24 读标志、8 位地址的路径（hal_ispi_recv_ex）用于片选 0/3 的
+ *   其他从设备，此处未建模。
  *   SPI 全双工：命令字 4 字节发完的同一时钟内从机已回 4 字节 ——
  *   本模型在命令字收集满时立即执行并把 32 位应答装入 RX，
  *   固件按传输宽度从 DATA 逐字节/半字/字弹出，取低 16 位为寄存器值
  *   （运行时实证：boot ROM recv 循环 tx=命令缓冲 len=4，发完即等
  *   +0x0C bit2 读 DATA，再无第二次 TX 写）。
  *
- * PMU 从设备：
+ * 从设备按片选分开：片选 = +0x04 bit[10:7]（hal_spi.o
+ *   hal_ispi_activate_cs: bfi r3, cs, #7, #4）。q63 用到片选 0/2/5/6/7
+ *   （PMU 及 PSRAM 模拟 PHY 等，实测），各自一套 10 位地址寄存器。
+ *
+ * 芯片标识：
  *   hal_analogif_open 连续两次读 reg0 做芯片校验：第一次要求
  *   >>4 == 0x170（chip id），第二次 == 0x18F（metal id；
  *   pmu_best1700.o read_hw_metal_id 的 switch 范围 0x183-0x18F 互证，
- *   且其低 4 位为修订号，读 0 走默认路径）。故 reg0 按读取序回报
- *   0x1700、之后恒 0x18F0。其余寄存器为普通存储（DCDC/GPIO 等配置
- *   由固件写入后回读，闭环即可）。
+ *   且其低 4 位为修订号，读 0 走默认路径）。两次读分别在片选 7 与
+ *   片选 0（PMU）上（q63 TEE/AP 实测：先置 +0x04 = 0x382 读，再置
+ *   0x002 读），故片选 7 的 reg0 复位值 0x1700、片选 0 的 0x18F0。
+ *   PMU 型号：pmu_best1700.o read_hw_metal_id 在 reg0>>4 == 0x18F 时再读
+ *   reg1，0x650 = PMU_CHIP_TYPE_1806P、0x1050 = 1810P；q63 AP 含
+ *   pmu1806p_gpio_setup_irq 等 1806P 专用代码（字符串实证），TEE 的
+ *   pmu_open 遇 1803/1808 即断言，故 reg1 复位值 0x0650。其余寄存器为普通存储（DCDC/GPIO 等配置
+ *   由固件写入后回读，闭环即可），除：
+ *   reg 0x4F：pmu_boot_init（pmu_best1700.o）写 bit15|bit13（0xA000）
+ *   启动 DCDC 校准，50ms 内轮询 bit[7:6] == 01 为完成，超时死循环。
+ *   校准即刻完成：写入带 bit15 时 bit[7:6] 置 01。
+ *
+ * PSRAM 模拟 PHY（片选 5，psramphy_best1700.o 以 0x5051/0x5052 访问，
+ * 高 4 位即片选）：reg 0x51 为 DLL 状态，bit6 = 锁定、bit7 = 全 0、
+ * bit8 = 全 1、bit[5:0] = 延时输入码（psramphy_is_dll_lock/
+ * _all_zero/_all_one/psramphy_dll_dly_in_get）。DLL 即刻锁定在中间码
+ * 0x10，否则 hal_psram_phy_dll_range_dyn_config 断言失败（q63 TEE 实测）。
  *
  * This code is licensed under the GPL version 2 or later.
  */
@@ -55,6 +78,11 @@
 #define ISPI_OFF_INTC         0x20
 #define ISPI_OFF_CNT_RST      0x30
 
+#define ISPI_CS(s)            (((s)->ctrl >> 7) & 0xF)
+#define ISPI_CS_PMU           0
+#define ISPI_CS_PSRAM_PHY     5
+#define ISPI_CS_CHIPID        7
+
 static void bes_ispi_tx(BesIspiState *s, uint32_t value, unsigned size)
 {
     /* 命令字按小端字节流收集，满 4 字节立即执行（全双工，应答同时入 RX） */
@@ -63,7 +91,7 @@ static void bes_ispi_tx(BesIspiState *s, uint32_t value, unsigned size)
         value >>= 8;
         if (++s->tx_cnt == 4) {
             uint32_t cmd = s->tx;
-            uint8_t reg = (cmd >> 16) & 0xFF;
+            uint16_t reg = (cmd >> 18) & 0x3FF;
 
             if (cmd & 0x10000000) {
                 /* 读命令：从设备寄存器值。SPI 全双工应答带 2 位前导：
@@ -72,21 +100,25 @@ static void bes_ispi_tx(BesIspiState *s, uint32_t value, unsigned size)
                  * 运行时实证：RX=0x1700 时固件算得 buf=0x05C0）。 */
                 uint16_t v;
 
-                if (reg == 0) {
-                    /* PMU 芯片标识：先报 chip id 0x170，再报 metal id 0x18F */
-                    v = s->pmu_id_seq++ ? 0x18F0 : 0x1700;
-                } else {
-                    v = s->pmu_regs[reg];
+                v = s->regs_slave[ISPI_CS(s)][reg];
+                if (ISPI_CS(s) == ISPI_CS_PSRAM_PHY && reg == 0x51) {
+                    v = (v & ~0x1FF) | 0x40 | 0x10;
                 }
                 s->rx = (uint32_t)v << 2;
-                qemu_log_mask(LOG_UNIMP, "bes.ispi: read reg 0x%02x -> 0x%04x\n",
-                              reg, v);
+                qemu_log_mask(LOG_UNIMP, "bes.ispi: cs%u read reg 0x%03x -> "
+                              "0x%04x\n", ISPI_CS(s), reg, v);
             } else {
-                /* 写命令：低 16 位为值；写事务的 RX 内容无效 */
-                s->pmu_regs[reg] = cmd & 0xFFFF;
+                /* 写命令：值在 bit[17:2]；写事务的 RX 内容无效 */
+                uint16_t *r = s->regs_slave[ISPI_CS(s)];
+
+                r[reg] = (cmd >> 2) & 0xFFFF;
+                if (ISPI_CS(s) == ISPI_CS_PMU && reg == 0x4F &&
+                    (r[reg] & 0x8000)) {
+                    r[reg] = (r[reg] & ~0xC0) | 0x40;
+                }
                 s->rx = 0;
-                qemu_log_mask(LOG_UNIMP, "bes.ispi: write reg 0x%02x = 0x%04x\n",
-                              reg, (unsigned)(cmd & 0xFFFF));
+                qemu_log_mask(LOG_UNIMP, "bes.ispi: cs%u write reg 0x%03x = "
+                              "0x%04x\n", ISPI_CS(s), reg, r[reg]);
             }
             s->rx_bits = 32;
             s->tx = 0;
@@ -102,7 +134,7 @@ static uint64_t bes_ispi_read(void *opaque, hwaddr offset, unsigned size)
 
     switch (offset) {
     case ISPI_OFF_CTRL:
-        v = 0x2;                        /* bit1: 引擎运行 */
+        v = s->ctrl | 0x2;              /* bit1: 引擎运行 */
         break;
     case ISPI_OFF_DATA:
         /* RX 按读取宽度从低位弹出 */
@@ -149,6 +181,8 @@ static void bes_ispi_write(void *opaque, hwaddr offset, uint64_t value,
     case ISPI_OFF_INTC:
         break;                          /* 清中断：消费 */
     case ISPI_OFF_CTRL:
+        s->ctrl = (uint32_t)value & ~0x2u;  /* bit1 恒报运行；片选等存下 */
+        break;
     case ISPI_OFF_FIFO:
         break;                          /* 状态寄存器：只读 */
     default:
@@ -176,8 +210,11 @@ static void bes_ispi_reset(DeviceState *dev)
     s->tx_cnt = 0;
     s->rx = 0;
     s->rx_bits = 0;
-    memset(s->pmu_regs, 0, sizeof(s->pmu_regs));
-    s->pmu_id_seq = 0;
+    s->ctrl = 0;
+    memset(s->regs_slave, 0, sizeof(s->regs_slave));
+    s->regs_slave[ISPI_CS_CHIPID][0] = 0x1700;  /* chip id 0x170 */
+    s->regs_slave[ISPI_CS_PMU][0] = 0x18F0;     /* metal id 0x18F */
+    s->regs_slave[ISPI_CS_PMU][1] = 0x0650;     /* PMU 1806P */
 }
 
 static void bes_ispi_realize(DeviceState *dev, Error **errp)
