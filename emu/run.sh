@@ -14,6 +14,8 @@
 #   FW=<dir> picks the firmware (its vela_ap.bin); the machine follows its
 #   chip, and the board profile its product. PROFILE=<name> forces a board
 #   (PROFILE=help lists them).
+#   EMMC=<file> attaches that eMMC image (best1700 devices; build it with
+#   emu/mkemmc.py <firmware dir>).
 # Must be run from the repository root (machine paths are relative).
 OUT=$1; SECS=$2; shift 2
 FW=${FW:-miwear.watch.p67tc_v3.101.043_full_a4ce8564}
@@ -39,9 +41,12 @@ fi
 if [ -n "$PROFILE" ]; then
     PROFILE_ARGS="-M profile=$PROFILE"
 fi
+if [ -n "$EMMC" ]; then
+    EMMC_ARGS="-drive if=sd,index=0,format=raw,file=$EMMC"
+fi
 mkdir -p "$OUT"
 build/qemu-system-arm -M miwear -kernel "$FW/vela_ap.bin" \
-    $DISPLAY_ARGS $BT_ARGS $NOR_ARGS $PROFILE_ARGS -monitor none \
+    $DISPLAY_ARGS $BT_ARGS $NOR_ARGS $PROFILE_ARGS $EMMC_ARGS -monitor none \
     -serial file:"$OUT/uart0.log" -serial file:"$OUT/uart1.log" \
     $UART2_ARGS -D "$OUT/qemu.log" "$@" > "$OUT/stdout.log" 2>&1 &
 PID=$!

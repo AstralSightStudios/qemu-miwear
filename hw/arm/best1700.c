@@ -49,6 +49,12 @@
 #include "hw/misc/bes_psram.h"
 #include "hw/misc/bes_dma.h"
 #include "hw/misc/bes_i2c.h"
+#include "hw/misc/bes_stub.h"
+#include "hw/core/or-irq.h"
+#include "hw/sd/sdhci.h"
+#include "hw/sd/sd.h"
+#include "system/blockdev.h"
+#include "system/block-backend.h"
 #include "hw/core/irq.h"
 #include "hw/misc/unimp.h"
 #include "chardev/char-fe.h"
@@ -108,6 +114,16 @@
  * {0x40077000, 54}。q63 AP 在 I2C2（0x40075000）上轮询 STATUS（实测）。
  * 板上器件未接入：bes_i2c 对无模型地址回退为通用寄存器文件。 */
 #define BEST1700_NUM_I2C         5
+
+/* eMMC 主控 @0x40150000：标准 SDHCI 寄存器（BSP sdhci_unifiedAl.o 的
+ * sdh_* 访问器：0x08 参数、0x0C 传输模式、0x0E 命令、0x2C 时钟、
+ * 0x30–0x3A 中断状态/使能），另有厂商区（DWC MSHC，q63 读改写
+ * 0x800/0x818–0x824，实测）按普通存储。q63 在首次访问后即使能 NVIC
+ * 26（sdhci_emmc_int_init，实测）；BSP 把 26 记为 UART2 的中断，两者
+ * 经或门共用。卡是 QEMU 的 eMMC，由 -drive if=sd,index=0 提供，镜像
+ * 由 emu/mkemmc.py 生成（GPT，各分区名即 /dev/<name>）。 */
+#define BEST1700_EMMC_BASE       0x40150000
+#define BEST1700_EMMC_IRQ        26
 
 /* 通用 DMA ×3（PL080 兼容 + BES 2D 扩展，bes_dma）：BSP hal_dma.o
  * .rodata.dma = {0x401A0000, 0x401A8000, 0x40260000}、irq_type =
@@ -196,6 +212,7 @@ static MemoryRegion g_bootvec;
 
 static ARMv7MState *g_armv7m;
 static MemoryRegion g_periph, g_bth_periph;
+static DeviceState *g_irq26;
 
 /*
  * IDAU：地址位 26 为安全别名（0x04xxxxxx ITCM、0x24xxxxxx SRAM、
@@ -729,6 +746,13 @@ static void best1700_init(MachineState *machine, BesImage *img,
         };
         int i;
 
+        /* NVIC 26 由 UART2 与 eMMC 主控共用（见 BEST1700_EMMC_IRQ） */
+        g_irq26 = qdev_new(TYPE_OR_IRQ);
+        qdev_prop_set_uint16(g_irq26, "num-lines", 2);
+        qdev_realize_and_unref(g_irq26, NULL, &error_fatal);
+        qdev_connect_gpio_out(g_irq26, 0,
+                              qdev_get_gpio_in(armv7m, BEST1700_EMMC_IRQ));
+
         for (i = 0; i < ARRAY_SIZE(uarts); i++) {
             DeviceState *uart = qdev_new("pl011");
             Chardev *chr = serial_hd(i);
@@ -740,6 +764,8 @@ static void best1700_init(MachineState *machine, BesImage *img,
             sysbus_realize_and_unref(SYS_BUS_DEVICE(uart), &error_fatal);
             best1700_map(SYS_BUS_DEVICE(uart), 0, uarts[i].base);
             sysbus_connect_irq(SYS_BUS_DEVICE(uart), 0,
+                               uarts[i].irq == BEST1700_EMMC_IRQ ?
+                               qdev_get_gpio_in(g_irq26, 0) :
                                qdev_get_gpio_in(armv7m, uarts[i].irq));
         }
         for (i = 0; i < ARRAY_SIZE(timers); i++) {
@@ -776,6 +802,46 @@ static void best1700_init(MachineState *machine, BesImage *img,
             best1700_map(SYS_BUS_DEVICE(i2c), 0, i2cs[i].base);
             sysbus_connect_irq(SYS_BUS_DEVICE(i2c), 0,
                                qdev_get_gpio_in(armv7m, i2cs[i].irq));
+        }
+    }
+
+    /* ---- eMMC 主控 + 卡（见宏注释） ---- */
+    {
+        DeviceState *sdhci = qdev_new(TYPE_SYSBUS_SDHCI);
+        DeviceState *vendor = qdev_new(TYPE_BES_STUB);
+        DriveInfo *dinfo = drive_get(IF_SD, 0, 0);
+
+        qdev_prop_set_uint8(sdhci, "sd-spec-version", 3);
+        /* QEMU 默认能力 + 8 位总线（eMMC） */
+        qdev_prop_set_uint64(sdhci, "capareg", 0x057834b4 | (1 << 18));
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(sdhci), &error_fatal);
+        memory_region_add_subregion_overlap(&g_periph,
+            BEST1700_EMMC_BASE - BEST1700_PERIPH_BASE,
+            sysbus_mmio_get_region(SYS_BUS_DEVICE(sdhci), 0), 1);
+        sysbus_connect_irq(SYS_BUS_DEVICE(sdhci), 0,
+                           qdev_get_gpio_in(g_irq26, 1));
+
+        qdev_prop_set_string(vendor, "tag", "emmc.vendor");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(vendor), &error_fatal);
+        memory_region_add_subregion_overlap(&g_periph,
+            BEST1700_EMMC_BASE - BEST1700_PERIPH_BASE,
+            sysbus_mmio_get_region(SYS_BUS_DEVICE(vendor), 0), 0);
+
+        if (dinfo) {
+            DeviceState *card = qdev_new(TYPE_EMMC);
+
+            /* q63 的 BES mmc 核心取 CID 序列号低 16 位作 RCA，NuttX
+             * mmcsd 重新枚举时固定用 RCA 1，之后 BES 层仍以旧 RCA 发
+             * CMD13（实测）；序列号低 16 位取 1 使两者一致。 */
+            qdev_prop_set_uint32(card, "serial", 0x17000001);
+
+            qdev_prop_set_drive_err(card, "drive", blk_by_legacy_dinfo(dinfo),
+                                    &error_fatal);
+            qdev_realize_and_unref(card, qdev_get_child_bus(sdhci, "sd-bus"),
+                                   &error_fatal);
+        } else {
+            warn_report("best1700: no eMMC (-drive if=sd,index=0,file=...; "
+                        "build one with emu/mkemmc.py)");
         }
     }
 
