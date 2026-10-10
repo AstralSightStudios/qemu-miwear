@@ -23,6 +23,9 @@ OBJECT_DECLARE_TYPE(Best1700CmuState, Best1700CmuClass, BEST1700_CMU)
 /* intersys mailbox groups: M55C0 channels 0/1, M55C1 channels 0/1, ... */
 #define BEST1700_ISYS_GROUPS    8
 
+/* MCU_CMU mailbox channels to the Bluetooth core */
+#define BEST1700_BT_ISYS_CHANNELS   4
+
 /* AON_CMU: boot address of the M55C1 core, bits [31:7] (its own view) */
 #define BEST1700_AONCMU_M55C1_VTOR  0xB4
 
@@ -45,6 +48,12 @@ struct Best1700CmuState {
     Best1700CmuState *isys_peer;
     qemu_irq isys_rx[BEST1700_ISYS_GROUPS];
     qemu_irq isys_tx[BEST1700_ISYS_GROUPS];
+
+    /* MCU_CMU: mailbox to the Bluetooth core */
+    uint32_t bt_word;           /* indications 4+ch, enables 8+ch / 12+ch */
+    uint32_t bt_raw;            /* BT data 24+ch, BT took MCU data 28+ch */
+    qemu_irq bt_doorbell[BEST1700_BT_ISYS_CHANNELS];
+    qemu_irq bt_irq[2 * BEST1700_BT_ISYS_CHANNELS];    /* tx done, rx */
 };
 
 /* pair the intersys mailbox halves of the MCU_CMU and the BTH_CMU */

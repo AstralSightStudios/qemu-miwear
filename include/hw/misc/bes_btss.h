@@ -1,6 +1,7 @@
 /*
- * BES Bluetooth subsystem stand-in (best1503): inter-core mailbox peer,
- * HCI controller and a virtual air interface to one peer device
+ * BES Bluetooth subsystem stand-in (best1503, best1700): inter-core
+ * mailbox peer, HCI controller and a virtual air interface to one peer
+ * device
  *
  * This code is licensed under the GPL version 2 or later.
  */
@@ -111,6 +112,10 @@ struct BesBtssState {
     uint32_t shared_table;              /* mailbox pointer table (BT RAM) */
     uint32_t exch_base;                 /* BT exchange memory */
     uint32_t exch_size;
+    bool rx_head_direct;                /* [8 * ch] = first descriptor */
+    uint8_t data_done_shift;            /* BT_CMU +0x54 done bit of ch 0 */
+    uint16_t hci_revision;              /* controller firmware date */
+    int32_t hci_channel;                /* only channel with HCI; -1: any */
 
     qemu_irq ind_ack[BES_BTSS_CHANNELS];    /* BT took MCU2BT data */
     qemu_irq bt2mcu[BES_BTSS_CHANNELS];     /* BT2MCU data indication */

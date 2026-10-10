@@ -51,6 +51,7 @@
 #include "hw/misc/bes_ispi.h"
 #include "hw/misc/bes_psram.h"
 #include "hw/misc/bes_dma.h"
+#include "hw/misc/bes_btss.h"
 #include "hw/misc/bes_i2c.h"
 #include "hw/i2c/i2c.h"
 #include "hw/misc/bes_stub.h"
@@ -179,6 +180,36 @@
  * 0x213449f4 即此（实测）。 */
 #define BEST1700_DTCM_AXI_BASE   0x21000000
 #define BEST1700_ITCM_AXI_BASE   0x21800000
+
+/* 蓝牙子系统（BT 核本体不模拟，bes.btss 扮演邮箱对端 + 空闲 HCI 控制
+ * 器）。蓝牙 host 跑在 M55C1（cp 固件）上，依据其 hal_intersys（AP 把
+ * vela_cp.bin 装在 PSRAM 0x1B300000，实测）：
+ *   - 邮箱指针表 0x68004000（cp 表 0x1B5ECB2C / 0x1B5ECB3C）：[8*ch]
+ *     是 BT 发给 cp 的首个描述符，[8*ch+4] 是 cp 发送链表头变量的地址
+ *   - 门铃 / 完成 / 中断：MCU_CMU 0x140/0x144（见 best1700_cmu.c）
+ *   - cp 收完后写 BT_CMU 0x6E030000 +0x54 bit 18+ch（ch 0/1；ch 2/3 在
+ *     +0xB0，未建模）
+ *   - cp 的 NVIC：tx done {102, 103, 29, 30}、rx {104, 105, 43, 119}
+ *     （cp 表 0x1B5ECB4C / 0x1B5ECB50）
+ *   - 通道 0 走 HCI（btdrv 与 bes_serial_hci2）；通道 1 只发 8 字节的
+ *     {user, msg} 给 BT 核（bt_intersys_oper_btcore），cp 在其上不收
+ * cp 的 btdrv_SendData 在任务里忙等 tx done，没有对端时它不让出 CPU，
+ * cp 的 rpmsg 随之停摆，sensor 等发送缓冲超时断言，AP 再整机复位。
+ * BT RAM 在 0x68000000（cp 还经 DMA 往 0x683FFF00 起写入，大小未查证，
+ * 取 8MB）；BT→cp 的描述符与数据放在其中 0x68010000 起 64KB。 */
+#define BEST1700_BT_RAM_BASE     0x68000000
+#define BEST1700_BT_RAM_SIZE     0x00800000
+#define BEST1700_BT_MBOX_TABLE   0x68004000
+#define BEST1700_BT_EXCH_BASE    0x68010000
+#define BEST1700_BT_EXCH_SIZE    0x00010000
+#define BEST1700_BT_CMU_BASE     0x6E030000
+/* 控制器固件日期（HCI_Revision = 年 << 9 | 月 << 5 | 日）：cp 的
+ * bt_drv_reg_op_init 要求晚于 2024-03-24（"Please merge
+ * MCU_WAKEUP_BT_V2 code"），取 2025-06-01 */
+#define BEST1700_BT_FW_DATE      (25 << 9 | 6 << 5 | 1)
+
+static const int best1700_bt_tx_irq[] = { 102, 103, 29, 30 };
+static const int best1700_bt_rx_irq[] = { 104, 105, 43, 119 };
 
 /* 第二颗 M55（M55C1，即固件里的 "cp"）：跑 cp_image 分区的 vela_cp.bin
  * （蓝牙 host 服务 + WiFi 协议栈，见其字符串）。本核 ITCM（0x0 起 2MB）、
@@ -1364,11 +1395,14 @@ static void best1700_init(MachineState *machine, BesImage *img,
         }
     }
 
-    /* ---- MCU_CMU / AON_CMU（见上方宏注释），含两核间中断与 M55C1
-     * 放核（见 M55C1 宏注释）。BT 子系统邮箱未建模：用到再查。 ---- */
+    /* ---- MCU_CMU / AON_CMU（见上方宏注释），含两核间中断、M55C1
+     * 放核（见 M55C1 宏注释）与 BT 子系统邮箱（见 BEST1700_BT_* 宏
+     * 注释）。 ---- */
     {
+        static MemoryRegion bt_ram;
         DeviceState *cmu = qdev_new(TYPE_BEST1700_CMU);
         DeviceState *aoncmu = qdev_new(TYPE_BEST1700_AONCMU);
+        DeviceState *btss = qdev_new(TYPE_BES_BTSS);
         int c;
 
         sysbus_realize_and_unref(SYS_BUS_DEVICE(cmu), &error_fatal);
@@ -1414,6 +1448,38 @@ static void best1700_init(MachineState *machine, BesImage *img,
                 qdev_connect_gpio_out_named(bthcmu, "intersys-tx", c,
                     qdev_get_gpio_in(DEVICE(g_bth), 65 + c));
             }
+        }
+
+        /* BT 子系统：MCU_CMU 蓝牙邮箱的对端 */
+        memory_region_init_ram(&bt_ram, NULL, "best1700.bt_ram",
+                               BEST1700_BT_RAM_SIZE, &error_fatal);
+        memory_region_add_subregion(sysmem, BEST1700_BT_RAM_BASE, &bt_ram);
+        object_property_set_link(OBJECT(btss), "downstream", OBJECT(sysmem),
+                                 &error_fatal);
+        qdev_prop_set_uint32(btss, "shared-table", BEST1700_BT_MBOX_TABLE);
+        qdev_prop_set_uint32(btss, "exch-base", BEST1700_BT_EXCH_BASE);
+        qdev_prop_set_uint32(btss, "exch-size", BEST1700_BT_EXCH_SIZE);
+        qdev_prop_set_bit(btss, "rx-head-direct", true);
+        qdev_prop_set_uint8(btss, "data-done-shift", 18);
+        qdev_prop_set_uint16(btss, "hci-revision", BEST1700_BT_FW_DATE);
+        qdev_prop_set_int32(btss, "hci-channel", 0);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(btss), &error_fatal);
+        memory_region_add_subregion(sysmem, BEST1700_BT_CMU_BASE,
+            sysbus_mmio_get_region(SYS_BUS_DEVICE(btss), 0));
+        for (c = 0; c < 2; c++) {
+            qdev_connect_gpio_out_named(cmu, "bt-doorbell", c,
+                qdev_get_gpio_in_named(btss, "doorbell", c));
+            qdev_connect_gpio_out_named(btss, "ind-ack", c,
+                qdev_get_gpio_in_named(cmu, "bt-ind-ack", c));
+            qdev_connect_gpio_out_named(btss, "bt2mcu", c,
+                qdev_get_gpio_in_named(cmu, "bt2mcu", c));
+        }
+        for (c = 0; c < BEST1700_BT_ISYS_CHANNELS; c++) {
+            qdev_connect_gpio_out_named(cmu, "bt-irq", c,
+                qdev_get_gpio_in(DEVICE(g_cp), best1700_bt_tx_irq[c]));
+            qdev_connect_gpio_out_named(cmu, "bt-irq",
+                                        BEST1700_BT_ISYS_CHANNELS + c,
+                qdev_get_gpio_in(DEVICE(g_cp), best1700_bt_rx_irq[c]));
         }
     }
 

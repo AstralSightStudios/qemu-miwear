@@ -1,5 +1,5 @@
 /*
- * BES Bluetooth subsystem stand-in (best1503)
+ * BES Bluetooth subsystem stand-in (best1503, best1700)
  *
  * The AP firmware talks to the Bluetooth core through the inter-core
  * mailbox ("intersys"). The BT core itself is not emulated; this device
@@ -22,6 +22,20 @@
  *   - BT -> AP: the BT core publishes its list and raises BT2MCU_DATA
  *     (bt2mcu line); the AP consumes it and acknowledges by writing
  *     bit 2 << ch to BT_CMU + 0x54
+ * best1700 (the M55C1 "cp" firmware's hal_intersys) has the same
+ * protocol with two differences, set by properties: word [8 * ch] holds
+ * the first BT -> MCU descriptor itself ("rx-head-direct"), and the
+ * done bit is 1 << (18 + ch) ("data-done-shift" 18).
+ *
+ * The best1700 host carries HCI on channel 0 only ("hci-channel" 0); on
+ * channel 1 it sends 8-byte {user, msg} requests to the BT core
+ * (bt_intersys_oper_btcore) and has no receive handler, so anything
+ * published there trips its "INTERSYS-RX: Handler missing" assertion.
+ *
+ * The HCI_Revision of Read Local Version Information ("hci-revision") is
+ * the controller firmware date, year << 9 | month << 5 | day: the
+ * best1700 host (bt_drv_update_btc_sw_version) turns it into 0xYYMMDD
+ * and bt_drv_reg_op_init asserts unless it is later than 0x240324.
  *
  * HCI (vendor/bes/chips/bes/bes_serial_hci2.c, bthci_send/receive):
  * H4 framed packets. Commands get a Command Complete (or Command Status
@@ -110,7 +124,8 @@ static void btss_publish(BesBtssState *s, int ch)
         data += ROUND_UP(m->len, 4);
     }
     c->inflight = n;
-    btss_stl(s, s->shared_table + 8 * ch, base + EXCH_HEAD_OFF);
+    btss_stl(s, s->shared_table + 8 * ch,
+             s->rx_head_direct ? base + EXCH_DESC_OFF : base + EXCH_HEAD_OFF);
     trace_bes_btss_publish(ch, n);
     qemu_set_irq(s->bt2mcu[ch], 1);
 }
@@ -404,6 +419,7 @@ static void hci_fill_return(BesBtssState *s, int side, uint16_t opcode,
     switch (opcode) {
     case 0x1001:                    /* Read Local Version Information */
         rp[1] = 0x0B;               /* HCI 5.2 */
+        stw_le_p(rp + 2, s->hci_revision);
         rp[4] = 0x0B;               /* LMP 5.2 */
         stw_le_p(rp + 5, 0x02B0);   /* Bestechnic (Shenzhen) */
         break;
@@ -620,6 +636,12 @@ static void btss_mcu_message(BesBtssState *s, int ch, uint8_t mbx,
     if (!len) {
         return;
     }
+    if (s->hci_channel >= 0 && ch != s->hci_channel) {
+        /* taken, never answered: the host has no receive handler there */
+        qemu_log_mask(LOG_UNIMP, "bes.btss: ch%d: %u-byte control message "
+                      "0x%02x ignored\n", ch, len, data[0]);
+        return;
+    }
     switch (data[0]) {
     case H4_CMD:
         s->hci_ch = ch;
@@ -682,7 +704,7 @@ static void btss_btcmu_write(void *opaque, hwaddr offset, uint64_t value,
 
     if (offset == BTCMU_OFF_MCU_DATA_DONE) {
         for (ch = 0; ch < BES_BTSS_CHANNELS; ch++) {
-            if (value & (4u << ch)) {
+            if (value & (1u << (s->data_done_shift + ch))) {
                 btss_rx_done(s, ch);
             }
         }
@@ -753,6 +775,10 @@ static const Property bes_btss_props[] = {
     DEFINE_PROP_UINT32("exch-base", BesBtssState, exch_base, 0),
     DEFINE_PROP_UINT32("exch-size", BesBtssState, exch_size, 0),
     DEFINE_PROP_UINT32("latency-us", BesBtssState, latency_us, 1000),
+    DEFINE_PROP_BOOL("rx-head-direct", BesBtssState, rx_head_direct, false),
+    DEFINE_PROP_UINT16("hci-revision", BesBtssState, hci_revision, 0),
+    DEFINE_PROP_INT32("hci-channel", BesBtssState, hci_channel, -1),
+    DEFINE_PROP_UINT8("data-done-shift", BesBtssState, data_done_shift, 2),
     DEFINE_PROP_STRING("bdaddr", BesBtssState, bdaddr_str[BTSS_BAND]),
     DEFINE_PROP_STRING("peer-bdaddr", BesBtssState, bdaddr_str[BTSS_PEER]),
     DEFINE_PROP_CHR("chardev", BesBtssState, radio),

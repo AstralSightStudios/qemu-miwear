@@ -53,6 +53,7 @@ config BEST1700
     select SGM25062
     select BES_GPIO
     select BES_ISPI
+    select BES_BTSS
     select RAYDIUM_TS
 
 config ARM_VIRT

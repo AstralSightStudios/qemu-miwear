@@ -48,6 +48,16 @@
  *    BTH_CMU 0x174; tx done: MCU_CMU 0x224, BTH_CMU 0x170), raw in bit g
  *    and masked in bit 16+g. Every group drives an "intersys-rx" and an
  *    "intersys-tx" line.
+ *  - mailbox to the Bluetooth core (the M55C1 firmware's hal_intersys,
+ *    4 channels), set 0x140 / clear 0x144: bit 4+ch the M55's data
+ *    indication (the doorbell), bit 8+ch / 12+ch enable the receive and
+ *    "BT took the data" interrupts, bits 24+ch / 28+ch report them. The
+ *    BT side takes the data by dropping the indication, which raises
+ *    28+ch (cleared by writing bit ch to 0x144); 24+ch follows its
+ *    "data for the M55" line. The receive handler masks with bit 8+ch in
+ *    0x144 and unmasks once it has told the BT core it is done. Every
+ *    channel drives a "tx done" and a "rx" interrupt line (bt-irq ch and
+ *    4+ch).
  *  - inter-core interrupts between the two M55 cores, set 0x90 / clear
  *    0x94 (hal_m55c0_2_m55c1_best1700.o, built for either core). Per
  *    channel c (0, 1): bit 15+c M55C0 data for M55C1, bit 12+c M55C0 done
@@ -112,6 +122,8 @@ struct Best1700CmuInfo {
     hwaddr isys_mask_clr;
     hwaddr isys_rx_stat;
     hwaddr isys_tx_stat;
+    hwaddr bt_set;              /* 0: no mailbox to the Bluetooth core */
+    hwaddr bt_clr;
 };
 
 static const Best1700CmuPair cmu_pairs[] = {
@@ -150,6 +162,8 @@ static const Best1700CmuInfo cmu_info = {
     .isys_mask_clr = 0x1F8,
     .isys_rx_stat = 0x0EC,
     .isys_tx_stat = 0x224,
+    .bt_set = 0x140,
+    .bt_clr = 0x144,
 };
 
 static const Best1700CmuPair aoncmu_pairs[] = {
@@ -270,6 +284,75 @@ void best1700_cmu_link_intersys(Best1700CmuState *mcu, Best1700CmuState *bth)
     bth->isys_peer = mcu;
 }
 
+#define BT_IND(ch)      (1u << (4 + (ch)))
+#define BT_RX_EN(ch)    (1u << (8 + (ch)))
+#define BT_TX_EN(ch)    (1u << (12 + (ch)))
+#define BT_RX(ch)       (1u << (24 + (ch)))
+#define BT_TX_DONE(ch)  (1u << (28 + (ch)))
+#define BT_WORD_MASK    0xFFF0u
+
+static void bt_update(Best1700CmuState *s)
+{
+    int ch;
+
+    for (ch = 0; ch < BEST1700_BT_ISYS_CHANNELS; ch++) {
+        qemu_set_irq(s->bt_irq[ch], (s->bt_raw & BT_TX_DONE(ch)) &&
+                                    (s->bt_word & BT_TX_EN(ch)));
+        qemu_set_irq(s->bt_irq[BEST1700_BT_ISYS_CHANNELS + ch],
+                     (s->bt_raw & BT_RX(ch)) && (s->bt_word & BT_RX_EN(ch)));
+    }
+}
+
+/* the BT core took the M55's data on channel ch */
+static void bt_ind_ack(void *opaque, int ch, int level)
+{
+    Best1700CmuState *s = BEST1700_CMU(opaque);
+
+    if (level) {
+        s->bt_word &= ~BT_IND(ch);
+        s->bt_raw |= BT_TX_DONE(ch);
+        bt_update(s);
+    }
+}
+
+/* the BT core has data published for the M55 on channel ch (level) */
+static void bt_data(void *opaque, int ch, int level)
+{
+    Best1700CmuState *s = BEST1700_CMU(opaque);
+
+    if (level) {
+        s->bt_raw |= BT_RX(ch);
+    } else {
+        s->bt_raw &= ~BT_RX(ch);
+    }
+    bt_update(s);
+}
+
+static void bt_write(Best1700CmuState *s, bool set, uint32_t value)
+{
+    int ch;
+
+    if (set) {
+        uint32_t newly = value & ~s->bt_word;
+
+        s->bt_word |= value & BT_WORD_MASK;
+        bt_update(s);
+        for (ch = 0; ch < BEST1700_BT_ISYS_CHANNELS; ch++) {
+            if (newly & BT_IND(ch)) {
+                qemu_irq_pulse(s->bt_doorbell[ch]);
+            }
+        }
+    } else {
+        for (ch = 0; ch < BEST1700_BT_ISYS_CHANNELS; ch++) {
+            if (value & (1u << ch)) {
+                s->bt_raw &= ~BT_TX_DONE(ch);
+            }
+        }
+        s->bt_word &= ~(value & BT_WORD_MASK);
+        bt_update(s);
+    }
+}
+
 static void cmu_update_ipc(Best1700CmuState *s, uint32_t word)
 {
     int i;
@@ -288,8 +371,10 @@ static uint64_t best1700_cmu_read(void *opaque, hwaddr offset, unsigned size)
     bool is_set;
     int pair;
 
-    if (info->isys_set && (offset == info->isys_set ||
-                           offset == info->isys_clr)) {
+    if (info->bt_set && (offset == info->bt_set || offset == info->bt_clr)) {
+        v = s->bt_word | s->bt_raw;
+    } else if (info->isys_set && (offset == info->isys_set ||
+                                  offset == info->isys_clr)) {
         v = s->isys_word;
     } else if (info->isys_set && (offset == info->isys_mask_set ||
                                   offset == info->isys_mask_clr)) {
@@ -344,7 +429,9 @@ static void best1700_cmu_write(void *opaque, hwaddr offset, uint64_t value,
     qemu_log_mask(LOG_UNIMP, "%s: write off=0x%03x = 0x%08x\n",
                   info->name, (unsigned)offset, (unsigned)value);
 
-    if (info->isys_set && offset == info->isys_set) {
+    if (info->bt_set && (offset == info->bt_set || offset == info->bt_clr)) {
+        bt_write(s, offset == info->bt_set, value);
+    } else if (info->isys_set && offset == info->isys_set) {
         s->isys_word |= value;
         isys_update(s);
     } else if (info->isys_set && offset == info->isys_clr) {
@@ -423,6 +510,8 @@ static void best1700_cmu_reset(DeviceState *dev)
     s->cpu_held = false;
     s->isys_word = 0;
     s->isys_mask = 0;
+    s->bt_word = 0;
+    s->bt_raw = 0;
 }
 
 static void best1700_cmu_realize(DeviceState *dev, Error **errp)
@@ -443,6 +532,16 @@ static void best1700_cmu_realize(DeviceState *dev, Error **errp)
                                  BEST1700_ISYS_GROUPS);
         qdev_init_gpio_out_named(dev, s->isys_tx, "intersys-tx",
                                  BEST1700_ISYS_GROUPS);
+    }
+    if (cmu_info_of(s)->bt_set) {
+        qdev_init_gpio_out_named(dev, s->bt_doorbell, "bt-doorbell",
+                                 BEST1700_BT_ISYS_CHANNELS);
+        qdev_init_gpio_out_named(dev, s->bt_irq, "bt-irq",
+                                 2 * BEST1700_BT_ISYS_CHANNELS);
+        qdev_init_gpio_in_named(dev, bt_ind_ack, "bt-ind-ack",
+                                BEST1700_BT_ISYS_CHANNELS);
+        qdev_init_gpio_in_named(dev, bt_data, "bt2mcu",
+                                BEST1700_BT_ISYS_CHANNELS);
     }
 }
 
