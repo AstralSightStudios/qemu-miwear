@@ -46,6 +46,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/misc/bes_cmu.h"
 
@@ -76,6 +77,9 @@ static const BesSetClrPair cmu_setclr[] = {
 #define CMU_OFF_MEMSC0        0xC0
 #define CMU_OFF_ISIRQ_SET     0xA0
 #define CMU_OFF_ISIRQ_CLR     0xA4
+/* 自由运行计数器 @0x288：best1700 boot ROM 实测（dump 0x133b80）——
+ * 读初值后循环等待 (现值-初值) > 2 作延时。HAL 无引用，boot ROM 私有。 */
+#define CMU_OFF_COUNTER       0x288
 
 #define ISIRQ_IND(ch)         (1u << (2 + (ch)))
 #define ISIRQ_DONE_CLR(ch)    (1u << (ch))
@@ -200,7 +204,11 @@ static uint64_t bes_cmu_read(void *opaque, hwaddr offset, unsigned size)
     bool is_set;
     const BesSetClrPair *p;
 
-    if (offset == CMU_OFF_MEMSC_STATUS) {
+    if (offset == CMU_OFF_COUNTER) {
+        /* 自由运行 µs 计数器（best1700 boot ROM 延时源）：读值单调
+         * 递增即可，写入忽略。 */
+        v = (uint32_t)qemu_clock_get_us(QEMU_CLOCK_VIRTUAL);
+    } else if (offset == CMU_OFF_MEMSC_STATUS) {
         /* power-up completes instantly: aggregate MEMSC[i] bit0 */
         int i;
 
@@ -249,7 +257,7 @@ static void bes_cmu_write(void *opaque, hwaddr offset, uint64_t value,
     qemu_log_mask(LOG_UNIMP, "bes.cmu: write off=0x%03x = 0x%08x\n",
                   (unsigned)offset, (unsigned)value);
 
-    if (offset == CMU_OFF_MEMSC_STATUS) {
+    if (offset == CMU_OFF_MEMSC_STATUS || offset == CMU_OFF_COUNTER) {
         return;   /* read-only */
     }
     if (cmu_is_pulse(offset)) {
