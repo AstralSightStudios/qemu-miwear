@@ -32,12 +32,14 @@
  * vg_lite_path.c, vg_lite_image.c; the copy bundled with LVGL 9 is the
  * reference) and checked against command streams captured from the
  * firmware (LVGL 9 vg_lite draw unit):
- *   0x0A00 control: [1:0] 1 = rectangle, 2 = tessellated path;
+ *   0x0A00 control: [2:0] 1 = rectangle, 2 = tessellated path,
+ *          4 = clear rectangle (fill colour, no blending);
  *          [14:12] image mode (0 none: fill colour, 1 normal, 2 multiply
  *          by colour, 3 stencil, 6 recolour); [11:8] blend (1 src-over,
  *          2 dst-over, 3 src-in, 4 dst-in, 5 multiply, 6 screen, 7 darken,
  *          8 lighten, 9 additive, 10 subtract); bit 15 transparent
- *          border; [25:24] paint type (3 = pattern); bit 28 premultiply
+ *          border; [25:24] paint type (1 linear gradient, 2 radial
+ *          gradient, 3 pattern); bit 28 premultiply
  *          the input colour (non-premultiplied target)
  *   0x0A02 colour, ABGR8888
  *   0x0A10 target format ([3:0] format, [5:4] component order),
@@ -53,6 +55,16 @@
  *          stride, 0x0A2F width | height << 16
  *   0x0A04-0x0A09, 0x0A24, 0x0A26, 0x0A28, 0x0A2A, 0x0A2E pattern paint
  *          image (affine coordinate generator)
+ *   gradients reuse the paint image as the colour ramp (vg_lite_update_
+ *          linear_grad / _radial_grad: texel i holds position
+ *          i / (width - 1)) and the generator states as coefficients
+ *          (float) of the ramp position g at pixel (x, y):
+ *          linear  g = c + x X + y Y   (c 0x0A04, X 0x0A06, Y 0x0A08)
+ *          radial  g = c + x X + y Y + sqrt(r), r = rc + x rX + y rY
+ *                      + x^2 rXX + y^2 rYY + x y rXY   (rc 0x0A05,
+ *                      rX 0x0A07, rY 0x0A09, rXX 0x0A03, rYY 0x0A0A,
+ *                      rXY 0x0A0B); the paint image tiling spreads g
+ *          outside 0..1
  *   0x0A34 tessellation control: bit 24 enable, [21:20] coordinate format
  *          (s8 / s16 / s32 / fp32), [1:0] quality (anti-aliasing), bit 4
  *          even-odd fill; 0x0A39 / 0x0A3A tessellation window
@@ -102,7 +114,10 @@
 /* state registers (offset from 0x0A00) */
 #define ST_CONTROL          0x00
 #define ST_COLOR            0x02
+#define ST_GRAD_RXX         0x03
 #define ST_PAINT_C0         0x04    /* .. 0x09: c0 c1 x0 x1 y0 y1 */
+#define ST_GRAD_RYY         0x0A
+#define ST_GRAD_RXY         0x0B
 #define ST_TARGET_CONFIG    0x10
 #define ST_TARGET_ADDR      0x11
 #define ST_TARGET_STRIDE    0x12
@@ -131,7 +146,7 @@
 #define ST_CLUT16           0xA0
 #define ST_CLUT256          0x100
 
-#define CTRL_OP(c)          ((c) & 3)
+#define CTRL_OP(c)          ((c) & 7)
 #define CTRL_IMAGE_MODE(c)  (((c) >> 12) & 7)
 #define CTRL_BLEND(c)       (((c) >> 8) & 0xF)
 #define CTRL_PAINT(c)       (((c) >> 24) & 3)
@@ -141,6 +156,8 @@
 #define PATH_TESS_ENABLE    (1u << 24)
 #define PATH_EVEN_ODD       (1u << 4)
 
+enum { OP_RECT = 1, OP_CLEAR = 4 };
+enum { PAINT_COLOR, PAINT_LINEAR, PAINT_RADIAL, PAINT_PATTERN };
 enum { IM_NONE = 0, IM_NORMAL = 1, IM_MULTIPLY = 2, IM_STENCIL = 3,
        IM_RECOLOR = 6 };
 enum { TILE_COLOR, TILE_PAD, TILE_REPEAT, TILE_REFLECT };
@@ -639,6 +656,30 @@ static void vgl_sample(VglSampler *sm, int x, int y, int c[4])
     }
 }
 
+/* gradient colour ramp: image row 0, texel i holding position i / (w - 1) */
+static void vgl_ramp(VglSampler *sm, double g, int c[4])
+{
+    float s;
+    int i0, wx, t0[4], t1[4], k;
+
+    if (!isfinite(g) || (sm->tile == TILE_COLOR && (g < 0.0 || g > 1.0))) {
+        memcpy(c, sm->border, sizeof(sm->border));
+        return;
+    }
+    s = g * (sm->w - 1);
+    if (sm->filter == 0) {
+        vgl_texel(sm, (int)floorf(s + 0.5f), 0, c);
+        return;
+    }
+    i0 = (int)floorf(s);
+    wx = (int)((s - i0) * 256.0f);
+    vgl_texel(sm, i0, 0, t0);
+    vgl_texel(sm, i0 + 1, 0, t1);
+    for (k = 0; k < 4; k++) {
+        c[k] = (t0[k] * (256 - wx) + t1[k] * wx + 128) >> 8;
+    }
+}
+
 /* ---- pixel engine ---- */
 
 typedef struct {
@@ -654,6 +695,7 @@ typedef struct {
     int win_y0;                 /* first row mapped in mem */
     bool use_image, use_paint;
     VglSampler image, pattern;
+    double grad[9];             /* c X Y rc rX rY rXX rYY rXY */
 } VglPE;
 
 static int vgl_mul(int a, int b)
@@ -665,6 +707,19 @@ static void vgl_paint(VglPE *pe, int x, int y, int p[4])
 {
     int t[4], k;
 
+    if (pe->use_paint && pe->paint != PAINT_PATTERN) {
+        const double *g = pe->grad;
+        double pos = g[0] + g[1] * x + g[2] * y;
+
+        if (pe->paint == PAINT_RADIAL) {
+            double r = g[3] + g[4] * x + g[5] * y + g[6] * x * x +
+                       g[7] * y * y + g[8] * x * y;
+
+            pos += sqrt(MAX(r, 0.0));
+        }
+        vgl_ramp(&pe->pattern, pos, p);
+        return;
+    }
     if (pe->use_paint) {
         vgl_sample(&pe->pattern, x, y, p);
         if (pe->image_mode == IM_MULTIPLY) {
@@ -785,15 +840,23 @@ static bool vgl_pe_open(VsiVgliteState *s, VglPE *pe, int y0, int y1)
     }
     pe->clip_w = size & 0xFFFF;
     pe->clip_h = size >> 16;
-    if (pe->paint == 3) {
+    if (pe->paint != PAINT_COLOR) {
         pe->use_paint = vgl_sampler_open(s, &pe->pattern, true);
         if (!pe->use_paint) {
             return false;
         }
-    } else if (pe->paint) {
-        qemu_log_mask(LOG_UNIMP, "vsi.vglite: gradient paint %u not "
-                      "modelled\n", pe->paint);
-        return false;
+    }
+    if (pe->paint == PAINT_LINEAR || pe->paint == PAINT_RADIAL) {
+        static const uint8_t reg[9] = {
+            ST_PAINT_C0, ST_PAINT_C0 + 2, ST_PAINT_C0 + 4,
+            ST_PAINT_C0 + 1, ST_PAINT_C0 + 3, ST_PAINT_C0 + 5,
+            ST_GRAD_RXX, ST_GRAD_RYY, ST_GRAD_RXY,
+        };
+        int i;
+
+        for (i = 0; i < 9; i++) {
+            pe->grad[i] = vgl_stf(s, reg[i]);
+        }
     }
     if (pe->image_mode != IM_NONE && !pe->use_paint) {
         pe->use_image = vgl_sampler_open(s, &pe->image, false);
@@ -866,6 +929,7 @@ static void vgl_rect_op(VsiVgliteState *s, const uint8_t *d)
     int x0 = MAX(x, 0), y0 = MAX(y, 0);
     int x1 = MIN(x + w, (int)(size & 0xFFFF));
     int y1 = MIN(y + h, (int)(size >> 16));
+    unsigned op = CTRL_OP(vgl_st(s, ST_CONTROL));
     VglPE pe;
     int row;
 
@@ -873,7 +937,7 @@ static void vgl_rect_op(VsiVgliteState *s, const uint8_t *d)
     trace_vsi_vglite_rect(vgl_st(s, ST_CONTROL), vgl_st(s, ST_TARGET_CONFIG),
                           vgl_st(s, ST_TARGET_ADDR), vgl_st(s, ST_IMAGE_CONFIG),
                           vgl_st(s, ST_IMAGE_ADDR), x, y, w, h);
-    if (CTRL_OP(vgl_st(s, ST_CONTROL)) != 1 || x1 <= x0 || y1 <= y0) {
+    if ((op != OP_RECT && op != OP_CLEAR) || x1 <= x0 || y1 <= y0) {
         return;
     }
     if (!vgl_pe_open(s, &pe, y0, y1)) {
