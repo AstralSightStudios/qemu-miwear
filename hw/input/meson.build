@@ -11,3 +11,4 @@ system_ss.add(when: 'CONFIG_VIRTIO_INPUT_HOST', if_true: files('virtio-input-hos
 
 system_ss.add(when: 'CONFIG_LASIPS2', if_true: files('lasips2.c'))
 system_ss.add(when: 'CONFIG_ZINITIX_TS', if_true: files('zinitix_ts.c'))
+system_ss.add(when: 'CONFIG_GPIO_KEYS', if_true: files('gpio_keys.c'))

@@ -34,6 +34,9 @@ config VHOST_USER_INPUT
 config LASIPS2
     select PS2
 
+config GPIO_KEYS
+    bool
+
 config ZINITIX_TS
     bool
     depends on I2C
