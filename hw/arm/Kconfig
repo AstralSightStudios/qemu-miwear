@@ -50,6 +50,7 @@ config BEST1700
     select BEST1700_DSI
     select BEST1700_BTHROM
     select CW2215
+    select SGM25062
     select BES_GPIO
     select BES_ISPI
 

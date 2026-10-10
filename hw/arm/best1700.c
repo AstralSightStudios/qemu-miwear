@@ -720,7 +720,7 @@ static void best1700_cp_init(MachineState *machine, MemoryRegion *sysmem,
 
 /* BTHC0 与它的 NOR（见宏注释）；无 sensor 镜像则都不建 */
 static void best1700_bth_init(MachineState *machine, MemoryRegion *sysmem,
-                              Clock *sysclk)
+                              Clock *sysclk, const BesBoard *board)
 {
     static MemoryRegion window, view, bus, code, data, impdef;
     static Best1700Dwt dwt;
@@ -826,6 +826,52 @@ static void best1700_bth_init(MachineState *machine, MemoryRegion *sysmem,
                                qdev_get_gpio_in(bth, btimers[i].irq0));
             sysbus_connect_irq(SYS_BUS_DEVICE(tmr), 1,
                                qdev_get_gpio_in(bth, btimers[i].irq1));
+        }
+    }
+    /* BTH hal_i2c's i2c_desc table: five DesignWare controllers,
+     * each routed to the BTH NVIC (not the AP's I2C interrupts). */
+    {
+        static const uint32_t bases[] = {
+            0x50006000, 0x50007000, 0x50008000, 0x5000A000, 0x5000D000,
+        };
+        int i;
+
+        for (i = 0; i < ARRAY_SIZE(bases); i++) {
+            DeviceState *i2c = qdev_new(TYPE_BES_I2C);
+
+            sysbus_realize_and_unref(SYS_BUS_DEVICE(i2c), &error_fatal);
+            best1700_map(SYS_BUS_DEVICE(i2c), 0, bases[i]);
+            sysbus_connect_irq(SYS_BUS_DEVICE(i2c), 0,
+                               qdev_get_gpio_in(bth, 39 + i));
+            if (board->sensor_switch.type && board->sensor_switch.bus == i) {
+                I2CBus *bus = I2C_BUS(qdev_get_child_bus(i2c, "i2c"));
+
+                i2c_slave_create_simple(bus, board->sensor_switch.type,
+                                        board->sensor_switch.addr);
+            }
+        }
+    }
+
+    /* BTH hal_uart table (0x2c294204): UART0/1/2 in BTH subsystem */
+    {
+        static const struct {
+            uint32_t base;
+            int irq;
+        } buarts[] = {
+            { 0x5000B000, 22 },
+            { 0x5000C000, 24 },
+            { 0x50071000, 26 },
+        };
+        int i;
+
+        for (i = 0; i < ARRAY_SIZE(buarts); i++) {
+            DeviceState *uart = qdev_new("pl011");
+
+            qdev_connect_clock_in(uart, "clk", sysclk);
+            sysbus_realize_and_unref(SYS_BUS_DEVICE(uart), &error_fatal);
+            best1700_map(SYS_BUS_DEVICE(uart), 0, buarts[i].base);
+            sysbus_connect_irq(SYS_BUS_DEVICE(uart), 0,
+                               qdev_get_gpio_in(bth, buarts[i].irq));
         }
     }
     info_report("best1700: sensor hub %s (%zu bytes) in the BTH flash",
@@ -1043,7 +1089,7 @@ static void best1700_init(MachineState *machine, BesImage *img,
                          BEST1700_PERIPH_BASE);
     best1700_periph_init(sysmem, &g_bth_periph, "best1700.bth_periph",
                          BEST1700_BTH_PERIPH_BASE);
-    best1700_bth_init(machine, sysmem, sysclk);
+    best1700_bth_init(machine, sysmem, sysclk, board);
 
     /* ---- NOR flash 控制器（见宏注释），即上面的存储后端 ---- */
     best1700_map(SYS_BUS_DEVICE(fc), 0, BEST1700_FLASH_CTRL_BASE);

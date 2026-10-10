@@ -20,6 +20,7 @@
 #include "hw/input/gpio_keys.h"
 #include "hw/input/zinitix_ts.h"
 #include "hw/misc/cw2215.h"
+#include "hw/misc/sgm25062.h"
 #include "hw/misc/nci_nfcc.h"
 #include "system/reset.h"
 #include "target/arm/cpu-qom.h"
@@ -74,6 +75,9 @@ static const BesBoard bes_boards[] = {
         /* CW2215：AP 电池驱动 board_cw2215_initialize 在 I2C 3
          * （0x40076000）地址 0x64 读芯片 ID（实测 I2C 访问） */
         .gauge = { TYPE_CW2215, 3, 0x64, -1 },
+        /* sensor bes_switch_setup (0x0c09af0c): bus 2, address 0x18.
+         * Its bus number matches the BTH hal_i2c controller ID. */
+        .sensor_switch = { TYPE_SGM25062, 2, 0x18, -1 },
         .nfc_ven_gpio = -1,
     },
 };

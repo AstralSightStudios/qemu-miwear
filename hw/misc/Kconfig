@@ -220,6 +220,10 @@ config BEST1700_DSI
 config BEST1700_BTHROM
     bool
 
+config SGM25062
+    bool
+    depends on I2C
+
 config CW2215
     bool
     depends on I2C

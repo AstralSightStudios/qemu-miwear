@@ -55,6 +55,7 @@ typedef struct BesBoard {
     BesBoardI2C touch;
     BesBoardI2C nfc;
     BesBoardI2C gauge;          /* battery fuel gauge */
+    BesBoardI2C sensor_switch;  /* load switch on the sensor core's I2C */
     int nfc_ven_gpio;           /* NFC enable, SoC output */
 
     /* SPI NAND on the second flash controller; nand_blocks 0 = none */
