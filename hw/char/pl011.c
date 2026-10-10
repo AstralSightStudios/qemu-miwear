@@ -90,6 +90,9 @@ DeviceState *pl011_create(hwaddr addr, qemu_irq irq, Chardev *chr)
 #define CR_LBE      (1 << 7)
 #define CR_UARTEN   (1 << 0)
 
+/* UARTDMACR */
+#define DMACR_RXDMAE (1 << 0)
+
 /* Integer Baud Rate Divider, UARTIBRD */
 #define IBRD_MASK 0xffff
 
@@ -139,6 +142,18 @@ static void pl011_update(PL011State *s)
     for (i = 0; i < ARRAY_SIZE(s->irq); i++) {
         qemu_set_irq(s->irq[i], (flags & irqmask[i]) != 0);
     }
+}
+
+/*
+ * RX DMA: the request is asserted while the receive FIFO holds data and
+ * RXDMAE is set; the DMA controller drains the FIFO by reading UARTDR.
+ * Once it is empty the receive timeout interrupt is raised, which is how
+ * DMA-driven receivers (BES best1700 console) learn that the line went
+ * idle with a partially filled DMA buffer.
+ */
+static void pl011_update_dma_rx(PL011State *s)
+{
+    qemu_set_irq(s->dma_rx, (s->dmacr & DMACR_RXDMAE) && s->read_count > 0);
 }
 
 static bool pl011_loopback_enabled(PL011State *s)
@@ -194,6 +209,7 @@ static void pl011_fifo_rx_put(void *opaque, uint32_t value)
         s->int_level |= INT_RX;
         pl011_update(s);
     }
+    pl011_update_dma_rx(s);
 }
 
 static void pl011_loopback_tx(PL011State *s, uint32_t value)
@@ -264,12 +280,14 @@ static uint32_t pl011_read_rxdata(PL011State *s)
 {
     uint32_t c;
     unsigned fifo_depth = pl011_get_fifo_depth(s);
+    bool drained = false;
 
     s->flags &= ~PL011_FLAG_RXFF;
     c = s->read_fifo[s->read_pos];
     if (s->read_count > 0) {
         s->read_count--;
         s->read_pos = (s->read_pos + 1) & (fifo_depth - 1);
+        drained = s->read_count == 0;
     }
     if (s->read_count == 0) {
         s->flags |= PL011_FLAG_RXFE;
@@ -277,9 +295,13 @@ static uint32_t pl011_read_rxdata(PL011State *s)
     if (s->read_count == s->read_trigger - 1) {
         s->int_level &= ~INT_RX;
     }
+    if (drained && (s->dmacr & DMACR_RXDMAE)) {
+        s->int_level |= INT_RT;
+    }
     trace_pl011_read_fifo(s->read_count, fifo_depth);
     s->rsr = c >> 8;
     pl011_update(s);
+    pl011_update_dma_rx(s);
     qemu_chr_fe_accept_input(&s->chr);
     return c;
 }
@@ -493,9 +515,10 @@ static void pl011_write(void *opaque, hwaddr offset,
         break;
     case 18: /* UARTDMACR */
         s->dmacr = value;
-        if (value & 3) {
-            qemu_log_mask(LOG_UNIMP, "pl011: DMA not implemented\n");
+        if (value & ~DMACR_RXDMAE & 3) {
+            qemu_log_mask(LOG_UNIMP, "pl011: TX DMA not implemented\n");
         }
+        pl011_update_dma_rx(s);
         break;
     default:
         qemu_log_mask(LOG_GUEST_ERROR,
@@ -653,6 +676,7 @@ static void pl011_init(Object *obj)
     for (i = 0; i < ARRAY_SIZE(s->irq); i++) {
         sysbus_init_irq(sbd, &s->irq[i]);
     }
+    qdev_init_gpio_out_named(DEVICE(obj), &s->dma_rx, "dma-rx", 1);
 
     s->clk = qdev_init_clock_in(DEVICE(obj), "clk", pl011_clock_update, s,
                                 ClockUpdate);

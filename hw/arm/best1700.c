@@ -160,8 +160,10 @@
 /* 通用 DMA ×3（PL080 兼容 + BES 2D 扩展，bes_dma）：BSP hal_dma.o
  * .rodata.dma = {0x401A0000, 0x401A8000, 0x40260000}、irq_type =
  * {37, 38, 39}。q63 AP 的 UART0 控制台走 DMA0：TX 通道 DestPeriph=5、
- * RX 通道 SrcPeriph=4（实测通道配置 0xC940/0xD008）。PL011 无 DMA 请求
- * 线，其发送 FIFO 在模拟里永不满，TX 请求线恒为高。 */
+ * RX 通道 SrcPeriph=4（实测通道配置 0xC940/0xD008）。PL011 无 TX DMA
+ * 请求线，其发送 FIFO 在模拟里永不满，TX 请求线恒为高。RX 通道是 128
+ * 字节一段的循环链表，UART 只开接收超时中断（IMSC=0x40、DMACR=3）：DMA
+ * 读空 FIFO 后由超时中断告诉驱动取已收部分，PL011 的 "dma-rx" 即此。 */
 #define BEST1700_DMA0_BASE       0x401A0000
 #define BEST1700_DMA1_BASE       0x401A8000
 #define BEST1700_DMA2_BASE       0x40260000
@@ -169,6 +171,7 @@
 #define BEST1700_DMA1_IRQ        38
 #define BEST1700_DMA2_IRQ        39
 #define BEST1700_UART0_DMA_TX    5
+#define BEST1700_UART0_DMA_RX    4
 
 /* 总线主设备（DMA 等）看到的 TCM：DTCM AXI 视图 0x21000000 = CPU
  * 0x20000000（4MB）、ITCM AXI 视图 0x21800000 = CPU 0x0（2MB），BSP
@@ -299,6 +302,7 @@ static ARMv7MState *g_bth;      /* BTHC0，NULL = 无 sensor 镜像 */
 static DeviceState *g_aoncmu;
 static MemoryRegion g_periph, g_bth_periph;
 static DeviceState *g_irq26;
+static DeviceState *g_uart0;    /* 控制台，RX DMA 请求接 DMA0 */
 
 /*
  * IDAU：地址位 26 为安全别名（0x04xxxxxx ITCM、0x24xxxxxx SRAM、
@@ -1153,6 +1157,9 @@ static void best1700_init(MachineState *machine, BesImage *img,
             qdev_connect_clock_in(uart, "clk", sysclk);
             sysbus_realize_and_unref(SYS_BUS_DEVICE(uart), &error_fatal);
             best1700_map(SYS_BUS_DEVICE(uart), 0, uarts[i].base);
+            if (uarts[i].base == BEST1700_UART0_BASE) {
+                g_uart0 = uart;
+            }
             sysbus_connect_irq(SYS_BUS_DEVICE(uart), 0,
                                uarts[i].irq == BEST1700_EMMC_IRQ ?
                                qdev_get_gpio_in(g_irq26, 0) :
@@ -1340,6 +1347,8 @@ static void best1700_init(MachineState *machine, BesImage *img,
         }
         qemu_irq_raise(qdev_get_gpio_in_named(dma[0], "dma-req",
                                               BEST1700_UART0_DMA_TX));
+        qdev_connect_gpio_out_named(g_uart0, "dma-rx", 0,
+            qdev_get_gpio_in_named(dma[0], "dma-req", BEST1700_UART0_DMA_RX));
     }
 
     /* ---- MPC 寄存器（见 best1700_mpc_read 前注释） ---- */
