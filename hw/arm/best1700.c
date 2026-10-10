@@ -57,6 +57,7 @@
 #include "hw/misc/bes_lcdc.h"
 #include "hw/misc/bes_gpio.h"
 #include "hw/misc/best1700_dsi.h"
+#include "hw/misc/best1700_bthrom.h"
 #include "hw/core/or-irq.h"
 #include "hw/sd/sdhci.h"
 #include "hw/sd/sd.h"
@@ -89,7 +90,7 @@
  * LENGTH 0xB000-0x20（末 0x20 另作他用）；q63 AP 睡眠判定读
  * 0x23c06fdd（实测）。大小取 64KB（上界未实证）。 */
 #define BEST1700_AON_RAM_BASE    0x23C00000
-#define BEST1700_AON_RAM_SIZE    0x00010000
+#define BEST1700_AON_RAM_SIZE    0x00020000
 
 /* PSRAM：cached 0x18000000 / NC 0x38000000，64MB（BSP _best1000.lds
  * MEMORY：PSRAM ORIGIN 0x18000000、PSRAM_NC = PSRAM - 0x18000000 +
@@ -187,11 +188,34 @@
 #define BEST1700_M55C1_DTCM_BASE 0x21C00000
 #define BEST1700_M55C1_DTCM_SIZE 0x00400000
 
+/* BTH 子系统的 BTHC0 核（固件里的 "sensor" 核，跑 vela_sensor.bin：传感器、
+ * GNSS、算法，/misc 所在的 littlefs）。它有自己的 NOR，挂在 flash 控制器 1
+ * （寄存器 0x50140000）上，镜像就在这颗 NOR 的偏移 0 原地执行：
+ *  - AP 视角的 XIP 窗口 0x28000000（q63 TEE 的 flash 窗口表：控制器 0/1/2
+ *    → 0x30000000/0x28000000/0x34000000；AP 在此查 sensor 镜像头，
+ *    "subsys_check_boot_struct: boot_addr=0x28000000"）
+ *  - BTH 核视角：取指 0x0C000000、数据 0x2C000000（镜像入口跳 0x0c09d6c8，
+ *    .data 自 0x2c310d4c 复制到 0x23010228；栈在 BTH RAM 0x2315efe0）
+ * 容量：sensor 的 bes_chip_flash_init 断言 hal_norflash_get_size 为
+ * 0x800000（"Please change the FLASH_SIZE in common.mk"），MTD 分区
+ * bth_misc（256 字节块 0x7800 起 0x400 块，即 7.5MB 起 256KB）与
+ * bth_factory（0x7C00 起 0x10 块）也在 8MB 内，按 GD25LQ64（C8-60-17）
+ * 建模。镜像不由 AP 装载（AP 只装 cp 与 audio），真机由 BTH
+ * 自行从这颗 NOR 启动；模拟器在系统复位时直接从镜像入口放 BTH 核运行。 */
+#define BEST1700_BTH_FLASH_CTRL_BASE 0x50140000
+#define BEST1700_BTH_FLASH_BASE  0x28000000
+#define BEST1700_BTH_FLASH_SIZE  0x00800000
+#define BEST1700_BTH_CODE_BASE   0x0C000000
+#define BEST1700_BTH_DATA_BASE   0x2C000000
+#define BEST1700_BTH_ENTRY       0x10       /* 镜像头后的入口跳板 */
+
 /* 两颗 M55 间的中断（MCU_CMU 0x90/0x94 各位，见 best1700_cmu.c）：
  * hal_m55c0_2_m55c1_best1700.o 两核版本的 rx_irq_id = {88, 89}、
  * tx_irq_id = {91, 92}，即各核 NVIC 上同号：88+c 收到对方通道 c 的数据，
  * 91+c 对方已取走本方通道 c 的数据。 */
 #define BEST1700_IPC_RX_IRQ      88
+#define BEST1700_ISYS_RX_IRQ     96
+#define BEST1700_ISYS_TX_IRQ     94
 #define BEST1700_IPC_TX_IRQ      91
 
 /* PSRAM 控制器（MC v6 + PHY）：BSP hal_psram_v6.o 以 0x40320000 访问
@@ -270,6 +294,7 @@ static MemoryRegion g_bootvec;
 
 static ARMv7MState *g_armv7m;
 static ARMv7MState *g_cp;       /* M55C1 */
+static ARMv7MState *g_bth;      /* BTHC0，NULL = 无 sensor 镜像 */
 static DeviceState *g_aoncmu;
 static MemoryRegion g_periph, g_bth_periph;
 static DeviceState *g_irq26;
@@ -554,6 +579,14 @@ static void best1700_reset(MachineState *ms)
     unsigned i;
 
     cpu_reset(CPU(g_cp->cpu));          /* M55C1 等 AP 放核 */
+    if (g_bth) {
+        /* BTHC0 自 NOR 启动（见宏注释）：入口跳板，栈由复位处理自设 */
+        CPUARMState *benv = &g_bth->cpu->env;
+
+        cpu_reset(CPU(g_bth->cpu));
+        benv->regs[15] = BEST1700_BTH_CODE_BASE + BEST1700_BTH_ENTRY;
+        benv->thumb = true;
+    }
     cpu_reset(CPU(armv7m->cpu));
     /* 真机 BL2 已使能 FPU/MVE（CPACR.CP10/CP11）；模拟器从 AP entry
      * 直接启动缺了这一步，MVE 指令（0xFF 前缀）会 Undefined
@@ -683,6 +716,120 @@ static void best1700_cp_init(MachineState *machine, MemoryRegion *sysmem,
                                 BEST1700_M55_IMPDEF_BASE, &impdef);
     best1700_dwt_init(ARMV7M(cp), &dwt);
     g_cp = ARMV7M(cp);
+}
+
+/* BTHC0 与它的 NOR（见宏注释）；无 sensor 镜像则都不建 */
+static void best1700_bth_init(MachineState *machine, MemoryRegion *sysmem,
+                              Clock *sysclk)
+{
+    static MemoryRegion window, view, bus, code, data, impdef;
+    static Best1700Dwt dwt;
+    g_autofree char *path = bes_machine_sensor_image(machine);
+    g_autofree char *image = NULL;
+    gsize len;
+    GError *gerr = NULL;
+    DeviceState *fc, *bth, *rom;
+    MemoryRegion *storage;
+
+    if (!path) {
+        warn_report("best1700: no sensor hub image (vela_sensor.bin); "
+                    "the AP's /misc and sensors will not come up");
+        return;
+    }
+    if (!g_file_get_contents(path, &image, &len, &gerr)) {
+        error_report("best1700: %s", gerr->message);
+        exit(1);
+    }
+    if (len > BEST1700_BTH_FLASH_SIZE) {
+        error_report("best1700: %s is larger than the BTH flash", path);
+        exit(1);
+    }
+
+    fc = qdev_new(TYPE_BES_FLASH);
+    qdev_prop_set_uint32(fc, "size", BEST1700_BTH_FLASH_SIZE);
+    qdev_prop_set_uint32(fc, "jedec-id", 0xC86017);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(fc), &error_fatal);
+    memcpy(bes_flash_data(BES_FLASH(fc)), image, len);
+    best1700_map(SYS_BUS_DEVICE(fc), 0, BEST1700_BTH_FLASH_CTRL_BASE);
+    storage = bes_flash_storage(BES_FLASH(fc));
+    memory_region_init_alias(&window, NULL, "best1700.bth_flash", storage, 0,
+                             BEST1700_BTH_FLASH_SIZE);
+    memory_region_add_subregion(sysmem, BEST1700_BTH_FLASH_BASE, &window);
+
+    /* 本核视图：总线 + flash 的取指/数据别名 */
+    memory_region_init(&view, NULL, "best1700.bthc0", 0x100000000ULL);
+    memory_region_init_alias(&bus, NULL, "best1700.bthc0_bus", sysmem, 0,
+                             0x100000000ULL);
+    memory_region_add_subregion_overlap(&view, 0, &bus, 0);
+    memory_region_init_alias(&code, NULL, "best1700.bth_flash_code", storage,
+                             0, BEST1700_BTH_FLASH_SIZE);
+    memory_region_add_subregion_overlap(&view, BEST1700_BTH_CODE_BASE, &code,
+                                        1);
+    memory_region_init_alias(&data, NULL, "best1700.bth_flash_data", storage,
+                             0, BEST1700_BTH_FLASH_SIZE);
+    memory_region_add_subregion_overlap(&view, BEST1700_BTH_DATA_BASE, &data,
+                                        1);
+
+    /* BTH 掩膜 ROM 的替身（best1700_bthrom.c），只在本核视图里；其
+     * hypercall 窗口放在外设区（固件开 MPU 后 ROM 之外的空洞不可访问） */
+    rom = qdev_new(TYPE_BEST1700_BTHROM);
+    object_property_set_link(OBJECT(rom), "memory", OBJECT(&view),
+                             &error_fatal);
+    qdev_prop_set_uint32(rom, "flash-size", BEST1700_BTH_FLASH_SIZE);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(rom), &error_fatal);
+    memory_region_add_subregion_overlap(&view, 0x03000000,
+        sysbus_mmio_get_region(SYS_BUS_DEVICE(rom), 0), 1);
+    memory_region_add_subregion_overlap(&view, 0x5FFFF000,
+        sysbus_mmio_get_region(SYS_BUS_DEVICE(rom), 1), 1);
+
+    bth = qdev_new(TYPE_ARMV7M);
+    object_property_add_child(OBJECT(machine), "armv7m-bth", OBJECT(bth));
+    qdev_prop_set_uint32(bth, "num-irq", BEST1700_NUM_IRQ);
+    qdev_prop_set_uint8(bth, "num-prio-bits", BEST1700_NUM_PRIO_BITS);
+    qdev_prop_set_string(bth, "cpu-type", ARM_CPU_TYPE_NAME("cortex-m55"));
+    qdev_connect_clock_in(bth, "cpuclk", sysclk);
+    qdev_connect_clock_in(bth, "refclk", sysclk);
+    object_property_set_link(OBJECT(bth), "memory", OBJECT(&view),
+                             &error_fatal);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(bth), &error_fatal);
+    memory_region_init_io(&impdef, NULL, &best1700_m55_impdef_ops, NULL,
+                          "best1700.bthc0-impdef", 0x1000);
+    memory_region_add_subregion(&ARMV7M(bth)->container,
+                                BEST1700_M55_IMPDEF_BASE, &impdef);
+    best1700_dwt_init(ARMV7M(bth), &dwt);
+    g_bth = ARMV7M(bth);
+
+    /* BTH 的 SP804 ×3：sensor 的 hal_timer_setup 自 RAM 表（0x230034e0）
+     * 取基址 {0x4008B000, 0x50002000, 0x50003000}，自 0x2c293fbc 取中断
+     * {19, 20}, {23, 24}, {25, 26}。0 号在 AON 区、走慢时钟，hwtimer
+     * （tickless 闹钟）用其子定时器 0；1、2 号时钟未查实，按快时钟。 */
+    {
+        static const struct {
+            uint32_t base, freq;
+            int irq0, irq1;
+        } btimers[] = {
+            { 0x4008B000, BEST1700_SLOW_TIMER_FRQ, 19, 20 },
+            { 0x50002000, BEST1700_FAST_TIMER_FRQ, 23, 24 },
+            { 0x50003000, BEST1700_FAST_TIMER_FRQ, 25, 26 },
+        };
+        int i;
+
+        for (i = 0; i < ARRAY_SIZE(btimers); i++) {
+            DeviceState *tmr = qdev_new("sp804");
+
+            qdev_prop_set_uint32(tmr, "freq0", btimers[i].freq);
+            qdev_prop_set_uint32(tmr, "freq1", btimers[i].freq);
+            qdev_prop_set_bit(tmr, "split-irq", true);
+            sysbus_realize_and_unref(SYS_BUS_DEVICE(tmr), &error_fatal);
+            best1700_map(SYS_BUS_DEVICE(tmr), 0, btimers[i].base);
+            sysbus_connect_irq(SYS_BUS_DEVICE(tmr), 0,
+                               qdev_get_gpio_in(bth, btimers[i].irq0));
+            sysbus_connect_irq(SYS_BUS_DEVICE(tmr), 1,
+                               qdev_get_gpio_in(bth, btimers[i].irq1));
+        }
+    }
+    info_report("best1700: sensor hub %s (%zu bytes) in the BTH flash",
+                path, (size_t)len);
 }
 
 static void best1700_init(MachineState *machine, BesImage *img,
@@ -896,6 +1043,7 @@ static void best1700_init(MachineState *machine, BesImage *img,
                          BEST1700_PERIPH_BASE);
     best1700_periph_init(sysmem, &g_bth_periph, "best1700.bth_periph",
                          BEST1700_BTH_PERIPH_BASE);
+    best1700_bth_init(machine, sysmem, sysclk);
 
     /* ---- NOR flash 控制器（见宏注释），即上面的存储后端 ---- */
     best1700_map(SYS_BUS_DEVICE(fc), 0, BEST1700_FLASH_CTRL_BASE);
@@ -1160,6 +1308,32 @@ static void best1700_init(MachineState *machine, BesImage *img,
         qdev_connect_gpio_out_named(aoncmu, "cpu-run", 0,
                                     qemu_allocate_irq(best1700_cp_run,
                                                       NULL, 0));
+
+        /* BTH_CMU 的 intersys 半边（见 best1700_cmu.c）：组 0/1 为 M55C0
+         * 通道 0/1，组 2/3 为 M55C1 通道 0/1。M55 两核的 NVIC 号相同：
+         * hal_m55c0_2_bthc0 / hal_m55c1_2_bthc0 的 rx_irq_id = {96, 97}、
+         * tx_irq_id = {94, 95}；BTH 侧取自 sensor 固件的 IPC 配置：
+         * M55C0 组 rx {73, 74} / tx {65, 66}，M55C1 组 rx {75, 76} /
+         * tx {67, 68}。 */
+        DeviceState *bthcmu = qdev_new(TYPE_BEST1700_BTHCMU);
+
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(bthcmu), &error_fatal);
+        best1700_map(SYS_BUS_DEVICE(bthcmu), 0, BEST1700_BTH_PERIPH_BASE);
+        best1700_cmu_link_intersys(BEST1700_CMU(cmu), BEST1700_CMU(bthcmu));
+        for (c = 0; c < 4; c++) {
+            DeviceState *m55 = c < 2 ? armv7m : DEVICE(g_cp);
+
+            qdev_connect_gpio_out_named(cmu, "intersys-rx", c,
+                qdev_get_gpio_in(m55, BEST1700_ISYS_RX_IRQ + c % 2));
+            qdev_connect_gpio_out_named(cmu, "intersys-tx", c,
+                qdev_get_gpio_in(m55, BEST1700_ISYS_TX_IRQ + c % 2));
+            if (g_bth) {
+                qdev_connect_gpio_out_named(bthcmu, "intersys-rx", c,
+                    qdev_get_gpio_in(DEVICE(g_bth), 73 + c));
+                qdev_connect_gpio_out_named(bthcmu, "intersys-tx", c,
+                    qdev_get_gpio_in(DEVICE(g_bth), 65 + c));
+            }
+        }
     }
 
     /* ---- ISPI 主控 @0x4000A000（q63 实证，见上方宏注释） ---- */

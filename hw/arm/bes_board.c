@@ -303,22 +303,46 @@ static void bes_set_tee_image(Object *obj, const char *val, Error **errp)
     BES_MACHINE(obj)->tee_image = g_strdup(val);
 }
 
-char *bes_machine_tee_image(MachineState *ms)
+static char *bes_get_sensor_image(Object *obj, Error **errp)
 {
-    BesMachineState *bms = BES_MACHINE(ms);
+    return g_strdup(BES_MACHINE(obj)->sensor_image);
+}
+
+static void bes_set_sensor_image(Object *obj, const char *val, Error **errp)
+{
+    g_free(BES_MACHINE(obj)->sensor_image);
+    BES_MACHINE(obj)->sensor_image = g_strdup(val);
+}
+
+/* the image named by a property, else <name> next to -kernel; "" = none */
+static char *bes_machine_sibling_image(MachineState *ms, const char *prop,
+                                       const char *name)
+{
     g_autofree char *dir = NULL;
     char *path;
 
-    if (bms->tee_image) {
-        return *bms->tee_image ? g_strdup(bms->tee_image) : NULL;
+    if (prop) {
+        return *prop ? g_strdup(prop) : NULL;
     }
     dir = g_path_get_dirname(ms->kernel_filename);
-    path = g_build_filename(dir, "vela_tee.bin", NULL);
+    path = g_build_filename(dir, name, NULL);
     if (g_file_test(path, G_FILE_TEST_IS_REGULAR)) {
         return path;
     }
     g_free(path);
     return NULL;
+}
+
+char *bes_machine_sensor_image(MachineState *ms)
+{
+    return bes_machine_sibling_image(ms, BES_MACHINE(ms)->sensor_image,
+                                     "vela_sensor.bin");
+}
+
+char *bes_machine_tee_image(MachineState *ms)
+{
+    return bes_machine_sibling_image(ms, BES_MACHINE(ms)->tee_image,
+                                     "vela_tee.bin");
 }
 
 static void bes_machine_finalize(Object *obj)
@@ -329,6 +353,7 @@ static void bes_machine_finalize(Object *obj)
     g_free(bms->flash_image);
     g_free(bms->nand_image);
     g_free(bms->tee_image);
+    g_free(bms->sensor_image);
 }
 
 static void bes_machine_class_init(ObjectClass *oc, const void *data)
@@ -338,11 +363,12 @@ static void bes_machine_class_init(ObjectClass *oc, const void *data)
     mc->init = bes_machine_init;
     mc->reset = bes_machine_reset;
     mc->ignore_memory_transaction_failures = true;
-    /* best1700 runs a second M55 (M55C1); the vCPU count sizes MTTCG's
-     * contexts. best1503 creates one CPU and leaves the second unused. */
-    mc->default_cpus = 2;
+    /* best1700 also runs its second M55 (M55C1) and the BTH core; the
+     * vCPU count sizes MTTCG's contexts. best1503 creates one CPU and
+     * leaves the others unused. */
+    mc->default_cpus = 3;
     mc->min_cpus = 1;
-    mc->max_cpus = 2;
+    mc->max_cpus = 3;
 
     object_class_property_add_str(oc, "profile", bes_get_profile,
                                   bes_set_profile);
@@ -373,6 +399,14 @@ static void bes_machine_class_init(ObjectClass *oc, const void *data)
                                           "one; default: vela_tee.bin next "
                                           "to the -kernel firmware, empty "
                                           "for none");
+    object_class_property_add_str(oc, "sensor-image", bes_get_sensor_image,
+                                  bes_set_sensor_image);
+    object_class_property_set_description(oc, "sensor-image",
+                                          "sensor hub image, executed in "
+                                          "place from the BTH NOR flash on "
+                                          "chips that have one; default: "
+                                          "vela_sensor.bin next to the "
+                                          "-kernel firmware, empty for none");
 }
 
 static void miwear_machine_class_init(ObjectClass *oc, const void *data)

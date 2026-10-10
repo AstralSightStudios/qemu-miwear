@@ -80,7 +80,7 @@ void bes_soc_register(const BesSoc *soc);
 /*
  * Machines: "miwear" takes the chip from the firmware, "best1503" and
  * "best1700" insist on theirs. All take profile=, flash-image=,
- * nand-image= and tee-image=.
+ * nand-image=, tee-image= and sensor-image=.
  */
 #define TYPE_BES_MACHINE MACHINE_TYPE_NAME("bes-vela")
 OBJECT_DECLARE_TYPE(BesMachineState, BesMachineClass, BES_MACHINE)
@@ -92,6 +92,7 @@ struct BesMachineState {
     char *flash_image;
     char *nand_image;
     char *tee_image;
+    char *sensor_image;
 
     const BesSoc *soc;
 };
@@ -105,6 +106,10 @@ struct BesMachineClass {
 /* the TEE image to boot (tee-image=, else a vela_tee.bin next to the
  * -kernel firmware), NULL for none; g_free() it */
 char *bes_machine_tee_image(MachineState *ms);
+
+/* the sensor hub image (sensor-image=, else a vela_sensor.bin next to the
+ * -kernel firmware), NULL for none; g_free() it */
+char *bes_machine_sensor_image(MachineState *ms);
 
 /* the board's push buttons as a gpio-keys device, NULL if it has none */
 DeviceState *bes_board_create_keys(const BesBoard *board);
