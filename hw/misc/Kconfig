@@ -210,6 +210,9 @@ config BES_PMU
 config BES_ISPI
     bool
 
+config BEST1700_CMU
+    bool
+
 config BES_I2C
     bool
     select I2C
