@@ -23,7 +23,9 @@
  *    return at once
  *  - the idle loop's sleep: the check that picks a sleep mode returns 0
  *    and the sleep itself is a WFI
- *  - hal_norflash_get_size: 8 MB (bes_chip_flash_init asserts that size)
+ *  - hal_norflash_get_size: 8 MB (bes_chip_flash_init asserts that size);
+ *    the geometry query: 64 KB blocks, 4 KB sectors, 256-byte pages
+ *    (bes_flash.c asserts the last two)
  *  - hal_cmu_get_crystal_freq: 24 MHz; the sleep timer calibration
  *    (crystal cycles against slow ticks) reports the nominal ratio
  * The rest are initialisation helpers whose return values the firmware
@@ -65,7 +67,7 @@ typedef enum {
 enum {
     F_MEMSET = 1, F_MEMCHR, F_MEMCPY, F_MEMMOVE, F_STRCMP, F_STRLEN,
     F_TRACE, F_MS_TO_TICKS, F_US_TO_TICKS, F_DELAY, F_FLASH_SIZE,
-    F_XTAL_HZ, F_SYSTICK_HZ, F_SLOW_CALIB,
+    F_XTAL_HZ, F_SYSTICK_HZ, F_SLOW_CALIB, F_FLASH_GEOMETRY,
     F_OTHER,
 };
 
@@ -100,7 +102,7 @@ static const RomEntry rom_entries[] = {
     { 0x03001194, ROM_HC, F_FLASH_SIZE, "hal_norflash_get_size" },
     /* not identified yet: logged, return 0 */
     { 0x03000504, ROM_HC, F_OTHER, "rom_03000504" },
-    { 0x03000d4c, ROM_HC, F_OTHER, "rom_03000d4c" },
+    { 0x03000d4c, ROM_HC, F_FLASH_GEOMETRY, "hal_norflash_get_geometry" },
     { 0x0300113c, ROM_HC, F_OTHER, "rom_0300113c" },
     { 0x03001158, ROM_HC, F_OTHER, "rom_03001158" },
     { 0x030011a4, ROM_HC, F_OTHER, "hal_norflash_open" },
@@ -481,6 +483,18 @@ static void bthrom_call(Best1700BthRomState *s, unsigned idx)
     case F_FLASH_SIZE:
         ret = s->flash_size;
         break;
+    case F_FLASH_GEOMETRY: {
+        /* (id, *total, *block, *sector, *page); bes_flash.c asserts a
+         * 256-byte page and a 4 KB sector */
+        uint32_t geo[4] = { s->flash_size, 0x10000, 0x1000, 0x100 };
+        uint32_t page_ptr = g_ld32(s, a + 16);
+
+        g_write(s, r1, &geo[0], 4);
+        g_write(s, r2, &geo[1], 4);
+        g_write(s, g_ld32(s, a + 12), &geo[2], 4);
+        g_write(s, page_ptr, &geo[3], 4);
+        break;
+    }
     case F_XTAL_HZ:
         ret = XTAL_HZ;
         break;
