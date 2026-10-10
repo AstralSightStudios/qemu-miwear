@@ -33,6 +33,7 @@
 #include "qemu/error-report.h"
 #include "qemu/module.h"
 #include "qemu/units.h"
+#include "qemu/timer.h"
 #include "hw/core/boards.h"
 #include "hw/core/cpu.h"
 #include "hw/core/qdev-properties.h"
@@ -40,6 +41,8 @@
 #include "hw/arm/armv7m.h"
 #include "target/arm/cpu.h"
 #include "target/arm/tcg/idau.h"
+#include "target/arm/arm-powerctl.h"
+#include "target/arm/multiprocessing.h"
 #include "hw/arm/boot.h"
 #include "hw/arm/bes_board.h"
 #include "hw/misc/bes_image.h"
@@ -171,6 +174,25 @@
 #define BEST1700_DTCM_AXI_BASE   0x21000000
 #define BEST1700_ITCM_AXI_BASE   0x21800000
 
+/* 第二颗 M55（M55C1，即固件里的 "cp"）：跑 cp_image 分区的 vela_cp.bin
+ * （蓝牙 host 服务 + WiFi 协议栈，见其字符串）。本核 ITCM（0x0 起 2MB）、
+ * DTCM（0x20000000 起 4MB）在总线上位于 0x20E00000 / 0x21C00000（BSP
+ * hal_maincmu_best1700.o dsp_m55c1_addr_cpu_to_dev），其余地址与 AP 同一
+ * 总线。AP 经 AON_CMU 放核（best1700_cmu.c）：q63 实测先把 {SP 0x200dffa0,
+ * 入口 0x3b300011} 写到总线 0x21cdff00，0xB4 = 0x200dff00（本核视角），
+ * 再置/清 0x1A4 bit1。 */
+#define BEST1700_M55C1_ITCM_BASE 0x20E00000
+#define BEST1700_M55C1_ITCM_SIZE 0x00200000
+#define BEST1700_M55C1_DTCM_BASE 0x21C00000
+#define BEST1700_M55C1_DTCM_SIZE 0x00400000
+
+/* 两颗 M55 间的中断（MCU_CMU 0x90/0x94 各位，见 best1700_cmu.c）：
+ * hal_m55c0_2_m55c1_best1700.o 两核版本的 rx_irq_id = {88, 89}、
+ * tx_irq_id = {91, 92}，即各核 NVIC 上同号：88+c 收到对方通道 c 的数据，
+ * 91+c 对方已取走本方通道 c 的数据。 */
+#define BEST1700_IPC_RX_IRQ      88
+#define BEST1700_IPC_TX_IRQ      91
+
 /* PSRAM 控制器（MC v6 + PHY）：BSP hal_psram_v6.o 以 0x40320000 访问
  * MGR 命令引擎、以 0x40328000 访问 PHY（q63 TEE 同，实测） */
 #define BEST1700_PSRAM_MC_BASE   0x40320000
@@ -219,6 +241,15 @@
 #define BEST1700_TIMER01_IRQ     59
 #define BEST1700_TIMER10_IRQ     72
 #define BEST1700_TIMER11_IRQ     73
+/* M55C1 自己的一对 SP804：vela_cp.bin 的 hal_timer 基址表 {0x40084000,
+ * 0x40003000}（0x1b304b48）、irq_num = {60, 61, 68, 69}（0x1b304a00），
+ * 与 BSP apc1 版 hal_timer.o 相同；中断只接 M55C1 的 NVIC。 */
+#define BEST1700_CP_TIMER0_BASE  0x40084000
+#define BEST1700_CP_TIMER1_BASE  0x40003000
+#define BEST1700_CP_TIMER00_IRQ  60
+#define BEST1700_CP_TIMER01_IRQ  61
+#define BEST1700_CP_TIMER10_IRQ  68
+#define BEST1700_CP_TIMER11_IRQ  69
 #define BEST1700_SLOW_TIMER_FRQ  16000
 #define BEST1700_FAST_TIMER_FRQ  6000000
 
@@ -237,6 +268,8 @@ static BesImage *g_tee;         /* 安全世界镜像，NULL = 无 */
 static MemoryRegion g_bootvec;
 
 static ARMv7MState *g_armv7m;
+static ARMv7MState *g_cp;       /* M55C1 */
+static DeviceState *g_aoncmu;
 static MemoryRegion g_periph, g_bth_periph;
 static DeviceState *g_irq26;
 
@@ -408,6 +441,69 @@ static const MemoryRegionOps best1700_m55_impdef_ops = {
     .impl.max_access_size = 4,
 };
 
+/*
+ * DWT 周期计数器（0xE0001000，CTRL +0x0 / CYCCNT +0x4）：QEMU 的 M 核
+ * 未建模 DWT（读落到 PPB 默认区为 0）。M55C1 的 vela_cp.bin 启动即以
+ * CYCCNT 做忙等延时，读 0 则永远等不到（实测 PC 0x100bf4 轮询
+ * 0xE0001004）。按 CPU 时钟由虚拟时间推出计数，写 CYCCNT 改基准；
+ * CTRL 为普通存储（NOCYCCNT 位 25 读 0，即有周期计数器）。
+ */
+typedef struct Best1700Dwt {
+    MemoryRegion mr;
+    uint32_t ctrl;
+    uint32_t base;              /* CYCCNT = cycles(now) + base */
+} Best1700Dwt;
+
+static uint32_t best1700_dwt_cycles(void)
+{
+    return muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                    BEST1700_SYSCLK_FRQ, NANOSECONDS_PER_SECOND);
+}
+
+static uint64_t best1700_dwt_read(void *opaque, hwaddr offset, unsigned size)
+{
+    Best1700Dwt *d = opaque;
+
+    switch (offset) {
+    case 0x0:
+        return d->ctrl;
+    case 0x4:
+        return best1700_dwt_cycles() + d->base;
+    default:
+        return 0;
+    }
+}
+
+static void best1700_dwt_write(void *opaque, hwaddr offset, uint64_t value,
+                               unsigned size)
+{
+    Best1700Dwt *d = opaque;
+
+    switch (offset) {
+    case 0x0:
+        d->ctrl = value;
+        break;
+    case 0x4:
+        d->base = value - best1700_dwt_cycles();
+        break;
+    }
+}
+
+static const MemoryRegionOps best1700_dwt_ops = {
+    .read = best1700_dwt_read,
+    .write = best1700_dwt_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .impl.min_access_size = 4,
+    .impl.max_access_size = 4,
+};
+
+static void best1700_dwt_init(ARMv7MState *armv7m, Best1700Dwt *d)
+{
+    memory_region_init_io(&d->mr, NULL, &best1700_dwt_ops, d,
+                          "best1700.dwt", 0x1000);
+    memory_region_add_subregion(&armv7m->container, 0xE0001000, &d->mr);
+}
+
 /* 外设挂进外设容器（容器同时出现在 NS 与安全别名地址） */
 static void best1700_map(SysBusDevice *sbd, int n, hwaddr addr)
 {
@@ -456,6 +552,7 @@ static void best1700_reset(MachineState *ms)
     uint32_t secure_msp;
     unsigned i;
 
+    cpu_reset(CPU(g_cp->cpu));          /* M55C1 等 AP 放核 */
     cpu_reset(CPU(armv7m->cpu));
     /* 真机 BL2 已使能 FPU/MVE（CPACR.CP10/CP11）；模拟器从 AP entry
      * 直接启动缺了这一步，MVE 指令（0xFF 前缀）会 Undefined
@@ -525,6 +622,68 @@ static void best1700_preload_data(const BesImage *im, uint8_t *flash,
            flash + (im->data_lma - im->flash_base), len);
 }
 
+/* AON_CMU 放核/扣核（见 M55C1 宏注释）：向量表地址为本核视角 */
+static void best1700_cp_run(void *opaque, int n, int level)
+{
+    ARMCPU *cpu = g_cp->cpu;
+    uint64_t id = arm_cpu_mp_affinity(cpu);
+
+    if (level) {
+        cpu->init_svtor = BEST1700_CMU(g_aoncmu)->regs[
+            BEST1700_AONCMU_M55C1_VTOR / 4] & ~0x7fu;
+        arm_set_cpu_on_and_reset(id);
+    } else if (cpu->power_state != PSCI_OFF) {
+        arm_set_cpu_off(id);
+    }
+}
+
+static void best1700_cp_init(MachineState *machine, MemoryRegion *sysmem,
+                             Clock *sysclk)
+{
+    static MemoryRegion itcm, dtcm, view, bus, itcm_local, dtcm_local;
+    static MemoryRegion impdef;
+    static Best1700Dwt dwt;
+    DeviceState *cp;
+
+    memory_region_init_ram(&itcm, NULL, "best1700.m55c1_itcm",
+                           BEST1700_M55C1_ITCM_SIZE, &error_fatal);
+    memory_region_add_subregion(sysmem, BEST1700_M55C1_ITCM_BASE, &itcm);
+    memory_region_init_ram(&dtcm, NULL, "best1700.m55c1_dtcm",
+                           BEST1700_M55C1_DTCM_SIZE, &error_fatal);
+    memory_region_add_subregion(sysmem, BEST1700_M55C1_DTCM_BASE, &dtcm);
+
+    /* 本核视图：总线 + 自己的 TCM 盖在 0x0 / 0x20000000 */
+    memory_region_init(&view, NULL, "best1700.m55c1", 0x100000000ULL);
+    memory_region_init_alias(&bus, NULL, "best1700.m55c1_bus", sysmem, 0,
+                             0x100000000ULL);
+    memory_region_add_subregion_overlap(&view, 0, &bus, 0);
+    memory_region_init_alias(&itcm_local, NULL, "best1700.m55c1_itcm_local",
+                             &itcm, 0, BEST1700_M55C1_ITCM_SIZE);
+    memory_region_add_subregion_overlap(&view, 0, &itcm_local, 1);
+    memory_region_init_alias(&dtcm_local, NULL, "best1700.m55c1_dtcm_local",
+                             &dtcm, 0, BEST1700_M55C1_DTCM_SIZE);
+    memory_region_add_subregion_overlap(&view, BEST1700_SRAM_BASE,
+                                        &dtcm_local, 1);
+
+    cp = qdev_new(TYPE_ARMV7M);
+    object_property_add_child(OBJECT(machine), "armv7m-cp", OBJECT(cp));
+    qdev_prop_set_uint32(cp, "num-irq", BEST1700_NUM_IRQ);
+    qdev_prop_set_uint8(cp, "num-prio-bits", BEST1700_NUM_PRIO_BITS);
+    qdev_prop_set_string(cp, "cpu-type", ARM_CPU_TYPE_NAME("cortex-m55"));
+    qdev_prop_set_bit(cp, "start-powered-off", true);
+    qdev_connect_clock_in(cp, "cpuclk", sysclk);
+    qdev_connect_clock_in(cp, "refclk", sysclk);
+    object_property_set_link(OBJECT(cp), "memory", OBJECT(&view),
+                             &error_fatal);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(cp), &error_fatal);
+    memory_region_init_io(&impdef, NULL, &best1700_m55_impdef_ops, NULL,
+                          "best1700.m55c1-impdef", 0x1000);
+    memory_region_add_subregion(&ARMV7M(cp)->container,
+                                BEST1700_M55_IMPDEF_BASE, &impdef);
+    best1700_dwt_init(ARMV7M(cp), &dwt);
+    g_cp = ARMV7M(cp);
+}
+
 static void best1700_init(MachineState *machine, BesImage *img,
                           const BesBoard *board)
 {
@@ -560,10 +719,13 @@ static void best1700_init(MachineState *machine, BesImage *img,
     {
         static MemoryRegion impdef;
 
+        static Best1700Dwt dwt;
+
         memory_region_init_io(&impdef, NULL, &best1700_m55_impdef_ops, NULL,
                               "best1700.m55-impdef", 0x1000);
         memory_region_add_subregion(&ARMV7M(armv7m)->container,
                                     BEST1700_M55_IMPDEF_BASE, &impdef);
+        best1700_dwt_init(ARMV7M(armv7m), &dwt);
     }
 
     /* ---- flash：bes_flash 设备持有存储后端，XIP/cached/NC 三别名共享 ----
@@ -727,6 +889,7 @@ static void best1700_init(MachineState *machine, BesImage *img,
 
     qemu_register_reset(best1700_bootvec_reset, NULL);
     g_armv7m = ARMV7M(armv7m);
+    best1700_cp_init(machine, sysmem, sysclk);
 
     best1700_periph_init(sysmem, &g_periph, "best1700.periph",
                          BEST1700_PERIPH_BASE);
@@ -764,11 +927,16 @@ static void best1700_init(MachineState *machine, BesImage *img,
             uint32_t freq;
             int irq0;   /* 子定时器 1 的 NVIC 线 */
             int irq1;   /* 子定时器 2 的 NVIC 线 */
+            bool cp;    /* 接 M55C1 的 NVIC */
         } timers[] = {
             { BEST1700_TIMER0_BASE, BEST1700_SLOW_TIMER_FRQ,
-              BEST1700_TIMER00_IRQ, BEST1700_TIMER01_IRQ },
+              BEST1700_TIMER00_IRQ, BEST1700_TIMER01_IRQ, false },
             { BEST1700_TIMER1_BASE, BEST1700_FAST_TIMER_FRQ,
-              BEST1700_TIMER10_IRQ, BEST1700_TIMER11_IRQ },
+              BEST1700_TIMER10_IRQ, BEST1700_TIMER11_IRQ, false },
+            { BEST1700_CP_TIMER0_BASE, BEST1700_SLOW_TIMER_FRQ,
+              BEST1700_CP_TIMER00_IRQ, BEST1700_CP_TIMER01_IRQ, true },
+            { BEST1700_CP_TIMER1_BASE, BEST1700_FAST_TIMER_FRQ,
+              BEST1700_CP_TIMER10_IRQ, BEST1700_CP_TIMER11_IRQ, true },
         };
         int i;
 
@@ -796,6 +964,7 @@ static void best1700_init(MachineState *machine, BesImage *img,
         }
         for (i = 0; i < ARRAY_SIZE(timers); i++) {
             DeviceState *tmr = qdev_new("sp804");
+            DeviceState *nvic = timers[i].cp ? DEVICE(g_cp) : armv7m;
 
             qdev_prop_set_uint32(tmr, "freq0", timers[i].freq);
             qdev_prop_set_uint32(tmr, "freq1", timers[i].freq);
@@ -804,9 +973,9 @@ static void best1700_init(MachineState *machine, BesImage *img,
             sysbus_realize_and_unref(SYS_BUS_DEVICE(tmr), &error_fatal);
             best1700_map(SYS_BUS_DEVICE(tmr), 0, timers[i].base);
             sysbus_connect_irq(SYS_BUS_DEVICE(tmr), 0,
-                               qdev_get_gpio_in(armv7m, timers[i].irq0));
+                               qdev_get_gpio_in(nvic, timers[i].irq0));
             sysbus_connect_irq(SYS_BUS_DEVICE(tmr), 1,
-                               qdev_get_gpio_in(armv7m, timers[i].irq1));
+                               qdev_get_gpio_in(nvic, timers[i].irq1));
         }
     }
 
@@ -957,16 +1126,31 @@ static void best1700_init(MachineState *machine, BesImage *img,
         }
     }
 
-    /* ---- MCU_CMU / AON_CMU（见上方宏注释） ----
-     * intersys/BT 邮箱未建模：BT 子系统用到再查。 */
+    /* ---- MCU_CMU / AON_CMU（见上方宏注释），含两核间中断与 M55C1
+     * 放核（见 M55C1 宏注释）。BT 子系统邮箱未建模：用到再查。 ---- */
     {
         DeviceState *cmu = qdev_new(TYPE_BEST1700_CMU);
         DeviceState *aoncmu = qdev_new(TYPE_BEST1700_AONCMU);
+        int c;
 
         sysbus_realize_and_unref(SYS_BUS_DEVICE(cmu), &error_fatal);
         best1700_map(SYS_BUS_DEVICE(cmu), 0, BEST1700_CMU_BASE);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(aoncmu), &error_fatal);
         best1700_map(SYS_BUS_DEVICE(aoncmu), 0, BEST1700_AON_CMU_BASE);
+        for (c = 0; c < 2; c++) {
+            qdev_connect_gpio_out_named(cmu, "ipc", 21 + c,
+                qdev_get_gpio_in(armv7m, BEST1700_IPC_RX_IRQ + c));
+            qdev_connect_gpio_out_named(cmu, "ipc", 18 + c,
+                qdev_get_gpio_in(armv7m, BEST1700_IPC_TX_IRQ + c));
+            qdev_connect_gpio_out_named(cmu, "ipc", 15 + c,
+                qdev_get_gpio_in(DEVICE(g_cp), BEST1700_IPC_RX_IRQ + c));
+            qdev_connect_gpio_out_named(cmu, "ipc", 12 + c,
+                qdev_get_gpio_in(DEVICE(g_cp), BEST1700_IPC_TX_IRQ + c));
+        }
+        g_aoncmu = aoncmu;
+        qdev_connect_gpio_out_named(aoncmu, "cpu-run", 0,
+                                    qemu_allocate_irq(best1700_cp_run,
+                                                      NULL, 0));
     }
 
     /* ---- ISPI 主控 @0x4000A000（q63 实证，见上方宏注释） ---- */

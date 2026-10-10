@@ -334,6 +334,11 @@ static void bes_machine_class_init(ObjectClass *oc, const void *data)
     mc->init = bes_machine_init;
     mc->reset = bes_machine_reset;
     mc->ignore_memory_transaction_failures = true;
+    /* best1700 runs a second M55 (M55C1); the vCPU count sizes MTTCG's
+     * contexts. best1503 creates one CPU and leaves the second unused. */
+    mc->default_cpus = 2;
+    mc->min_cpus = 1;
+    mc->max_cpus = 2;
 
     object_class_property_add_str(oc, "profile", bes_get_profile,
                                   bes_set_profile);
