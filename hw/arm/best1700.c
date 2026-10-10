@@ -47,6 +47,9 @@
 #include "hw/misc/best1700_cmu.h"
 #include "hw/misc/bes_ispi.h"
 #include "hw/misc/bes_psram.h"
+#include "hw/misc/bes_dma.h"
+#include "hw/misc/bes_i2c.h"
+#include "hw/core/irq.h"
 #include "hw/misc/unimp.h"
 #include "chardev/char-fe.h"
 #include "system/address-spaces.h"
@@ -98,6 +101,33 @@
  * 实测 SRAM 0x241005fc），BSP hal_norflaship_v2.o 引用 0x40190000/
  * 0x40198000。id0 = 代码 NOR。 */
 #define BEST1700_FLASH_CTRL_BASE 0x40190000
+
+/* I2C 主控 ×5（DesignWare，bes_i2c）：BSP hal_i2c.o .rodata.i2c_desc
+ * 每项 {基址, DMA 请求, 中断号 @+0xA} = {0x40006000, 50},
+ * {0x40007000, 51}, {0x40075000, 52}, {0x40076000, 53},
+ * {0x40077000, 54}。q63 AP 在 I2C2（0x40075000）上轮询 STATUS（实测）。
+ * 板上器件未接入：bes_i2c 对无模型地址回退为通用寄存器文件。 */
+#define BEST1700_NUM_I2C         5
+
+/* 通用 DMA ×3（PL080 兼容 + BES 2D 扩展，bes_dma）：BSP hal_dma.o
+ * .rodata.dma = {0x401A0000, 0x401A8000, 0x40260000}、irq_type =
+ * {37, 38, 39}。q63 AP 的 UART0 控制台走 DMA0：TX 通道 DestPeriph=5、
+ * RX 通道 SrcPeriph=4（实测通道配置 0xC940/0xD008）。PL011 无 DMA 请求
+ * 线，其发送 FIFO 在模拟里永不满，TX 请求线恒为高。 */
+#define BEST1700_DMA0_BASE       0x401A0000
+#define BEST1700_DMA1_BASE       0x401A8000
+#define BEST1700_DMA2_BASE       0x40260000
+#define BEST1700_DMA0_IRQ        37
+#define BEST1700_DMA1_IRQ        38
+#define BEST1700_DMA2_IRQ        39
+#define BEST1700_UART0_DMA_TX    5
+
+/* 总线主设备（DMA 等）看到的 TCM：DTCM AXI 视图 0x21000000 = CPU
+ * 0x20000000（4MB）、ITCM AXI 视图 0x21800000 = CPU 0x0（2MB），BSP
+ * hal_cmu_best1700.o addr_remap_dev_to_cpu；q63 AP 的 UART DMA 源地址
+ * 0x213449f4 即此（实测）。 */
+#define BEST1700_DTCM_AXI_BASE   0x21000000
+#define BEST1700_ITCM_AXI_BASE   0x21800000
 
 /* PSRAM 控制器（MC v6 + PHY）：BSP hal_psram_v6.o 以 0x40320000 访问
  * MGR 命令引擎、以 0x40328000 访问 PHY（q63 TEE 同，实测） */
@@ -629,6 +659,27 @@ static void best1700_init(MachineState *machine, BesImage *img,
                                  &bootram, 0, 0x200000 - 0x1000);
         memory_region_add_subregion(sysmem, BEST1700_SRAM_S_BASE -
                                     BEST1700_SRAM_BASE + 0x1000, &bootram_s);
+
+        /* TCM 的 AXI 视图（见宏注释），含安全别名 */
+        static MemoryRegion axi[4];
+        static const char *const names[4] = {
+            "best1700.dtcm_axi", "best1700.dtcm_axi_s",
+            "best1700.itcm_axi", "best1700.itcm_axi_s",
+        };
+        int i;
+
+        for (i = 0; i < 4; i++) {
+            bool itcm = i >= 2;
+
+            memory_region_init_alias(&axi[i], NULL, names[i],
+                                     itcm ? &bootram : &sram, 0,
+                                     itcm ? 0x200000 - 0x1000
+                                          : BEST1700_SRAM_SIZE);
+            memory_region_add_subregion(sysmem,
+                (itcm ? BEST1700_ITCM_AXI_BASE + 0x1000
+                      : BEST1700_DTCM_AXI_BASE) +
+                (i & 1 ? BEST1700_S_ALIAS : 0), &axi[i]);
+        }
     }
 
     qemu_register_reset(best1700_bootvec_reset, NULL);
@@ -705,6 +756,53 @@ static void best1700_init(MachineState *machine, BesImage *img,
             sysbus_connect_irq(SYS_BUS_DEVICE(tmr), 1,
                                qdev_get_gpio_in(armv7m, timers[i].irq1));
         }
+    }
+
+    /* ---- I2C（见宏注释） ---- */
+    {
+        static const struct {
+            uint32_t base;
+            int irq;
+        } i2cs[BEST1700_NUM_I2C] = {
+            { 0x40006000, 50 }, { 0x40007000, 51 }, { 0x40075000, 52 },
+            { 0x40076000, 53 }, { 0x40077000, 54 },
+        };
+        int i;
+
+        for (i = 0; i < ARRAY_SIZE(i2cs); i++) {
+            DeviceState *i2c = qdev_new(TYPE_BES_I2C);
+
+            sysbus_realize_and_unref(SYS_BUS_DEVICE(i2c), &error_fatal);
+            best1700_map(SYS_BUS_DEVICE(i2c), 0, i2cs[i].base);
+            sysbus_connect_irq(SYS_BUS_DEVICE(i2c), 0,
+                               qdev_get_gpio_in(armv7m, i2cs[i].irq));
+        }
+    }
+
+    /* ---- 通用 DMA（见宏注释） ---- */
+    {
+        static const struct {
+            uint32_t base;
+            int irq;
+        } dmas[] = {
+            { BEST1700_DMA0_BASE, BEST1700_DMA0_IRQ },
+            { BEST1700_DMA1_BASE, BEST1700_DMA1_IRQ },
+            { BEST1700_DMA2_BASE, BEST1700_DMA2_IRQ },
+        };
+        DeviceState *dma[ARRAY_SIZE(dmas)];
+        int i;
+
+        for (i = 0; i < ARRAY_SIZE(dmas); i++) {
+            dma[i] = qdev_new(TYPE_BES_DMA);
+            object_property_set_link(OBJECT(dma[i]), "downstream",
+                                     OBJECT(sysmem), &error_fatal);
+            sysbus_realize_and_unref(SYS_BUS_DEVICE(dma[i]), &error_fatal);
+            best1700_map(SYS_BUS_DEVICE(dma[i]), 0, dmas[i].base);
+            sysbus_connect_irq(SYS_BUS_DEVICE(dma[i]), 0,
+                               qdev_get_gpio_in(armv7m, dmas[i].irq));
+        }
+        qemu_irq_raise(qdev_get_gpio_in_named(dma[0], "dma-req",
+                                              BEST1700_UART0_DMA_TX));
     }
 
     /* ---- MPC 寄存器（见 best1700_mpc_read 前注释） ---- */

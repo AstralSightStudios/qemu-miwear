@@ -40,6 +40,8 @@ config BEST1700
     select BES_IMAGE
     select BES_FLASH
     select BES_PSRAM
+    select BES_DMA
+    select BES_I2C
     select BEST1700_CMU
     select BES_ISPI
 
