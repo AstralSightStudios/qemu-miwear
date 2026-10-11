@@ -58,6 +58,7 @@ typedef struct BesBoard {
     uint32_t panel_y_offset;
 
     BesBoardI2C touch;
+    BesBoardI2C light;          /* ambient light / PPG front end, -1 irq */
     BesBoardI2C nfc;
     BesBoardI2C gauge;          /* battery fuel gauge */
     BesBoardI2C sensor_switch;  /* load switch on the sensor core's I2C */

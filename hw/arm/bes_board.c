@@ -169,6 +169,8 @@ static const BesBoard bes_boards[] = {
         /* CST9217 @0x5A on I2C3，INT GPIO 27 */
         /* 触摸在 I2C5（0x40063000）：固件对 0x5A 的访问全部落在该总线上 */
         .touch = { TYPE_HYNITRON_TS, 5, 0x5A, 27 },
+        /* W1150 light device on I2C5 at 0x48 (sub_C3913A0 w11xx init) */
+        .light = { "w1150.als", 5, 0x48, -1 },
         /* NAND：固件表 nand_system first 0 nblocks 57600、nand_data
          * first 57600 nblocks 73472；/system 是 YAFFS2 目录树 */
         .nand_id = 0xC8F4C8,

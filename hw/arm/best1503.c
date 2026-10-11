@@ -558,6 +558,12 @@ static void best1503_init(MachineState *machine, BesImage *img,
         }
 
         /* 板上的 NFC 控制器：数据就绪脚入、VEN 脚出 */
+        if (board->light.type) {
+            I2CSlave *als = i2c_slave_new(board->light.type, board->light.addr);
+
+            i2c_slave_realize_and_unref(als, i2c_bus[board->light.bus], &error_fatal);
+        }
+
         if (board->nfc.type) {
             I2CSlave *nfc = i2c_slave_new(board->nfc.type, board->nfc.addr);
 
