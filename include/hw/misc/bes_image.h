@@ -38,6 +38,8 @@ typedef struct BesImage {
 bool bes_image_load(BesImage *img, const char *path, Error **errp);
 void bes_image_unload(BesImage *img);
 /* 镜像里是否含有字符串 str（不含结尾 NUL），用于识别产品 */
+/* how often str occurs in the image */
+unsigned bes_image_count(const BesImage *img, const char *str);
 bool bes_image_contains(const BesImage *img, const char *str);
 
 #endif

@@ -176,13 +176,27 @@ static const BesBoard *bes_board_resolve(const char *profile,
         return found;
     }
 
+    /*
+     * A firmware also names products it is compatible with (q66 lists two
+     * o66 codes in its model table), so the board is the product the
+     * image names most often; a tie is ambiguous.
+     */
+    unsigned best = 0;
+
     for (i = 0; i < ARRAY_SIZE(bes_boards); i++) {
         g_autofree char *tag = g_strconcat("miwear.watch.",
                                            bes_boards[i].product, NULL);
+        unsigned n;
 
-        if (g_str_equal(bes_boards[i].chip, chip) &&
-            bes_image_contains(img, tag)) {
+        if (!g_str_equal(bes_boards[i].chip, chip)) {
+            continue;
+        }
+        n = bes_image_count(img, tag);
+        if (n > best) {
             found = &bes_boards[i];
+            best = n;
+            matches = 1;
+        } else if (n && n == best) {
             matches++;
         }
     }

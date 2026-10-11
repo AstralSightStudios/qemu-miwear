@@ -225,20 +225,28 @@ void bes_image_unload(BesImage *img)
     img->size = 0;
 }
 
-bool bes_image_contains(const BesImage *img, const char *str)
+unsigned bes_image_count(const BesImage *img, const char *str)
 {
     size_t len = strlen(str);
     const uint8_t *p = img->data;
     const uint8_t *end = img->data + img->size;
+    unsigned n = 0;
 
     if (!len) {
-        return true;
+        return 1;
     }
     while (end - p >= len && (p = memchr(p, str[0], end - p - len + 1))) {
         if (!memcmp(p, str, len)) {
-            return true;
+            n++;
+            p += len;
+        } else {
+            p++;
         }
-        p++;
     }
-    return false;
+    return n;
+}
+
+bool bes_image_contains(const BesImage *img, const char *str)
+{
+    return bes_image_count(img, str) != 0;
 }
