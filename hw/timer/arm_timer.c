@@ -17,6 +17,7 @@
 #include "qemu/module.h"
 #include "qemu/log.h"
 #include "qom/object.h"
+#include "trace.h"
 
 /* Common timer implementation.  */
 
@@ -36,6 +37,7 @@ typedef struct {
     int freq;
     int int_level;
     qemu_irq irq;
+    bool count_zero;    /* periodic / one-shot: Load + 1 cycles to zero */
 } arm_timer_state;
 
 /* Check all active timers, and schedule the next timer interrupt.  */
@@ -59,6 +61,12 @@ static uint32_t arm_timer_read(void *opaque, hwaddr offset)
     case 6: /* TimerBGLoad */
         return s->limit;
     case 1: /* TimerValue */
+        if (s->count_zero &&
+            (s->control & (TIMER_CTRL_PERIODIC | TIMER_CTRL_ONESHOT))) {
+            uint64_t c = ptimer_get_count(s->timer);
+
+            return c ? c - 1 : 0;
+        }
         return ptimer_get_count(s->timer);
     case 2: /* TimerControl */
         return s->control;
@@ -93,7 +101,11 @@ static void arm_timer_recalibrate(arm_timer_state *s, int reload)
           /* Periodic.  */
           limit = s->limit;
     }
-    ptimer_set_limit(s->timer, limit, reload);
+    ptimer_set_limit(s->timer,
+                     (uint64_t)limit + (s->count_zero &&
+                                        (s->control & (TIMER_CTRL_PERIODIC |
+                                                       TIMER_CTRL_ONESHOT))),
+                     reload);
 }
 
 static void arm_timer_write(void *opaque, hwaddr offset,
@@ -102,6 +114,7 @@ static void arm_timer_write(void *opaque, hwaddr offset,
     arm_timer_state *s = (arm_timer_state *)opaque;
     int freq;
 
+    trace_arm_timer_write(s, offset, value);
     switch (offset >> 2) {
     case 0: /* TimerLoad */
         s->limit = value;
@@ -163,6 +176,8 @@ static void arm_timer_write(void *opaque, hwaddr offset,
 static void arm_timer_tick(void *opaque)
 {
     arm_timer_state *s = (arm_timer_state *)opaque;
+
+    trace_arm_timer_tick(s, s->control);
     s->int_level = 1;
     arm_timer_update(s);
 }
@@ -214,6 +229,15 @@ struct SP804State {
      * sub-timers to two separate NVIC lines instead of OR-ing them. */
     qemu_irq irq2;
     bool split_irq;
+    /*
+     * Periodic and one-shot counters take Load + 1 cycles to interrupt,
+     * the zero state included (BES best1700: its hal_timer programs
+     * n - 1 for an n-tick interval, and the hwtimer interrupt handler
+     * drops an interrupt that arrives before the system timer reached
+     * the deadline without rearming, which stalls tickless sleeps for
+     * good).
+     */
+    bool count_zero;
 };
 
 static const uint8_t sp804_ids[] = {
@@ -322,6 +346,8 @@ static void sp804_realize(DeviceState *dev, Error **errp)
 
     s->timer[0] = arm_timer_init(s->freq0);
     s->timer[1] = arm_timer_init(s->freq1);
+    s->timer[0]->count_zero = s->count_zero;
+    s->timer[1]->count_zero = s->count_zero;
     s->timer[0]->irq = qemu_allocate_irq(sp804_set_irq, s, 0);
     s->timer[1]->irq = qemu_allocate_irq(sp804_set_irq, s, 1);
 }
@@ -408,6 +434,7 @@ static const Property sp804_properties[] = {
     DEFINE_PROP_UINT32("freq0", SP804State, freq0, 1000000),
     DEFINE_PROP_UINT32("freq1", SP804State, freq1, 1000000),
     DEFINE_PROP_BOOL("split-irq", SP804State, split_irq, false),
+    DEFINE_PROP_BOOL("count-zero", SP804State, count_zero, false),
 };
 
 static void sp804_class_init(ObjectClass *klass, const void *data)
