@@ -2395,6 +2395,12 @@ static MemTxResult nvic_sysreg_write(void *opaque, hwaddr addr,
         return MEMTX_ERROR;
     }
 
+    if (offset >= 0xf50 && offset <= 0xf78) {
+        /* Cache and branch predictor maintenance: NOP in QEMU and does
+         * not affect CPU hflags; avoid arm_rebuild_hflags() overhead. */
+        return MEMTX_OK;
+    }
+
     switch (offset) {
     case 0x100 ... 0x13f: /* NVIC Set enable */
         offset += 0x80;

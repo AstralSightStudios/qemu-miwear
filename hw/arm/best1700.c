@@ -598,6 +598,22 @@ static void best1700_map(SysBusDevice *sbd, int n, hwaddr addr)
     }
 }
 
+static uint64_t best1700_wdt_read(void *opaque, hwaddr offset, unsigned size)
+{
+    return 0;
+}
+
+static void best1700_wdt_write(void *opaque, hwaddr offset, uint64_t val, unsigned size)
+{
+}
+
+static const MemoryRegionOps best1700_wdt_ops = {
+    .read = best1700_wdt_read,
+    .write = best1700_wdt_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+};
+
 static void best1700_periph_init(MemoryRegion *sysmem, MemoryRegion *mr,
                                  const char *name, hwaddr base)
 {
@@ -1156,6 +1172,14 @@ static void best1700_init(MachineState *machine, BesImage *img,
     best1700_periph_init(sysmem, &g_bth_periph, "best1700.bth_periph",
                          BEST1700_BTH_PERIPH_BASE);
     best1700_bth_init(machine, sysmem, sysclk, board);
+
+    /* BTH Watchdog @0x50001000 (absorb pet/reload writes without unimp overhead) */
+    {
+        static MemoryRegion bth_wdt;
+        memory_region_init_io(&bth_wdt, NULL, &best1700_wdt_ops, NULL,
+                              "best1700.bth_wdt", 0x1000);
+        memory_region_add_subregion(&g_bth_periph, 0x1000, &bth_wdt);
+    }
 
     /* ---- NOR flash 控制器（见宏注释），即上面的存储后端 ---- */
     best1700_map(SYS_BUS_DEVICE(fc), 0, BEST1700_FLASH_CTRL_BASE);

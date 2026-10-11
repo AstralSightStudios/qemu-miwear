@@ -242,8 +242,11 @@ static bool cmu_is_pulse(const Best1700CmuInfo *info, hwaddr offset)
     return false;
 }
 
-static uint64_t cmu_ticks(const Best1700CmuInfo *info)
+static inline uint64_t cmu_ticks(const Best1700CmuInfo *info)
 {
+    if (info->timer_hz == 16000) {
+        return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 62500;
+    }
     return muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), info->timer_hz,
                     NANOSECONDS_PER_SECOND);
 }
@@ -395,6 +398,12 @@ static uint64_t best1700_cmu_read(void *opaque, hwaddr offset, unsigned size)
     bool is_set;
     int pair;
 
+    if (info->timer_hz &&
+        (offset == info->timer || offset == info->timer + 4)) {
+        uint64_t t = cmu_ticks(info) + s->timer_offset;
+        return offset == info->timer ? (uint32_t)t : (uint32_t)(t >> 32);
+    }
+
     if (info->bt_set && (offset == info->bt_set || offset == info->bt_clr)) {
         v = s->bt_word | s->bt_raw;
     } else if (info->tz_set &&
@@ -418,11 +427,6 @@ static uint64_t best1700_cmu_read(void *opaque, hwaddr offset, unsigned size)
         s->memsc_taken |= bit;
     } else if (info->num_memsc && offset == info->memsc_avail) {
         v = ~s->memsc_taken & MAKE_64BIT_MASK(0, info->num_memsc);
-    } else if (info->timer_hz &&
-               (offset == info->timer || offset == info->timer + 4)) {
-        uint64_t t = cmu_ticks(info) + s->timer_offset;
-
-        v = offset == info->timer ? (uint32_t)t : (uint32_t)(t >> 32);
     } else if ((pair = cmu_find_pair(info, offset, &is_set)) >= 0) {
         v = s->pair_state[pair];
         if (info->pll_set && info->pairs[pair].set == info->pll_set) {
