@@ -95,6 +95,7 @@
 #include "qemu/timer.h"
 #include "hw/core/irq.h"
 #include "hw/misc/best1700_cmu.h"
+#include "trace.h"
 
 typedef struct Best1700CmuPair {
     uint16_t set;
@@ -460,6 +461,8 @@ static void best1700_cmu_write(void *opaque, hwaddr offset, uint64_t value,
         tz_update(s);
     } else if (info->isys_set && offset == info->isys_set) {
         s->isys_word |= value;
+        trace_best1700_cmu_isys(info->name, "set", value, s->isys_word,
+                                s->isys_mask);
         isys_update(s);
     } else if (info->isys_set && offset == info->isys_clr) {
         /* clearing a data bit tells the sender it was taken */
@@ -467,12 +470,18 @@ static void best1700_cmu_write(void *opaque, hwaddr offset, uint64_t value,
 
         s->isys_word &= ~value;
         s->isys_word |= taken & ~value & ISYS_G_MASK;
+        trace_best1700_cmu_isys(info->name, "clr", value, s->isys_word,
+                                s->isys_mask);
         isys_update(s);
     } else if (info->isys_set && offset == info->isys_mask_set) {
         s->isys_mask |= value;
+        trace_best1700_cmu_isys(info->name, "mask-set", value, s->isys_word,
+                                s->isys_mask);
         isys_update(s);
     } else if (info->isys_set && offset == info->isys_mask_clr) {
         s->isys_mask &= ~value;
+        trace_best1700_cmu_isys(info->name, "mask-clr", value, s->isys_word,
+                                s->isys_mask);
         isys_update(s);
     } else if (info->isys_set && (offset == info->isys_rx_stat ||
                                   offset == info->isys_tx_stat)) {
