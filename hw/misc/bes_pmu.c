@@ -129,6 +129,8 @@ static void bes_pmu_exec(BesPmuState *s, uint32_t cmd)
             }
         } else if (dev == BES_ISPI_DEV_PMU && page == 0 && off == 0x50) {
             val = 0xFF;     /* every channel has a finished conversion */
+        } else if (dev == BES_ISPI_DEV_PMU && page == 0 && off == 0x5e) {
+            val = 0x8000;   /* power status: bit 15 = powered on, bit 2 = 0 */
         } else if (dev == BES_ISPI_DEV_PMU && page == 0 &&
                    off >= 0x56 && off <= 0x5D) {
             val = bes_gpadc_code(s->gpadc_mv[off - 0x56]);
@@ -275,6 +277,8 @@ static void bes_pmu_reset(DeviceState *dev)
     s->ispi_rx_valid = false;
     memset(s->cur_page, 0, sizeof(s->cur_page));
     memset(s->regs, 0, sizeof(s->regs));
+    /* 0x4F: PMU power-on reason / power key / VBUS presence (bit 0 = on) */
+    s->regs[BES_ISPI_DEV_PMU][0][0x4F] = 1;
     timer_del(s->wdt_timer);
 }
 
