@@ -1,16 +1,17 @@
 #!/bin/sh
-# Run the best1503 machine against the AP firmware for a bounded time.
+# Run the best1503 / best1700 machine against the AP firmware for a bounded time.
 # usage: emu/run.sh <outdir> <seconds> [extra qemu args...]
 #   seconds = 0 runs until QEMU exits.
 #   GUI=1 opens the panel in a window (the mouse is the finger; the host
 #   cursor stays visible); otherwise the run is headless.
-#   NSH=<port> serves the console UART (uart2) on that TCP port with an
-#   interactive NuttX shell (emu/nsh.py, through the gdbstub on port
-#   NSH+1); attach with `emu/nsh.py console <port>`. uart2.log still
-#   records everything.
+#   NSH=<port> serves the console UART on that TCP port with an interactive
+#   NuttX shell (emu/nsh.py, through the gdbstub on port NSH+1); attach
+#   with `emu/nsh.py console <port>`. Console logs still record everything.
 #   BT_PORT=<port> listens there for the peer Bluetooth host (H4 HCI).
 #   NOR=<file> backs the NOR flash with that image (factory data, see
 #   emu/mknor.py); written back on exit.
+#   SENSOR_NOR=<file> backs the sensor hub's NOR flash (q63 best1700, see
+#   emu/mksensornor.py); written back on exit.
 #   FW=<dir> picks the firmware (its vela_ap.bin); the machine follows its
 #   chip, and the board profile its product. PROFILE=<name> forces a board
 #   (PROFILE=help lists them).
@@ -24,19 +25,38 @@ if [ -n "$GUI" ]; then
 else
     DISPLAY_ARGS="-nographic"
 fi
+
+# Pick the console UART: best1700 (q63) uses UART0; best1503 (p67) uses UART2.
+CONSOLE_UART=uart2
+case "$PROFILE-$FW" in
+    *q63*|*best1700*)
+        CONSOLE_UART=uart0
+        ;;
+esac
+
 if [ -n "$NSH" ]; then
     NSH_GDB=$((NSH + 1))
-    UART2_ARGS="-chardev socket,id=uart2,host=127.0.0.1,port=$NSH,server=on,wait=off,logfile=$OUT/uart2.log"
-    UART2_ARGS="$UART2_ARGS -serial chardev:uart2 -S -gdb tcp:127.0.0.1:$NSH_GDB"
+    if [ "$CONSOLE_UART" = "uart0" ]; then
+        SERIAL_ARGS="-chardev socket,id=uart0,host=127.0.0.1,port=$NSH,server=on,wait=off,logfile=$OUT/uart0.log"
+        SERIAL_ARGS="$SERIAL_ARGS -serial chardev:uart0 -serial file:$OUT/uart1.log -serial file:$OUT/uart2.log"
+    else
+        SERIAL_ARGS="-chardev socket,id=uart2,host=127.0.0.1,port=$NSH,server=on,wait=off,logfile=$OUT/uart2.log"
+        SERIAL_ARGS="$SERIAL_ARGS -serial file:$OUT/uart0.log -serial file:$OUT/uart1.log -serial chardev:uart2"
+    fi
+    SERIAL_ARGS="$SERIAL_ARGS -S -gdb tcp:127.0.0.1:$NSH_GDB"
 else
-    UART2_ARGS="-serial file:$OUT/uart2.log"
+    SERIAL_ARGS="-serial file:$OUT/uart0.log -serial file:$OUT/uart1.log -serial file:$OUT/uart2.log"
 fi
+
 if [ -n "$BT_PORT" ]; then
     BT_ARGS="-chardev socket,id=bt,host=127.0.0.1,port=$BT_PORT,server=on,wait=off"
     BT_ARGS="$BT_ARGS -global driver=bes.btss,property=chardev,value=bt"
 fi
 if [ -n "$NOR" ]; then
     NOR_ARGS="-M flash-image=$NOR"
+fi
+if [ -n "$SENSOR_NOR" ]; then
+    SENSOR_NOR_ARGS="-M sensor-nor=$SENSOR_NOR"
 fi
 if [ -n "$PROFILE" ]; then
     PROFILE_ARGS="-M profile=$PROFILE"
@@ -46,9 +66,8 @@ if [ -n "$EMMC" ]; then
 fi
 mkdir -p "$OUT"
 build/qemu-system-arm -M miwear -kernel "$FW/vela_ap.bin" \
-    $DISPLAY_ARGS $BT_ARGS $NOR_ARGS $PROFILE_ARGS $EMMC_ARGS -monitor none \
-    -serial file:"$OUT/uart0.log" -serial file:"$OUT/uart1.log" \
-    $UART2_ARGS -D "$OUT/qemu.log" "$@" > "$OUT/stdout.log" 2>&1 &
+    $DISPLAY_ARGS $BT_ARGS $NOR_ARGS $SENSOR_NOR_ARGS $PROFILE_ARGS $EMMC_ARGS -monitor none \
+    $SERIAL_ARGS -D "$OUT/qemu.log" "$@" > "$OUT/stdout.log" 2>&1 &
 PID=$!
 if [ -n "$NSH" ]; then
     python3 emu/nsh.py inject "$NSH_GDB" "$FW/vela_ap.bin" &

@@ -197,6 +197,55 @@ AONCMU/CMU 魔术值 → UART（console, qemu chardev 直通终端）→ TIMER/S
 
 ## 7. 最新变更
 
+- **2026-10-11 (3)（q63：40 秒进向导、配色复原、蓝牙偶发 panic 根治）**：
+  ①**启动慢**：80 秒里有 40 秒是 miwear 主线程在支付宝 eSE 开通道上等两次
+  20 秒超时——q63 没接 NFC。q63 与 p67 同一 sn110 驱动、同一固件文件
+  NXP_01_10_6E.bin：I2C 4（0x40077000）地址 0x28，数据就绪 GPIO 90、
+  VEN 91（board_sn110_initialize 0x1088DA68，总线号由 0x10878E20 传入）。
+  nci_nfcc 两处按 p67 写的行为不兼容 q63：1 字节载荷后的填充字节（q63
+  按帧长精读，残字节错位下一包头）→ 改为"读事务越过包尾给填充、下次读
+  从新包开始"；VEN 上电 NTF（q63 探测把 RSP、NTF 当前两包读）→ 改为
+  property power-on-ntf，默认关（p67 驱动本就跳过它）；VEN 拉高即可收
+  命令。NXP 栈只认 ROM 0x01 + 固件主版本 0x10（sub_10EE2380，否则
+  NFA_Enable 0xF0 "Unexpected firmware"），固件版本须等于文件的 0x106E
+  （否则进下载模式）→ 板级 nfc_rom_version / nfc_fw_version。现在 NFC 栈
+  约 1 秒起来，40 秒进向导。
+  ②**"偏色"**：渐变色带是单行图像，q63 驱动不设其 stride（0x0A2A=0），
+  采样器按 stride×高=0 字节映射，所有线性/径向渐变全透明，向导背景成了
+  黑色；向导本是浅色设计（固件显式设白底按钮、黑字、#333333 标题，
+  0x10D0ADFC/0x10D0D3BC），黑底上就像反色。修后首页是金色光球、语言页
+  浅蓝灰渐变。另查明：0x0A1B 是缓存刷新（0x11 flush、0x11000 失效图像
+  缓存）；0x0A00 bit28 / 0x0A10 bit8 由驱动按"目标未预乘"设置
+  （vg_lite_blit 0x101D2E70、vg_lite_draw 0x101D5220），LVGL 给的画笔色
+  本已预乘，模型在 bit28 时再预乘一次画笔色是错的（半透明填充偏暗），
+  尚未改。
+  ③**蓝牙偶发 panic（并行负载下约 1/12～1/16）**：在三个核的 _assert
+  入口（AP 0x1086E6F4、cp 0x1B33DED4、sensor 0x0C061494）下 gdbstub
+  断点批量抓到两种，都是 bes_btss 回复时序：
+  (a) cp hal_intersys_rx_irq_handler:544 "Handler missing"——btdrv 初始化
+  open(ch0,mbx0) 发厂商命令、只等 TX done 就 close，bthci 稍后才 open；
+  最后一条 FC77 的 CC（1 ms 后发布）落进空档；
+  (b) cp bes_serial_hci2.c:343——HCI_Reset 后 bthci_receive 发 FC77 唤醒，
+  其 CC 复位 TX-done 信号量（0x1B30F226），若早于发复位的线程取走
+  TX-done，bthci_send 等满 10 秒断言。
+  修法：消息逐条记可发布时间、保序；q63 普通回复 50 µs（latency-us），
+  "复位后紧跟的 FC77"的 CC 延迟 10 ms（新 property wake-latency-us，
+  默认 0 = 不区分，p67 不变）。之前以为"sensor 先 panic"是误读：
+  "[M55C0_2_BTHC0] Got panic msg" 是链路名，不代表发起方。
+  调试手段：emu/assertwatch.py <gdb 端口>（QEMU 加 -S -gdb，三核 _assert
+  断点，打印首个断言的核、文件:行、寄存器），并行多开几路批量跑抓偶发；
+  -trace bes_btss_* 看 HCI；-trace bes_i2c_* 新增
+  DATA_CMD / RX 逐字节；-trace vsi_vglite_ramp 看渐变色带。
+  ④**q63 NSH 交互体验（达到 p67 水准）**：
+  查明 UART0 控制台在 q63 上需攒满 128 字节 DMA 方才响应的根因：
+  逆向 `hal_uart_open`（0x108C03EC）发现，固件配置的 NVIC 中断号取自
+  结构体 b4 字节：UART0 是 55（0x37）、UART1 是 56、UART2 是 57
+  （I2C 0..4 为 50..54，后接 UART 55..57，定时器 58..59 连号）！
+  原 QEMU 误把 UART0 接到 NVIC 22（实为 TX DMA 外设 ID），导致
+  PL011 的接收超时中断 INT_RT 送不达 CPU。改正中断号为 55 后，
+  单字符与回车即时触发超时中断并交付 NuttX 驱动，终端交互延迟达
+  0.001 秒；同步更新 `emu/run.sh` 自动路由 q63 控制台至 UART0 socket。
+
 - **2026-10-11 (2)（q63：GPU 出图、触摸/按键可用、偶发启动停滞根治）**：
   现在 q63 约 80 秒进入 OOBE 欢迎页，点箭头进"选择语言"，再进配对页。
   ①**GPU**：q63 的 VGLite 与 best1503 同一型号，改用现成的

@@ -303,9 +303,9 @@ static const int best1700_bt_rx_irq[] = { 104, 105, 43, 119 };
 #define BEST1700_UART0_BASE      0x4000B000
 #define BEST1700_UART1_BASE      0x4000C000
 #define BEST1700_UART2_BASE      0x40011000
-#define BEST1700_UART0_IRQ       22
-#define BEST1700_UART1_IRQ       24
-#define BEST1700_UART2_IRQ       26
+#define BEST1700_UART0_IRQ       55
+#define BEST1700_UART1_IRQ       56
+#define BEST1700_UART2_IRQ       57
 
 /* TIMER = ARM SP804（hal_timer.o：子定时器间距 0x20，+0x8 控制、+0xC
  * 清中断）。hal_timer.o .boot_rodata = {0x40083000, 0x40005000}，
