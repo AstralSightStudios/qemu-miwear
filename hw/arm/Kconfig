@@ -55,6 +55,8 @@ config BEST1700
     select BES_ISPI
     select BES_BTSS
     select RAYDIUM_TS
+    select NCI_NFCC
+    select VSI_VGLITE
 
 config ARM_VIRT
     bool

@@ -1309,6 +1309,27 @@ static void best1700_init(MachineState *machine, BesImage *img,
         }
     }
 
+    /* 板上的 NFC 控制器：数据就绪脚入、VEN 脚出 */
+    if (board->nfc.type) {
+        I2CSlave *nfc = i2c_slave_new(board->nfc.type, board->nfc.addr);
+
+        if (board->nfc_rom_version) {
+            qdev_prop_set_uint32(DEVICE(nfc), "hw-major",
+                                 board->nfc_rom_version);
+        }
+        if (board->nfc_fw_version) {
+            qdev_prop_set_uint32(DEVICE(nfc), "fw-version",
+                                 board->nfc_fw_version);
+        }
+        i2c_slave_realize_and_unref(nfc, ap_i2c_bus[board->nfc.bus],
+                                    &error_fatal);
+        qdev_connect_gpio_out_named(DEVICE(nfc), "data-ready", 0,
+                                    qdev_get_gpio_in(gpio,
+                                                     board->nfc.irq_gpio));
+        qdev_connect_gpio_out(gpio, board->nfc_ven_gpio,
+                              qdev_get_gpio_in_named(DEVICE(nfc), "ven", 0));
+    }
+
     /* ---- 显示：LCDC + DSI0（见宏注释），面板尺寸来自板级 profile ---- */
     if (board->panel_width) {
         DeviceState *lcdc = qdev_new(TYPE_BES_LCDC);

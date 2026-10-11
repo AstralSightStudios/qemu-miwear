@@ -74,14 +74,26 @@ static const BesBoard bes_boards[] = {
         /* Raydium RM6D03x：挂载在 AP I2C0 (0x40006000)，从机地址 0x39，
          * 中断 GPIO 73（实测 AP 日志与驱动反汇编） */
         .touch = { TYPE_RAYDIUM_TS, 0, 0x39, 73 },
-        .nfc = { .irq_gpio = -1 },
+        /* NXP SN110，同 p67 的 bes sn110 驱动与固件文件
+         * NXP_01_10_6E.bin：board_sn110_initialize（0x1088DA68，由
+         * 0x10878E20 以总线 4 调用）配 I2C 4（0x40077000）地址 0x28、
+         * 400kHz，中断(数据就绪)=90，VEN=91（另有 DWL_REQ=89、电源=70，
+         * 模型不需要）。没有它 miwear 主线程在支付宝 eSE 开通道上等
+         * 两个 20 秒超时才画出第一页。 */
+        .nfc = { TYPE_NCI_NFCC, 4, 0x28, 90 },
         /* CW2215：AP 电池驱动 board_cw2215_initialize 在 I2C 3
          * （0x40076000）地址 0x64 读芯片 ID（实测 I2C 访问） */
         .gauge = { TYPE_CW2215, 3, 0x64, -1 },
         /* sensor bes_switch_setup (0x0c09af0c): bus 2, address 0x18.
          * Its bus number matches the BTH hal_i2c controller ID. */
         .sensor_switch = { TYPE_SGM25062, 2, 0x18, -1 },
-        .nfc_ven_gpio = -1,
+        .nfc_ven_gpio = 91,
+        /* 协议栈只接受与自带固件 NXP_01_10_6E.bin 相同的 ROM 01 / 固件
+         * 10.6E（sub_10EE2380：ROM 版本须为 1、固件主版本须为 0x10，否则
+         * NFA_Enable 报 0xF0 "Unexpected firmware"；文件首帧 c0 00 6e 10
+         * 即 6E/10）；ROM 低半字节 1 也是探测表 NXP 项的匹配值。 */
+        .nfc_rom_version = 0x01,
+        .nfc_fw_version = 0x106E,
         /* 两个侧键接 PMU GPIO，按下接地：AP 板级按键初始化
          * sub_1081D65C 的按键表（PSRAM 0x185F0C0C，8 字节一项：键号、
          * 引脚、iomux 配置、有效电平 0）= {键 2: 114, 键 1: 113}。

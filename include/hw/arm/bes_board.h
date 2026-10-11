@@ -58,6 +58,13 @@ typedef struct BesBoard {
     BesBoardI2C gauge;          /* battery fuel gauge */
     BesBoardI2C sensor_switch;  /* load switch on the sensor core's I2C */
     int nfc_ven_gpio;           /* NFC enable, SoC output */
+    /*
+     * what the NFC controller reports in CORE_RESET_NTF: the byte the
+     * driver's chip probe and the NXP stack read as ROM / hardware version,
+     * and the firmware version (major << 8 | minor); 0 = model default
+     */
+    uint8_t nfc_rom_version;
+    uint16_t nfc_fw_version;
 
     /* SPI NAND on the second flash controller; nand_blocks 0 = none */
     uint32_t nand_id;
