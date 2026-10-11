@@ -27,6 +27,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(BesPmuState, BES_PMU)
 #define BES_PMU_REG_WDT_CFG     0x37    /* bit8 WDT_EN, bit7 WDT_RESET_EN */
 
 #define BES_PMU_CHIP_ID_VAL     0x1530  /* "1503" in bits[15:4] */
+#define BES_PMU_REG_SEQ_CTRL    0xF8    /* bits 14|3 start the 0xF7..0xFE sequence */
+#define BES_PMU_REG_SEQ_STATUS  0xFC    /* bit 11 = sequence finished */
+#define BES_PMU_SEQ_START       0x4008
+#define BES_PMU_SEQ_DONE        0x0800
 
 struct BesPmuState {
     SysBusDevice parent_obj;

@@ -32,6 +32,12 @@
  *   - PMU (device 3): chip id at offset 0; WDT (0x36 period in ms, 0x37
  *     WDT_EN|WDT_RESET_EN, programmed by pmu_shutdown's fallback
  *     sub_C0E7C00) resets the system when it expires unfed
+ *   - PMU 0xF7..0xFE (page 0): a self-timed analog sequence. Writing
+ *     0xF8 with bits 14 and 3 set starts it; 0xFC bit 11 reports it
+ *     finished. p67 (sub_C0E8684) samples 0xFC once after a 10 us delay
+ *     and ignores the result; Band 9 n66 (sub_C109F58, called from the
+ *     analog init sub_C100880) polls 0xFC until bit 11 is set. Modelled
+ *     as finishing as soon as it is started.
  *   - GPADC (PMU page 0, hal_gpadc sub_C22EE84 / sub_C22EF38): 0x50 is the
  *     conversion-done bitmap, 0x51 its clear, 0x56 + ch the channel code.
  *     Conversions complete instantly. The code is produced from the
@@ -114,6 +120,13 @@ static void bes_pmu_exec(BesPmuState *s, uint32_t cmd)
         /* read command: produce the RX word */
         if (dev == BES_ISPI_DEV_PMU && off == BES_PMU_REG_CHIP_ID) {
             val = BES_PMU_CHIP_ID_VAL;
+        } else if (dev == BES_ISPI_DEV_PMU && page == 0 &&
+                   off == BES_PMU_REG_SEQ_STATUS) {
+            val = s->regs[dev][page][off];
+            if ((s->regs[dev][page][BES_PMU_REG_SEQ_CTRL] &
+                 BES_PMU_SEQ_START) == BES_PMU_SEQ_START) {
+                val |= BES_PMU_SEQ_DONE;
+            }
         } else if (dev == BES_ISPI_DEV_PMU && page == 0 && off == 0x50) {
             val = 0xFF;     /* every channel has a finished conversion */
         } else if (dev == BES_ISPI_DEV_PMU && page == 0 &&
