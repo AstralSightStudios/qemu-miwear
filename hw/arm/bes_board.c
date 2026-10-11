@@ -167,7 +167,8 @@ static const BesBoard bes_boards[] = {
         .panel_height = 480,
         .lcd_te_gpio = 65,
         /* CST9217 @0x5A on I2C3，INT GPIO 27 */
-        .touch = { TYPE_HYNITRON_TS, 3, 0x5A, 27 },
+        /* 触摸在 I2C5（0x40063000）：固件对 0x5A 的访问全部落在该总线上 */
+        .touch = { TYPE_HYNITRON_TS, 5, 0x5A, 27 },
         /* NAND：固件表 nand_system first 0 nblocks 57600、nand_data
          * first 57600 nblocks 73472；/system 是 YAFFS2 目录树 */
         .nand_id = 0xC8F4C8,
@@ -175,7 +176,7 @@ static const BesBoard bes_boards[] = {
         .nand_oob_size = 64,
         .nand_pages_per_block = 64,
         .nand_blocks = 4096,
-        .gpadc_mv = { [2] = 571, [3] = 450, [5] = 450 },
+        /* 未配 GPADC：沿用 n66 的 ch2/ch3/ch5 标定时固件把电池读成 38 mV，判低电量关机 */
     },
     {
         /* 板级外设逐个查实后补入 */
