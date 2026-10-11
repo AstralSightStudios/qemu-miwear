@@ -78,7 +78,7 @@ static const BesBoard bes_boards[] = {
          * sub_C35CBC0），400kHz；引脚表 0x200812A0：reset 28、
          * interrupt 27、vcc_en 74。board_hynitron_setup 先试 cst92xx，
          * 只有 I2C 不应答时才转 zinitix，故装 CST92xx。 */
-        .touch = { TYPE_HYNITRON_TS, 3, 0x5A, 27 },
+        .touch = { TYPE_HYNITRON_TS, 3, 0x5A, 27, false, 0x9217 },
         /* 板号 0（board.binfos "bt"）：board_bsp_product_init 记
          * "not support nfc"，NFC 栈不启动，不装 */
         /* NAND：固件按 512MB 表分区（实测日志 resource first 0
@@ -116,7 +116,7 @@ static const BesBoard bes_boards[] = {
          * 先探测 Zinitix @0x20（devid 须为 0xE623），再探测 CST92xx
          * @0x5A；引脚 INT 0x1041B（GPIO 27）、RESET 0x1401C（28）、
          * 供电 0x1404A / 0x1404D。 */
-        .touch = { TYPE_HYNITRON_TS, 3, 0x5A, 27 },
+        .touch = { TYPE_HYNITRON_TS, 3, 0x5A, 27, true, 0x9220 },
         /* NAND：固件分区 nand_system first 0 nblocks 65536、nand_data
          * first 65536 nblocks 65536（实测日志），/system 是 YAFFS2
          * （emu/mknand.py --profile n66 --system <固件目录>）；固件 ID 表
@@ -144,7 +144,7 @@ static const BesBoard bes_boards[] = {
         .panel_x_offset = 24,
         .lcd_te_gpio = 65,
         /* CST9217M @0x5A on I2C3，INT GPIO 27 */
-        .touch = { TYPE_HYNITRON_TS, 3, 0x5A, 27 },
+        .touch = { TYPE_HYNITRON_TS, 3, 0x5A, 27, true, 0x9220 },
         /* NAND：固件 512MB 表 nand_system first 0 nblocks 65536、nand_data
          * first 65536 nblocks 196608；/system 是 YAFFS2 */
         .nand_id = 0xC8F4C8,
@@ -168,7 +168,7 @@ static const BesBoard bes_boards[] = {
         .lcd_te_gpio = 65,
         /* CST9217 @0x5A on I2C3，INT GPIO 27 */
         /* 触摸在 I2C5（0x40063000）：固件对 0x5A 的访问全部落在该总线上 */
-        .touch = { TYPE_HYNITRON_TS, 5, 0x5A, 27 },
+        .touch = { TYPE_HYNITRON_TS, 5, 0x5A, 27, true, 0x9220 },
         /* W1150 light device on I2C5 at 0x48 (sub_C3913A0 w11xx init) */
         .light = { "w1150.als", 5, 0x48, -1 },
         /* NAND：固件表 nand_system first 0 nblocks 57600、nand_data

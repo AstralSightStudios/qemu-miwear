@@ -552,6 +552,10 @@ static void best1503_init(MachineState *machine, BesImage *img,
 
             qdev_prop_set_uint32(DEVICE(tp), "width", board->panel_width);
             qdev_prop_set_uint32(DEVICE(tp), "height", board->panel_height);
+            if (board->touch.part_no) {
+                qdev_prop_set_uint32(DEVICE(tp), "part-no", board->touch.part_no);
+            }
+            qdev_prop_set_bit(DEVICE(tp), "hyn92xx", board->touch.hyn92xx);
             i2c_slave_realize_and_unref(tp, i2c_bus[board->touch.bus],
                                         &error_fatal);
             qdev_connect_gpio_out_named(DEVICE(tp), "irq", 0,

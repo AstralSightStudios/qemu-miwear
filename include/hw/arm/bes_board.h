@@ -40,6 +40,8 @@ typedef struct BesBoardI2C {
     int bus;                    /* SoC I2C controller index */
     uint8_t addr;
     int irq_gpio;               /* interrupt / data-ready line, -1 = none */
+    bool hyn92xx;               /* true = Hynitron hyn92xx driver, false = Xiaomi cst92xx */
+    uint32_t part_no;           /* touch IC part number (0 = default) */
 } BesBoardI2C;
 
 typedef struct BesBoard {

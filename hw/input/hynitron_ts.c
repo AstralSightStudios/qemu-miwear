@@ -302,6 +302,32 @@ static uint8_t hyn_gesture_code(HynitronTsState *s)
     return s->gesture;
 }
 
+/* hyn92xx echoes the mode command byte; Xiaomi's cst92xx echoes the enum */
+static uint8_t hyn_echo_mode(HynitronTsState *s)
+{
+    if (s->mode == 0x1E) {
+        return 0x1E;
+    }
+    if (s->hyn92xx) {
+        return s->mode;
+    }
+    switch (s->mode) {
+    case 0x09: return 0;   /* ENUM_MODE_NORMAL */
+    case 0x0D: return 4;
+    case 0x0A: return 5;
+    case 0x14: return 6;
+    case 0x01: return 7;
+    case 0x25: return 9;
+    case 0x26: return 10;
+    case 0x23: return 11;
+    case 0x24: return 12;
+    case 0x10: return 16;
+    case 0x11: return 17;
+    case 0x12: return 18;
+    default:   return s->mode;
+    }
+}
+
 static uint8_t hyn_read_byte(HynitronTsState *s, unsigned off)
 {
     const HynitronEvent *e = s->q_count ? &s->q[s->q_head] : NULL;
@@ -317,7 +343,7 @@ static uint8_t hyn_read_byte(HynitronTsState *s, unsigned off)
     case HYN_CMD_MEM_DATA:
         return off < 4 ? hyn_mem_word(s) >> (off * 8) : 0;
     case HYN_CMD_ECHO:
-        return off == 1 ? s->mode : 0;
+        return off == 1 ? hyn_echo_mode(s) : 0;
     case HYN_CMD_ESD:
         if (off == 0) {
             return HYN_ESD_ALIVE;
@@ -556,6 +582,7 @@ static void hyn_init(Object *obj)
 }
 
 static const Property hyn_props[] = {
+    DEFINE_PROP_BOOL("hyn92xx", HynitronTsState, hyn92xx, false),
     DEFINE_PROP_UINT32("part-no", HynitronTsState, part_no, 0x9217),
     DEFINE_PROP_UINT32("module-id", HynitronTsState, module_id, 0x03660014),
     DEFINE_PROP_UINT32("project-id", HynitronTsState, project_id, 0x0001),
