@@ -544,7 +544,14 @@ static bool vgl_sampler_open(VsiVgliteState *s, VglSampler *sm, bool paint)
     if (!sm->w || !sm->h) {
         return false;
     }
-    vgl_mem_open(&sm->mem, &s->as, addr, (uint64_t)sm->stride * sm->h,
+    /*
+     * The last row needs only its pixels: a gradient's colour ramp is a
+     * single row and the driver leaves its stride at 0 (q63 firmware).
+     */
+    vgl_mem_open(&sm->mem, &s->as, addr,
+                 (uint64_t)sm->stride * (sm->h - 1) +
+                 (sm->fmt.bytes ? (uint64_t)sm->w * sm->fmt.bytes
+                                : ((uint64_t)sm->w * sm->fmt.bits + 7) / 8),
                  false);
     return true;
 }
@@ -856,6 +863,17 @@ static bool vgl_pe_open(VsiVgliteState *s, VglPE *pe, int y0, int y1)
 
         for (i = 0; i < 9; i++) {
             pe->grad[i] = vgl_stf(s, reg[i]);
+        }
+        if (trace_event_get_state_backends(TRACE_VSI_VGLITE_RAMP) &&
+            pe->pattern.fmt.bytes) {
+            unsigned bpp = pe->pattern.fmt.bytes, w = pe->pattern.w;
+
+            trace_vsi_vglite_ramp(vgl_st(s, ST_PAINT_CONFIG), w,
+                                  vgl_mem_pixel(&pe->pattern.mem, 0, bpp),
+                                  vgl_mem_pixel(&pe->pattern.mem,
+                                                (w / 2) * bpp, bpp),
+                                  vgl_mem_pixel(&pe->pattern.mem,
+                                                (w - 1) * bpp, bpp));
         }
     }
     if (pe->image_mode != IM_NONE && !pe->use_paint) {

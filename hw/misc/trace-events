@@ -493,6 +493,7 @@ bes_lcdc_write(uint64_t offset, uint64_t val) "off=0x%03" PRIx64 " val=0x%08" PR
 vsi_vglite_submit(uint32_t addr, uint32_t size) "cmdbuf 0x%08x size %u"
 vsi_vglite_state(uint32_t addr, uint32_t val) "state 0x%04x = 0x%08x"
 vsi_vglite_rect(uint32_t ctrl, uint32_t tcfg, uint32_t taddr, uint32_t icfg, uint32_t iaddr, unsigned x, unsigned y, unsigned w, unsigned h) "ctrl=0x%08x target=0x%08x@0x%08x image=0x%08x@0x%08x rect %u,%u %ux%u"
+vsi_vglite_ramp(uint32_t cfg, unsigned w, uint32_t first, uint32_t mid, uint32_t last) "paint 0x%08x width %u: texels 0x%08x 0x%08x 0x%08x"
 vsi_vglite_path(uint32_t ctrl, uint32_t pctrl, uint32_t taddr, uint64_t data, uint32_t bytes) "ctrl=0x%08x path=0x%08x target=0x%08x data=0x%"PRIx64" %u bytes"
 
 # best1700_dsi.c
