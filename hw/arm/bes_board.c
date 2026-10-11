@@ -97,6 +97,87 @@ static const BesBoard bes_boards[] = {
         /* 无实体按键 */
     },
     {
+        .name = "n66",
+        .desc = "Xiaomi Smart Band 9",
+        .chip = "best1503",
+        .product = "n66",
+        /* 依据为 n66 3.1.32 IDB。192x490：LCD 识别（rm690b0 / rm690c0 /
+         * sh8601z1 读 ID）落空后默认 rm690b0，日志 "rel_screen_w = 192,
+         * rel_screen_h = 490"。TE 脚未实测，沿用 GPIO 65；运行中没有
+         * "Bad te gpio" 报错。 */
+        .panel_width = 192,
+        .panel_height = 490,
+        /* 实测 SPU DCS 流：CASET 24..215（RASET 0..489），即 192 列的可见区
+         * 从 GRAM 第 24 列开始；偏移若取 14 则窗口超出 192 列，画面右移
+         * 10 像素并被截掉右侧 */
+        .panel_x_offset = 24,
+        .lcd_te_gpio = 65,
+        /* board_tp_initialize（sub_C3AC660）：I2C 3（sub_C1689A8(3)），
+         * 先探测 Zinitix @0x20（devid 须为 0xE623），再探测 CST92xx
+         * @0x5A；引脚 INT 0x1041B（GPIO 27）、RESET 0x1401C（28）、
+         * 供电 0x1404A / 0x1404D。 */
+        .touch = { TYPE_HYNITRON_TS, 3, 0x5A, 27 },
+        /* NAND：固件分区 nand_system first 0 nblocks 65536、nand_data
+         * first 65536 nblocks 65536（实测日志），/system 是 YAFFS2
+         * （emu/mknand.py --profile n66 --system <固件目录>）；固件 ID 表
+         * 0xC739F9C 含 c8-f4-c8（512MB，2048+64B 页） */
+        .nand_id = 0xC8F4C8,
+        .nand_page_size = 2048,
+        .nand_oob_size = 64,
+        .nand_pages_per_block = 64,
+        .nand_blocks = 4096,
+        /* 板号 ADC 用 PMU 默认 ch4 816 mV：hw 版本表 0x2C698FC8
+         * 701..900 mV = 3（实测 "get_hw_ver: vol=815, hwver=3"）。
+         * 无实体按键 */
+    },
+    {
+        .name = "o66",
+        .desc = "Xiaomi Smart Band 10",
+        .chip = "best1503",
+        .product = "o66",
+        /* 依据为 o66 3.1.28 IDB：rm690b0 vtable 0x2c10b9e4 给出 212x520
+         * （0xD4 x 0x208）；实测 SPU DCS 流 CASET 24..235（RASET 0..519），
+         * 可见区从 GRAM 第 24 列开始。TE 脚未实测，沿用 q66 的 GPIO 65；
+         * 运行中没有 "Bad te gpio" 报错 */
+        .panel_width = 212,
+        .panel_height = 520,
+        .panel_x_offset = 24,
+        .lcd_te_gpio = 65,
+        /* CST9217M @0x5A on I2C3，INT GPIO 27 */
+        .touch = { TYPE_HYNITRON_TS, 3, 0x5A, 27 },
+        /* NAND：固件 512MB 表 nand_system first 0 nblocks 65536、nand_data
+         * first 65536 nblocks 196608；/system 是 YAFFS2 */
+        .nand_id = 0xC8F4C8,
+        .nand_page_size = 2048,
+        .nand_oob_size = 64,
+        .nand_pages_per_block = 64,
+        .nand_blocks = 4096,
+        /* 板载 GPADC：ch2=电池分压(571 mV 对应 4.0V)，ch3/ch5=NTC 测温
+         * (450 mV 对应室温 25℃，低过 84 mV 会报 70℃ 触发过温保护) */
+        .gpadc_mv = { [2] = 571, [3] = 450, [5] = 450 },
+    },
+    {
+        .name = "n67",
+        .desc = "Xiaomi Smart Band 9 Pro",
+        .chip = "best1503",
+        .product = "n67",
+        /* 未验证：启动在显示前的 PMU 阶段就停了，面板尺寸、CASET 与 TE 脚
+         * 都还没有实测，下面的数值只是占位。 */
+        .panel_width = 336,
+        .panel_height = 480,
+        .lcd_te_gpio = 65,
+        /* CST9217 @0x5A on I2C3，INT GPIO 27 */
+        .touch = { TYPE_HYNITRON_TS, 3, 0x5A, 27 },
+        /* NAND：固件表 nand_system first 0 nblocks 57600、nand_data
+         * first 57600 nblocks 73472；/system 是 YAFFS2 目录树 */
+        .nand_id = 0xC8F4C8,
+        .nand_page_size = 2048,
+        .nand_oob_size = 64,
+        .nand_pages_per_block = 64,
+        .nand_blocks = 4096,
+        .gpadc_mv = { [2] = 571, [3] = 450, [5] = 450 },
+    },
+    {
         /* 板级外设逐个查实后补入 */
         .name = "q63",
         .desc = "Xiaomi Watch S5 (best1700)",
