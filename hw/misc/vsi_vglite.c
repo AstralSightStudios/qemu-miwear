@@ -513,7 +513,7 @@ static bool vgl_sampler_open(VsiVgliteState *s, VglSampler *sm, bool paint)
     sm->h = size >> 16;
     sm->tile = (cfg >> 12) & 3;
     sm->filter = (cfg >> 16) & 3;
-    sm->premul = !paint && (cfg & (1u << 24));
+    sm->premul = !paint && !(cfg & (1u << 24));
     vgl_abgr(vgl_st(s, paint ? ST_PAINT_BORDER : ST_IMAGE_BORDER),
              sm->border);
     vgl_premultiply(sm->border);
