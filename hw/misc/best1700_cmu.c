@@ -321,6 +321,7 @@ static void bt_ind_ack(void *opaque, int ch, int level)
     if (level) {
         s->bt_word &= ~BT_IND(ch);
         s->bt_raw |= BT_TX_DONE(ch);
+        trace_best1700_cmu_bt("bt-took", ch, s->bt_word, s->bt_raw);
         bt_update(s);
     }
 }
@@ -335,6 +336,8 @@ static void bt_data(void *opaque, int ch, int level)
     } else {
         s->bt_raw &= ~BT_RX(ch);
     }
+    trace_best1700_cmu_bt(level ? "bt-data" : "bt-nodata", ch, s->bt_word,
+                          s->bt_raw);
     bt_update(s);
 }
 
@@ -342,6 +345,8 @@ static void bt_write(Best1700CmuState *s, bool set, uint32_t value)
 {
     int ch;
 
+    trace_best1700_cmu_bt(set ? "set" : "clear", value, s->bt_word,
+                          s->bt_raw);
     if (set) {
         uint32_t newly = value & ~s->bt_word;
 

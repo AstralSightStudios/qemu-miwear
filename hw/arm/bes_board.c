@@ -342,6 +342,17 @@ static void bes_set_sensor_image(Object *obj, const char *val, Error **errp)
     BES_MACHINE(obj)->sensor_image = g_strdup(val);
 }
 
+static char *bes_get_sensor_nor(Object *obj, Error **errp)
+{
+    return g_strdup(BES_MACHINE(obj)->sensor_nor);
+}
+
+static void bes_set_sensor_nor(Object *obj, const char *val, Error **errp)
+{
+    g_free(BES_MACHINE(obj)->sensor_nor);
+    BES_MACHINE(obj)->sensor_nor = g_strdup(val);
+}
+
 /* the image named by a property, else <name> next to -kernel; "" = none */
 static char *bes_machine_sibling_image(MachineState *ms, const char *prop,
                                        const char *name)
@@ -382,6 +393,7 @@ static void bes_machine_finalize(Object *obj)
     g_free(bms->nand_image);
     g_free(bms->tee_image);
     g_free(bms->sensor_image);
+    g_free(bms->sensor_nor);
 }
 
 static void bes_machine_class_init(ObjectClass *oc, const void *data)
@@ -435,6 +447,14 @@ static void bes_machine_class_init(ObjectClass *oc, const void *data)
                                           "chips that have one; default: "
                                           "vela_sensor.bin next to the "
                                           "-kernel firmware, empty for none");
+    object_class_property_add_str(oc, "sensor-nor", bes_get_sensor_nor,
+                                  bes_set_sensor_nor);
+    object_class_property_set_description(oc, "sensor-nor",
+                                          "backing image file of the sensor "
+                                          "hub's own NOR flash (loaded at "
+                                          "startup, written back on exit; "
+                                          "the sensor image is installed at "
+                                          "its start); see emu/mksensornor.py");
 }
 
 static void miwear_machine_class_init(ObjectClass *oc, const void *data)

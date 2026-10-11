@@ -102,6 +102,7 @@ struct BesMachineState {
     char *nand_image;
     char *tee_image;
     char *sensor_image;
+    char *sensor_nor;
 
     const BesSoc *soc;
 };

@@ -22,6 +22,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(BesBtssState, BES_BTSS)
 #define BES_BTSS_RADIO_BUF  4096
 
 typedef struct BesBtssMsg {
+    int64_t ready_us;                   /* published from this time on */
     uint16_t len;
     uint8_t data[BES_BTSS_MSG_MAX];
 } BesBtssMsg;
@@ -122,6 +123,8 @@ struct BesBtssState {
 
     BesBtssChan chan[BES_BTSS_CHANNELS];
     uint32_t latency_us;                /* controller response latency */
+    uint32_t reset_latency_us;          /* ... of HCI_Reset */
+    uint32_t reply_us;                  /* latency of what is queued now */
     QEMUTimer *publish_timer;
     int hci_ch;                         /* channel the band's host uses */
 

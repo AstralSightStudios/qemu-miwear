@@ -46,12 +46,30 @@
  * Command Complete satisfies that handshake.
  *
  * Timing: the controller takes the AP's messages immediately (TX done)
- * but answers after a processing latency (latency-us, default 1 ms). The
- * driver depends on that ordering: on HCI_Reset it marks the controller
- * asleep, and the Command Complete of the 0xFC77 wake handshake that it
- * replays after the reset resets the TX-done semaphore. An instant reply
- * lands before the thread that sent the reset has consumed its TX-done,
- * the reset wipes it, and bthci_send asserts (line 343) after 10 s.
+ * but answers after a processing latency (latency-us, default 1 ms).
+ * Messages go out in order, each once its own latency has passed. Two
+ * host behaviours bound that latency (q63 cp firmware, vela_cp.bin):
+ *   - On HCI_Reset bthci_send marks the controller asleep; bthci_receive
+ *     answers the reset's Command Complete with the 0xFC77 wake command
+ *     and, on that command's Command Complete, resets the TX-done
+ *     semaphore. If this lands before the thread that sent the reset has
+ *     taken its TX-done, the reset wipes it and bthci_send asserts
+ *     (bes_serial_hci2.c line 343) after 10 s. HCI_Reset therefore
+ *     completes after reset-latency-us, like a real controller that
+ *     needs a while to reset, which leaves the sending thread time to
+ *     take its TX-done (q63: 100 ms; with 1 ms the race was lost about
+ *     once in 30 boots, with 10 ms still under host load).
+ *   - The Bluetooth driver's init (btdrv) opens mailbox (0, 0) with its
+ *     own receive handler, sends vendor commands without waiting for
+ *     their completion (btdrv_SendData only waits for TX done) and closes
+ *     the mailbox again; bthci opens it later. A Command Complete that
+ *     arrives in between finds no handler: "INTERSYS-RX: Handler missing"
+ *     (hal_intersys_rx_irq_handler line 544): rx_done re-enables a
+ *     channel's receive interrupt whether or not it is open. A real
+ *     controller answers well before that. With latency-us 0 an answer is
+ *     published within the very doorbell access that carried the command,
+ *     so the host takes it in its receive interrupt before the send call
+ *     returns (q63; at 50 us or 1 ms one boot in about 20 failed).
  *
  * This code is licensed under the GPL version 2 or later.
  */
@@ -96,7 +114,9 @@ static void btss_publish(BesBtssState *s, int ch)
     uint32_t prev = 0;
     unsigned n;
 
-    if (c->inflight || !c->q_count) {
+    int64_t now = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL);
+
+    if (c->inflight || !c->q_count || c->q[c->q_head].ready_us > now) {
         return;
     }
     for (n = 0; n < c->q_count; n++) {
@@ -104,7 +124,8 @@ static void btss_publish(BesBtssState *s, int ch)
         uint32_t desc = base + EXCH_DESC_OFF + n * EXCH_DESC_SIZE;
         uint8_t hdr[EXCH_DESC_SIZE] = { 0 };
 
-        if (data + m->len > base + EXCH_CHAN_SPAN ||
+        if (m->ready_us > now ||
+            data + m->len > base + EXCH_CHAN_SPAN ||
             desc + EXCH_DESC_SIZE > base + EXCH_DATA_OFF) {
             break;
         }
@@ -130,6 +151,26 @@ static void btss_publish(BesBtssState *s, int ch)
     qemu_set_irq(s->bt2mcu[ch], 1);
 }
 
+/* wake up when the next unpublished message is due */
+static void btss_schedule(BesBtssState *s)
+{
+    int64_t next = INT64_MAX;
+    int ch;
+
+    for (ch = 0; ch < BES_BTSS_CHANNELS; ch++) {
+        BesBtssChan *c = &s->chan[ch];
+
+        if (!c->inflight && c->q_count) {
+            next = MIN(next, c->q[c->q_head].ready_us);
+        }
+    }
+    if (next == INT64_MAX) {
+        timer_del(s->publish_timer);
+    } else {
+        timer_mod(s->publish_timer, next);
+    }
+}
+
 static void btss_queue(BesBtssState *s, int ch, const uint8_t *data,
                        unsigned len)
 {
@@ -144,12 +185,21 @@ static void btss_queue(BesBtssState *s, int ch, const uint8_t *data,
     m = &c->q[(c->q_head + c->q_count) % BES_BTSS_QUEUE_LEN];
     memcpy(m->data, data, len);
     m->len = len;
-    c->q_count++;
-    /* published once the controller has "processed" the request */
-    if (!timer_pending(s->publish_timer)) {
-        timer_mod(s->publish_timer,
-                  qemu_clock_get_us(QEMU_CLOCK_VIRTUAL) + s->latency_us);
+    /* published once the controller has "processed" the request, and
+     * never ahead of what was queued before it */
+    m->ready_us = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL) + s->reply_us;
+    if (c->q_count) {
+        const BesBtssMsg *last =
+            &c->q[(c->q_head + c->q_count - 1) % BES_BTSS_QUEUE_LEN];
+
+        m->ready_us = MAX(m->ready_us, last->ready_us);
     }
+    c->q_count++;
+    if (!s->reply_us) {
+        /* no latency: out within the access that caused it */
+        btss_publish(s, ch);
+    }
+    btss_schedule(s);
 }
 
 static void btss_publish_timer(void *opaque)
@@ -160,6 +210,7 @@ static void btss_publish_timer(void *opaque)
     for (ch = 0; ch < BES_BTSS_CHANNELS; ch++) {
         btss_publish(s, ch);
     }
+    btss_schedule(s);
 }
 
 unsigned btss_band_queue_free(BesBtssState *s)
@@ -189,6 +240,7 @@ static void btss_rx_done(BesBtssState *s, int ch)
     btss_stl(s, s->exch_base + ch * EXCH_CHAN_SPAN + EXCH_HEAD_OFF, 0);
     qemu_set_irq(s->bt2mcu[ch], 0);
     btss_publish(s, ch);
+    btss_schedule(s);
     if (ch == s->hci_ch) {
         btss_link_band_drained(s);
     }
@@ -585,9 +637,8 @@ static void hci_fill_return(BesBtssState *s, int side, uint16_t opcode,
     }
 }
 
-/* one H4 command packet from the host of controller "side" */
-void btss_hci_command(BesBtssState *s, int side, const uint8_t *cmd,
-                      unsigned len)
+static void btss_hci_execute(BesBtssState *s, int side, const uint8_t *cmd,
+                             unsigned len)
 {
     uint16_t opcode;
     uint8_t rp[252];
@@ -625,6 +676,19 @@ void btss_hci_command(BesBtssState *s, int side, const uint8_t *cmd,
     }
     hci_fill_return(s, side, opcode, cmd, len, rp);
     btss_cmd_complete(s, side, opcode, rp, n);
+}
+
+/* one H4 command packet from the host of controller "side" */
+void btss_hci_command(BesBtssState *s, int side, const uint8_t *cmd,
+                      unsigned len)
+{
+    /* a reset takes the controller a while (see the header) */
+    if (side == BTSS_BAND && len >= 4 && lduw_le_p(cmd + 1) == 0x0C03 &&
+        s->reset_latency_us) {
+        s->reply_us = s->reset_latency_us;
+    }
+    btss_hci_execute(s, side, cmd, len);
+    s->reply_us = s->latency_us;
 }
 
 /* one MCU -> BT message */
@@ -731,6 +795,7 @@ static void bes_btss_reset(DeviceState *dev)
 
     memset(s->btcmu_regs, 0, sizeof(s->btcmu_regs));
     memset(s->chan, 0, sizeof(s->chan));
+    s->reply_us = s->latency_us;
     timer_del(s->publish_timer);
     btss_link_reset(s);
 }
@@ -750,6 +815,7 @@ static void bes_btss_realize(DeviceState *dev, Error **errp)
     address_space_init(&s->as, s->downstream, "bes.btss-as");
     s->publish_timer = timer_new_us(QEMU_CLOCK_VIRTUAL, btss_publish_timer,
                                     s);
+    s->reply_us = s->latency_us;
     btss_link_realize(s, errp);
 }
 
@@ -775,6 +841,7 @@ static const Property bes_btss_props[] = {
     DEFINE_PROP_UINT32("exch-base", BesBtssState, exch_base, 0),
     DEFINE_PROP_UINT32("exch-size", BesBtssState, exch_size, 0),
     DEFINE_PROP_UINT32("latency-us", BesBtssState, latency_us, 1000),
+    DEFINE_PROP_UINT32("reset-latency-us", BesBtssState, reset_latency_us, 0),
     DEFINE_PROP_BOOL("rx-head-direct", BesBtssState, rx_head_direct, false),
     DEFINE_PROP_UINT16("hci-revision", BesBtssState, hci_revision, 0),
     DEFINE_PROP_INT32("hci-channel", BesBtssState, hci_channel, -1),

@@ -802,6 +802,11 @@ static void best1700_bth_init(MachineState *machine, MemoryRegion *sysmem,
     fc = qdev_new(TYPE_BES_FLASH);
     qdev_prop_set_uint32(fc, "size", BEST1700_BTH_FLASH_SIZE);
     qdev_prop_set_uint32(fc, "jedec-id", 0xC86017);
+    /* sensor-nor= keeps the rest of the NOR (its /misc littlefs with the
+     * factory properties, see emu/mksensornor.py) across runs */
+    if (BES_MACHINE(machine)->sensor_nor) {
+        qdev_prop_set_string(fc, "image", BES_MACHINE(machine)->sensor_nor);
+    }
     sysbus_realize_and_unref(SYS_BUS_DEVICE(fc), &error_fatal);
     memcpy(bes_flash_data(BES_FLASH(fc)), image, len);
     best1700_map(SYS_BUS_DEVICE(fc), 0, BEST1700_BTH_FLASH_CTRL_BASE);
@@ -1537,6 +1542,10 @@ static void best1700_init(MachineState *machine, BesImage *img,
         qdev_prop_set_uint8(btss, "data-done-shift", 18);
         qdev_prop_set_uint16(btss, "hci-revision", BEST1700_BT_FW_DATE);
         qdev_prop_set_int32(btss, "hci-channel", 0);
+        /* 回复时序（见 bes_btss.c 头注释）：btdrv 发完配置命令即关邮箱，
+         * 回复须远早于此；HCI_Reset 则像真控制器一样要一段时间 */
+        qdev_prop_set_uint32(btss, "latency-us", 0);
+        qdev_prop_set_uint32(btss, "reset-latency-us", 100000);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(btss), &error_fatal);
         memory_region_add_subregion(sysmem, BEST1700_BT_CMU_BASE,
             sysbus_mmio_get_region(SYS_BUS_DEVICE(btss), 0));
