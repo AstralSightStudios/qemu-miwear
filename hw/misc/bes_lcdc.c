@@ -42,6 +42,11 @@
  * board wires TE to a GPIO interrupt that paces frame starts (display PM
  * thread sub_C224ECC).
  *
+ * The panel's frame memory can be larger than its visible area: the
+ * properties panel-x-offset / panel-y-offset give the GRAM column / row
+ * the visible area starts at (Band 9's panel: full-screen CASET 14..205
+ * for 192 visible columns), and CASET/RASET are taken relative to it.
+ *
  * A started frame is composed from the enabled layers into the panel's
  * frame memory (GRAM) at the window set by the last CASET/RASET, and
  * completes after the QSPI transfer time with the frame-done IRQ.  The
@@ -102,6 +107,8 @@ struct BesLcdcState {
     /* panel */
     uint32_t panel_w;
     uint32_t panel_h;
+    uint32_t panel_x_off;       /* GRAM column of the first visible one */
+    uint32_t panel_y_off;       /* GRAM row of the first visible one */
     uint32_t refresh_hz;
     uint32_t frame_us;          /* QSPI transfer time of one frame */
     bool sleeping;
@@ -228,12 +235,12 @@ static void bes_lcdc_dcs(BesLcdcState *s, uint8_t dcs, uint32_t p)
         s->te_on = true;
         break;
     case DCS_CASET:
-        s->win_x0 = p >> 16;
-        s->win_x1 = p & 0xFFFF;
+        s->win_x0 = (p >> 16) - MIN(p >> 16, s->panel_x_off);
+        s->win_x1 = (p & 0xFFFF) - MIN(p & 0xFFFF, s->panel_x_off);
         break;
     case DCS_RASET:
-        s->win_y0 = p >> 16;
-        s->win_y1 = p & 0xFFFF;
+        s->win_y0 = (p >> 16) - MIN(p >> 16, s->panel_y_off);
+        s->win_y1 = (p & 0xFFFF) - MIN(p & 0xFFFF, s->panel_y_off);
         break;
     }
     bes_lcdc_te_update(s);
@@ -249,8 +256,25 @@ static void bes_lcdc_panel_cmd(BesLcdcState *s, uint32_t cmdword)
     uint32_t p = lcdc_reg(s, LCDC_SPU_DATA0);
 
     trace_bes_lcdc_panel_cmd(instr, dcs, p);
-    if (instr == 0x02) {                /* reads and pixel writes ignored */
+    if (instr == 0x02) {                /* writes */
         bes_lcdc_dcs(s, dcs, p);
+    } else if (instr == 0x03) {         /* panel register reads */
+        uint8_t resp = 0;
+        switch (dcs) {
+        case 0x0A:                      /* get power mode: display on, normal */
+            resp = 0x9C;
+            break;
+        case 0xDA:                      /* read ID1 */
+            resp = 0x26;
+            break;
+        case 0xDB:                      /* read ID2 */
+            resp = 0x01;
+            break;
+        case 0xDC:                      /* read ID3 */
+            resp = 0x20;
+            break;
+        }
+        s->regs[0x140 / 4] = resp;
     }
 }
 
@@ -498,6 +522,8 @@ static void bes_lcdc_init(Object *obj)
 static const Property bes_lcdc_props[] = {
     DEFINE_PROP_UINT32("panel-width", BesLcdcState, panel_w, 336),
     DEFINE_PROP_UINT32("panel-height", BesLcdcState, panel_h, 480),
+    DEFINE_PROP_UINT32("panel-x-offset", BesLcdcState, panel_x_off, 0),
+    DEFINE_PROP_UINT32("panel-y-offset", BesLcdcState, panel_y_off, 0),
     DEFINE_PROP_UINT32("refresh-hz", BesLcdcState, refresh_hz, 60),
     DEFINE_PROP_UINT32("frame-us", BesLcdcState, frame_us, 8000),
 };

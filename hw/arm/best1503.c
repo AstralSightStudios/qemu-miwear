@@ -531,6 +531,8 @@ static void best1503_init(MachineState *machine, BesImage *img,
         /* 面板尺寸与 TE 脚来自板级 profile */
         qdev_prop_set_uint32(lcdc, "panel-width", board->panel_width);
         qdev_prop_set_uint32(lcdc, "panel-height", board->panel_height);
+        qdev_prop_set_uint32(lcdc, "panel-x-offset", board->panel_x_offset);
+        qdev_prop_set_uint32(lcdc, "panel-y-offset", board->panel_y_offset);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(lcdc), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(lcdc), 0, BEST1503_LCDC_BASE);
         sysbus_connect_irq(SYS_BUS_DEVICE(lcdc), 0,

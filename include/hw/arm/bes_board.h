@@ -52,6 +52,10 @@ typedef struct BesBoard {
     uint32_t panel_width;
     uint32_t panel_height;
     int lcd_te_gpio;            /* tearing-effect line, -1 = none */
+    /* GRAM column / row where the visible area starts (CASET / RASET of a
+     * full-screen frame), 0 for panels whose GRAM is the visible area */
+    uint32_t panel_x_offset;
+    uint32_t panel_y_offset;
 
     BesBoardI2C touch;
     BesBoardI2C nfc;
