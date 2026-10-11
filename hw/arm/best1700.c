@@ -853,7 +853,13 @@ static void best1700_bth_init(MachineState *machine, MemoryRegion *sysmem,
     /* BTH 的 SP804 ×3：sensor 的 hal_timer_setup 自 RAM 表（0x230034e0）
      * 取基址 {0x4008B000, 0x50002000, 0x50003000}，自 0x2c293fbc 取中断
      * {19, 20}, {23, 24}, {25, 26}。0 号在 AON 区、走慢时钟，hwtimer
-     * （tickless 闹钟）用其子定时器 0；1、2 号时钟未查实，按快时钟。 */
+     * （tickless 闹钟）用其子定时器 0；1、2 号时钟未查实，按快时钟。
+     * BES 定时器的计数含 0 态，Load + 1 个周期才中断：hal_timer 重装
+     * （sensor 0x0c0a2980）为 n 个节拍写 Load = n - 1。少数一拍时，
+     * hwtimer_handler（0x0c0a41e4）读系统定时器发现闹钟未到，只记一次
+     * "irq early" 便返回、不再重设硬件定时器，此后 tickless 睡眠永不
+     * 唤醒（sensor 卡在 rptun 建链的 10ms 轮询里，cp/AP 随之停在启动
+     * 中途），故 SP804 开 count-zero。 */
     {
         static const struct {
             uint32_t base, freq;
@@ -871,6 +877,7 @@ static void best1700_bth_init(MachineState *machine, MemoryRegion *sysmem,
             qdev_prop_set_uint32(tmr, "freq0", btimers[i].freq);
             qdev_prop_set_uint32(tmr, "freq1", btimers[i].freq);
             qdev_prop_set_bit(tmr, "split-irq", true);
+            qdev_prop_set_bit(tmr, "count-zero", true);
             sysbus_realize_and_unref(SYS_BUS_DEVICE(tmr), &error_fatal);
             best1700_map(SYS_BUS_DEVICE(tmr), 0, btimers[i].base);
             sysbus_connect_irq(SYS_BUS_DEVICE(tmr), 0,
@@ -1219,6 +1226,8 @@ static void best1700_init(MachineState *machine, BesImage *img,
             qdev_prop_set_uint32(tmr, "freq1", timers[i].freq);
             /* BES 两子定时器分接两路 NVIC，不做 OR 合并 */
             qdev_prop_set_bit(tmr, "split-irq", true);
+            /* 计数含 0 态：Load + 1 个周期才中断（见 BTH 定时器处说明） */
+            qdev_prop_set_bit(tmr, "count-zero", true);
             sysbus_realize_and_unref(SYS_BUS_DEVICE(tmr), &error_fatal);
             best1700_map(SYS_BUS_DEVICE(tmr), 0, timers[i].base);
             sysbus_connect_irq(SYS_BUS_DEVICE(tmr), 0,
