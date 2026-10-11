@@ -32,6 +32,7 @@ struct BesPsramState {
     uint32_t mgr_tx_cnt;
     uint8_t mr[32];             /* mode registers */
     bool v6;                    /* best1700 MC v6 + PHY (see bes_psram.c) */
+    uint8_t vendor_id;          /* MR1[4:0] the PSRAM die reports */
 };
 
 #endif

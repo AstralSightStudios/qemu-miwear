@@ -127,6 +127,11 @@
  * 固件经 veneer 跳 0x1C000000+off 执行（如 sub_C588C30 → 0x1C058FAD）。
  * 缺失时取指落空滑行进 SRAM 向量表 → NOCP UsageFault → pmu_shutdown。 */
 #define BEST1503_PSRAMX_BASE     0x1C000000
+/* SiP PSRAMUHS 的 MR1 厂商 ID：APMemory = 0x0D。Band 11（q66 4.100.x）
+ * 的 PSRAM 识别 sub_C0C7D10 以 MRR 读 MR1，[4:0]=0x0D 走 APMemory 路径
+ * （与 p67 固件不识别、直接按 APMemory 初始化的路径一致），否则改按另一
+ * 厂商复位重读 MR0，两者都不符即 ASSERT（hal_psram_polling:2266）。 */
+#define BEST1503_PSRAM_VENDOR    0x0D
 
 #define BEST1503_UART0_IRQ       17
 #define BEST1503_UART1_IRQ       18
@@ -610,6 +615,7 @@ static void best1503_init(MachineState *machine, BesImage *img,
                              (uint64_t)(uintptr_t)
                              memory_region_get_ram_ptr(&psram));
         qdev_prop_set_uint32(psramc, "psram-size", BEST1503_PSRAM_SIZE);
+        qdev_prop_set_uint8(psramc, "vendor-id", BEST1503_PSRAM_VENDOR);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(psramc), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(psramc), 0, BEST1503_PSRAM_PHY_BASE);
         sysbus_mmio_map(SYS_BUS_DEVICE(psramc), 1, BEST1503_PSRAM_MC_BASE);

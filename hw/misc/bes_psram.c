@@ -33,8 +33,12 @@
  *            1 = write data: TX FIFO words -> PSRAM[REG_008 & 0x3FFFFFF]
  *            2 = read data:  PSRAM[REG_008 & 0x3FFFFFF] -> RX FIFO
  *            5 = mode-register write: MR[REG_008] = REG_00C
+ *            6 = mode-register read: MR[REG_008] -> RX FIFO
  *            (firmware sub_C0E5228 uses 5 for MR config, sub_C0E5308
- *            uses 2 to read back the calibration pattern)
+ *            uses 2 to read back the calibration pattern; Band 11
+ *            q66 4.100.x reads MR1 with 6 in sub_C0C7374, polls
+ *            REG_404 bit1 until the RX FIFO holds the value and takes
+ *            the APMemory path when MR1[4:0] = 0x0D, sub_C0C7D10)
  *   REG_008  MGR_ADDR (26-bit PSRAM physical offset)
  *   REG_00C  MGR_LEN (words) / MR value for cmd 5
  *   REG_014  TX FIFO (write-data source)
@@ -45,9 +49,12 @@
  *            firmware sub_C0E51C0), bits[14:11] = WB fill level
  *            (firmware sub_C0E51E0 waits for 0)
  *
+ * The PSRAM die answers MR1 with its vendor ID in bits[4:0] (property
+ * "vendor-id"; best1503's SiP PSRAMUHS is APMemory, 0x0D).
+ *
  * best1700 (property "v6", BSP hal_psram_v6.o): the MC keeps the same
- * MGR engine, REG_004 also taking 6 = mode-register read (MR[REG_008]
- * -> RX FIFO, hal_psram_mc_set_cmd_mrr), and REG_404 adds bits[19:16]
+ * MGR engine (mode-register read = hal_psram_mc_set_cmd_mrr), and
+ * REG_404 adds bits[19:16]
  * = power state (hal_psram_mc_is_sleep: 2 = sleeping). The PHY is a
  * different block: REG_040 starts it and REG_044 bits[28:25] report its
  * state, 3 = ready (hal_psram_phy_init polls for it); REG_050/058 are
@@ -137,12 +144,10 @@ static void bes_psram_mgr_exec(BesPsramState *s, uint32_t cmd)
     case 5:   /* mode-register write */
         s->mr[addr & 0x1F] = len & 0xFF;
         break;
-    case 6:   /* mode-register read (v6) */
-        if (s->v6) {
-            s->mgr_rx_cnt = 0;
-            s->mgr_rx_pos = 0;
-            s->mgr_rxfifo[s->mgr_rx_cnt++] = s->mr[addr & 0x1F];
-        }
+    case 6:   /* mode-register read */
+        s->mgr_rx_cnt = 0;
+        s->mgr_rx_pos = 0;
+        s->mgr_rxfifo[s->mgr_rx_cnt++] = s->mr[addr & 0x1F];
         break;
     default:
         /* init/reset/refresh commands (32, 255, ...): stateless here */
@@ -296,12 +301,14 @@ static void bes_psram_reset(DeviceState *dev)
     s->mgr_rx_pos = 0;
     s->mgr_tx_cnt = 0;
     memset(s->mr, 0, sizeof(s->mr));
+    s->mr[1] = s->vendor_id & 0x1F;
 }
 
 static const Property bes_psram_props[] = {
     DEFINE_PROP_UINT64("psram-ptr", BesPsramState, psram, 0),
     DEFINE_PROP_UINT32("psram-size", BesPsramState, psram_size, 0),
     DEFINE_PROP_BOOL("v6", BesPsramState, v6, false),
+    DEFINE_PROP_UINT8("vendor-id", BesPsramState, vendor_id, 0),
 };
 
 static void bes_psram_class_init(ObjectClass *klass, const void *data)
