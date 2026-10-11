@@ -8,14 +8,20 @@
  *     asserted while the controller has output queued; the host then reads
  *     the 3-byte NCI header and, in a second read transaction, the payload
  *   - the VEN line (host output) resets the controller: low holds it in
- *     reset, the rising edge boots it and it announces itself with a
- *     CORE_RESET_NTF
+ *     reset, the rising edge boots it (announced with a CORE_RESET_NTF
+ *     only when the power-on-ntf property is set, see nci_ven)
+ *   - a read transaction ends at the end of a packet: further bytes read
+ *     in it are filler, the next read starts with the next packet
  * The probe identifies the chip family from a manufacturer byte in the
- * CORE_RESET_NTF (high nibble of the hardware major version).  The host
- * stack compares the firmware version in the same notification with the
- * one of the firmware file it carries and downloads it again on a
- * mismatch; the controller reports the version the host expects (property
- * fw-version, the file's own version number) so no download is started.
+ * CORE_RESET_NTF that follows CORE_RESET_RSP (property hw-major, the byte
+ * the NXP stack keeps as ROM version: high nibble 0xD matches the TMS
+ * entry of the probe table, low nibble 1 the NXP one; the NXP stack then
+ * wants ROM 0x01 and firmware major 0x10 unless the chip is a TMS one).
+ * The host stack compares the firmware version in the same notification
+ * with the one of the firmware file it carries and downloads it again on
+ * a mismatch; the controller reports the version the host expects
+ * (property fw-version, the file's own version number) so no download is
+ * started.
  *
  * Packets and field layouts follow NFC Forum NCI 2.0.  The controller
  * answers the core and RF-discovery configuration commands (it reports no
@@ -203,6 +209,7 @@ struct NciNfccState {
 
     uint32_t hw_major;          /* identification byte of CORE_RESET_NTF */
     uint32_t fw_version;        /* 16 bit, in the manufacturer info */
+    bool power_on_ntf;          /* announce power-on with CORE_RESET_NTF */
 
     bool in_reset;              /* VEN low */
     bool nfcee_enabled[NCI_NUM_NFCEE];
@@ -221,6 +228,7 @@ struct NciNfccState {
     NciPacket q[NCI_QUEUE];
     unsigned q_head, q_count;
     unsigned rd_off;            /* bytes of the head packet already read */
+    bool rd_eop;                /* this read transaction ended a packet */
 
     uint8_t wbuf[NCI_MAX_PACKET];
     unsigned wlen;
@@ -259,13 +267,7 @@ static void nci_push(NciNfccState *s, uint8_t mt_gid, uint8_t oid,
 {
     NciPacket *p;
 
-    /*
-     * a payload of exactly one byte is followed by a padding byte; the
-     * host drivers read two bytes there and drop the second
-     */
-    unsigned extra = plen == 1;
-
-    if (s->q_count == NCI_QUEUE || plen + 3 + extra > NCI_MAX_PACKET) {
+    if (s->q_count == NCI_QUEUE || plen + 3 > NCI_MAX_PACKET) {
         return;
     }
     p = &s->q[(s->q_head + s->q_count) % NCI_QUEUE];
@@ -273,8 +275,7 @@ static void nci_push(NciNfccState *s, uint8_t mt_gid, uint8_t oid,
     p->data[1] = oid;
     p->data[2] = plen;
     memcpy(&p->data[3], payload, plen);
-    memset(&p->data[3 + plen], 0xFF, extra);
-    p->len = 3 + plen + extra;
+    p->len = 3 + plen;
     s->q_count++;
     trace_nci_nfcc_push(p->len, s->q_count);
     nci_update_ready(s);
@@ -944,6 +945,7 @@ static int nci_event(I2CSlave *i2c, enum i2c_event event)
         s->wlen = 0;
         break;
     case I2C_START_RECV:
+        s->rd_eop = false;
         break;
     case I2C_FINISH:
         trace_nci_nfcc_write(s->wlen);
@@ -1001,7 +1003,13 @@ static uint8_t nci_recv(I2CSlave *i2c)
     NciPacket *p;
     uint8_t b;
 
-    if (!s->q_count) {
+    /*
+     * Reading past the end of a packet returns filler bytes until the
+     * transaction ends; the next read starts with the next packet.  The
+     * p67 driver reads a one-byte payload as two bytes and drops the
+     * second, the q63 one reads exactly the payload length.
+     */
+    if (!s->q_count || s->rd_eop) {
         return 0xFF;
     }
     p = &s->q[s->q_head];
@@ -1011,6 +1019,7 @@ static uint8_t nci_recv(I2CSlave *i2c)
         s->q_head = (s->q_head + 1) % NCI_QUEUE;
         s->q_count--;
         s->rd_off = 0;
+        s->rd_eop = true;
         /*
          * one interrupt per packet: drop the line, then raise it again
          * for the next queued packet so the host sees a new edge
@@ -1021,14 +1030,20 @@ static uint8_t nci_recv(I2CSlave *i2c)
     return b;
 }
 
-/* VEN (host output, active high enable): reset on low, boot on high */
+/*
+ * VEN (host output, active high enable): reset on low, boot on high.  The
+ * controller takes commands right away (the q63 stack writes CORE_RESET a
+ * few milliseconds after raising VEN).  It announces power-on with a
+ * CORE_RESET_NTF only when power-on-ntf is set: the q63 driver's chip
+ * probe (nfc_check_chipinfo, 0x1088DA68) reads the reply to its
+ * CORE_RESET_CMD as the first two packets, and the p67 driver skips such
+ * a notification ("recv nfcc power on ntf, continue") either way.
+ */
 static void nci_boot_tick(void *opaque)
 {
     NciNfccState *s = opaque;
     const uint8_t ntf[] = { 0x01 };         /* reset: power on */
 
-    s->booted = true;
-    trace_nci_nfcc_boot();
     nci_ntf(s, NCI_GID_CORE, NCI_OID_CORE_RESET, ntf, 1);
 }
 
@@ -1045,8 +1060,12 @@ static void nci_ven(void *opaque, int n, int level)
     }
     if (s->in_reset) {
         s->in_reset = false;
-        timer_mod(s->boot_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                  NCI_BOOT_DELAY_NS);
+        s->booted = true;
+        trace_nci_nfcc_boot();
+        if (s->power_on_ntf) {
+            timer_mod(s->boot_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      NCI_BOOT_DELAY_NS);
+        }
     }
 }
 
@@ -1107,6 +1126,7 @@ static void nci_init(Object *obj)
 static const Property nci_props[] = {
     DEFINE_PROP_UINT32("hw-major", NciNfccState, hw_major, 0xD1),
     DEFINE_PROP_UINT32("fw-version", NciNfccState, fw_version, 0x1C00),
+    DEFINE_PROP_BOOL("power-on-ntf", NciNfccState, power_on_ntf, false),
 };
 
 static void nci_class_init(ObjectClass *klass, const void *data)
