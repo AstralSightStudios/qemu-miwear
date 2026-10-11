@@ -136,6 +136,7 @@ struct HynitronTsState {
     HynitronEvent q[HYN_QUEUE];
     unsigned q_head, q_count;
     uint8_t gesture;            /* pending wake gesture, 0 = none */
+    bool hyn92xx;               /* acked with D0 00 AB: hyn92xx driver */
     int down_x, down_y;
     int64_t last_tap_ms;
     int last_tap_x, last_tap_y;
@@ -264,6 +265,7 @@ static void hyn_write(HynitronTsState *s)
         break;
     case HYN_CMD_POINT:
         if (n && d[0] == HYN_REPORT_MARK) {
+            s->hyn92xx = true;
             hyn_ack(s);
         }
         break;
@@ -284,6 +286,15 @@ static uint32_t hyn_mem_word(HynitronTsState *s)
         return s->module_id;
     }
     return 0;
+}
+
+/* hyn92xx accepts double tap as 1, cst92xx as 2 */
+static uint8_t hyn_gesture_code(HynitronTsState *s)
+{
+    if (s->hyn92xx && s->gesture == HYN_GESTURE_DOUBLE_TAP) {
+        return 1;
+    }
+    return s->gesture;
 }
 
 static uint8_t hyn_read_byte(HynitronTsState *s, unsigned off)
@@ -318,9 +329,9 @@ static uint8_t hyn_read_byte(HynitronTsState *s, unsigned off)
         case 3:
             return e ? (e->x & 15) << 4 | (e->y & 15) : 0;
         case 4:
-            return s->gesture << 4;
+            return hyn_gesture_code(s) << 4;
         case 5:
-            return e ? 1 : 0;
+            return e || s->gesture ? 1 : 0;
         case 6:
             return HYN_REPORT_MARK;
         default:
