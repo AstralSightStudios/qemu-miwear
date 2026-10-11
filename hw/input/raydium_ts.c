@@ -58,7 +58,7 @@
 #include "ui/input.h"
 #include "trace.h"
 
-#define RAYDIUM_QUEUE           16
+#define RAYDIUM_QUEUE           64
 #define RAYDIUM_SCAN_MS         8       /* gap between two reports */
 #define RAYDIUM_RETRIGGER_MS    100     /* re-signal an unread report */
 

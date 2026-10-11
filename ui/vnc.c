@@ -58,9 +58,9 @@
 #include "io/dns-resolver.h"
 #include "monitor/monitor.h"
 
-#define VNC_REFRESH_INTERVAL_BASE GUI_REFRESH_INTERVAL_DEFAULT
-#define VNC_REFRESH_INTERVAL_INC  50
-#define VNC_REFRESH_INTERVAL_MAX  GUI_REFRESH_INTERVAL_IDLE
+#define VNC_REFRESH_INTERVAL_BASE 16
+#define VNC_REFRESH_INTERVAL_INC  16
+#define VNC_REFRESH_INTERVAL_MAX  80
 static const struct timeval VNC_REFRESH_STATS = { 0, 500000 };
 static const struct timeval VNC_REFRESH_LOSSY = { 2, 0 };
 
@@ -1789,6 +1789,10 @@ static void pointer_event(VncState *vs, uint8_t button_mask,
         vs->last_y = y;
     }
     qemu_input_event_sync();
+    if (vs->vd) {
+        vs->vd->dcl.update_interval = VNC_REFRESH_INTERVAL_BASE;
+        qemu_console_listener_set_refresh(&vs->vd->dcl, VNC_REFRESH_INTERVAL_BASE);
+    }
 }
 
 static void press_key(VncState *vs, unsigned int lnx)
