@@ -187,11 +187,13 @@
  * 时钟：
  *   系统时钟最大档 208MHz（SDK hal_cmu.h:70-79 HAL_CMU_FREQ_T 枚举含 208M）
  *   MCU_TIMER0 = slow = 16KHz（SDK hal_cmu_best1503.c:599 注释 "16K"）
- *   MCU_TIMER1 = fast = 6.5MHz（SDK hal_cmu_best1503.c:614 注释 "6.5M"）
+ *   MCU_TIMER1 = fast = 6MHz：32k 晶振校准（sub_C08B554）以固件常量
+ *   0x20081240 = 24MHz 的 1/4 作为快时钟频率，模型须一致，否则 hz 恒为
+ *   16384 * 6/6.5 ≈ 15124，校准以 ret=-3 失败，启动卡死在 system_mode 之后
  */
 #define BEST1503_SYSCLK_FRQ      208000000ULL
 #define BEST1503_SLOW_TIMER_FRQ  16000
-#define BEST1503_FAST_TIMER_FRQ  6500000
+#define BEST1503_FAST_TIMER_FRQ  6000000
 /* AON_TIMER0：32.768K 晶振二分频 = 16384Hz。固件 NuttX 时基按此换算：
  * bes_freerun.c（sub_C19D454 起）µs = ticks * 1000000 >> 14，
  * bes_oneshot.c（sub_C19D25C）余量 / 16384000000。按 32768 计数时
