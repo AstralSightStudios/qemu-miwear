@@ -177,11 +177,16 @@ static void hyn_push(HynitronTsState *s, uint8_t state, int x, int y)
     hyn_update_irq(s);
 }
 
+static void hyn_mode(HynitronTsState *s, uint8_t mode);
+
 /* the report or wake gesture was fetched */
 static void hyn_ack(HynitronTsState *s)
 {
     if (s->gesture) {
         s->gesture = 0;
+        if (s->asleep) {
+            hyn_mode(s, HYN_MODE_NORMAL);
+        }
         qemu_irq_raise(s->irq);
     } else if (s->q_count) {
         s->q_head = (s->q_head + 1) % HYN_QUEUE;
