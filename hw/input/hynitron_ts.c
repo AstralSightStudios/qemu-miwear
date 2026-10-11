@@ -54,6 +54,7 @@
 #include "trace.h"
 
 #define HYN_CMD_BOOT            0xA001  /* AA enters the bootloader, 00 leaves */
+#define HYN_CMD_BOOT_CMD_PREFIX 0xA000  /* bootloader commands are A0xx */
 #define HYN_CMD_BOOT_ACK        0xA002  /* reads 55 B0 in the bootloader */
 #define HYN_CMD_MEM_BANK        0xA010
 #define HYN_CMD_MEM_ADDR        0xA00C
@@ -243,6 +244,10 @@ static void hyn_write(HynitronTsState *s)
     uint8_t *d = s->wbuf + 2;
     unsigned n = MIN(s->nsent, HYN_BUF) - 2;
 
+    if ((s->cmd & 0xFF00) != HYN_CMD_BOOT_CMD_PREFIX) {
+        s->boot = false;
+    }
+
     trace_hynitron_ts_write(s->cmd, n ? d[0] : 0, n);
     switch (s->cmd) {
     case HYN_CMD_BOOT:
@@ -271,7 +276,6 @@ static void hyn_write(HynitronTsState *s)
         break;
     default:
         if ((s->cmd & 0xFF00) == HYN_MODE) {
-            s->boot = false;
             hyn_mode(s, s->cmd & 0xFF);
         }
         break;
