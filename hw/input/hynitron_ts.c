@@ -270,7 +270,8 @@ static void hyn_write(HynitronTsState *s)
         }
         break;
     default:
-        if ((s->cmd & 0xFF00) == HYN_MODE && !s->boot) {
+        if ((s->cmd & 0xFF00) == HYN_MODE) {
+            s->boot = false;
             hyn_mode(s, s->cmd & 0xFF);
         }
         break;
@@ -552,7 +553,7 @@ static void hyn_init(Object *obj)
 
 static const Property hyn_props[] = {
     DEFINE_PROP_UINT32("part-no", HynitronTsState, part_no, 0x9217),
-    DEFINE_PROP_UINT32("module-id", HynitronTsState, module_id, 0),
+    DEFINE_PROP_UINT32("module-id", HynitronTsState, module_id, 0x03660014),
     DEFINE_PROP_UINT32("project-id", HynitronTsState, project_id, 0x0001),
     DEFINE_PROP_UINT32("fw-version", HynitronTsState, fw_version, 0x0100),
     DEFINE_PROP_UINT32("fw-checksum", HynitronTsState, fw_checksum, 0),
