@@ -398,7 +398,12 @@ static void bthrom_trace(Best1700BthRomState *s, uint32_t args)
         trace_best1700_bth_log(s->line->str);
         g_string_erase(s->line, 0, nl - s->line->str + 1);
     }
-    if (s->line->len > 512) {
+    /* every call is a line of its own; the firmware's strings rarely end
+     * in a newline */
+    while (s->line->len && (s->line->str[s->line->len - 1] == '\r')) {
+        g_string_truncate(s->line, s->line->len - 1);
+    }
+    if (s->line->len) {
         trace_best1700_bth_log(s->line->str);
         g_string_truncate(s->line, 0);
     }
