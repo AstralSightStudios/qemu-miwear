@@ -62,6 +62,14 @@
  *   1806P（reg 0x202C3CD6 记的 PMU 类型 6）上 ≤130 号脚读这两个寄存器；
  *   方向/输出等配置走其他寄存器（ITCM 0x139060）。电平由 "pmu-gpio"
  *   输入线给出（第 n 根 = 99 + n 号脚），板上的按键接在这里。
+ *   PMU GPIO 中断（hal_gpio_setup_irq → ITCM 0x139328）：每 8 脚一组，
+ *   组 g 的寄存器从 0xBE + {0, 6, 11, 17}[g] 起，+0 写 1 清中断，+1 的
+ *   bit k 是组内第 k 脚的中断使能（q63 开键时写 0xC5 = 0x00C0）；
+ *   状态在 0xDE（99..114）/ 0xDF（115..130）。这里使能脚的电平一变
+ *   （双沿）就置状态位，按键驱动在处理函数里自己读电平分辨按下/松开。
+ *   状态非 0 时拉高 "pmu-irq"（AP NVIC 23，pmu_set_irq_handler 0x137E3C
+ *   挂 0x134B9C；1806P 上它每次都调 GPIO 类处理函数 0x135394，由其读
+ *   0xDE/0xDF 并按位清除）。
  *
  * PSRAM 模拟 PHY（片选 5，psramphy_best1700.o 以 0x5051/0x5052 访问，
  * 高 4 位即片选）：reg 0x51 为 DLL 状态，bit6 = 锁定、bit7 = 全 0、
@@ -74,6 +82,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/misc/bes_ispi.h"
 
@@ -91,6 +100,16 @@
 
 #define PMU_REG_GPIO_IN0      0xBC    /* PMU GPIO 99..114 */
 #define PMU_REG_GPIO_IN1      0xBD    /* PMU GPIO 115..130 */
+#define PMU_REG_GPIO_IRQ0     0xDE    /* interrupt status, 99..114 */
+#define PMU_REG_GPIO_IRQ1     0xDF    /* interrupt status, 115..130 */
+#define PMU_REG_GPIO_GROUP    0xBE    /* + group offset: clear, enable */
+
+static const uint8_t pmu_gpio_group_off[4] = { 0, 6, 11, 17 };
+
+static void bes_ispi_pmu_irq_update(BesIspiState *s)
+{
+    qemu_set_irq(s->pmu_irq, s->pmu_gpio_isr != 0);
+}
 
 static void bes_ispi_tx(BesIspiState *s, uint32_t value, unsigned size)
 {
@@ -116,6 +135,11 @@ static void bes_ispi_tx(BesIspiState *s, uint32_t value, unsigned size)
                            (reg == PMU_REG_GPIO_IN0 ||
                             reg == PMU_REG_GPIO_IN1)) {
                     v = s->pmu_gpio_in >> (reg == PMU_REG_GPIO_IN1 ? 16 : 0);
+                } else if (ISPI_CS(s) == ISPI_CS_PMU &&
+                           (reg == PMU_REG_GPIO_IRQ0 ||
+                            reg == PMU_REG_GPIO_IRQ1)) {
+                    v = s->pmu_gpio_isr >>
+                        (reg == PMU_REG_GPIO_IRQ1 ? 16 : 0);
                 }
                 s->rx = (uint32_t)v << 2;
                 qemu_log_mask(LOG_UNIMP, "bes.ispi: cs%u read reg 0x%03x -> "
@@ -128,6 +152,17 @@ static void bes_ispi_tx(BesIspiState *s, uint32_t value, unsigned size)
                 if (ISPI_CS(s) == ISPI_CS_PMU && reg == 0x4F &&
                     (r[reg] & 0x8000)) {
                     r[reg] = (r[reg] & ~0xC0) | 0x40;
+                }
+                if (ISPI_CS(s) == ISPI_CS_PMU) {
+                    int g;
+
+                    for (g = 0; g < 4; g++) {
+                        if (reg == PMU_REG_GPIO_GROUP +
+                                   pmu_gpio_group_off[g]) {
+                            s->pmu_gpio_isr &= ~((r[reg] & 0xFFu) << (8 * g));
+                            bes_ispi_pmu_irq_update(s);
+                        }
+                    }
                 }
                 s->rx = 0;
                 qemu_log_mask(LOG_UNIMP, "bes.ispi: cs%u write reg 0x%03x = "
@@ -144,8 +179,19 @@ static void bes_ispi_tx(BesIspiState *s, uint32_t value, unsigned size)
 static void bes_ispi_pmu_gpio_in(void *opaque, int n, int level)
 {
     BesIspiState *s = BES_ISPI(opaque);
+    unsigned g = n / 8;
+    uint16_t enable =
+        s->regs_slave[ISPI_CS_PMU][PMU_REG_GPIO_GROUP + 1 +
+                                   pmu_gpio_group_off[g]];
 
+    if (extract32(s->pmu_gpio_in, n, 1) == (level != 0)) {
+        return;
+    }
     s->pmu_gpio_in = deposit32(s->pmu_gpio_in, n, 1, level != 0);
+    if (enable & (1u << (n % 8))) {
+        s->pmu_gpio_isr |= 1u << n;
+        bes_ispi_pmu_irq_update(s);
+    }
 }
 
 static uint64_t bes_ispi_read(void *opaque, hwaddr offset, unsigned size)
@@ -236,6 +282,8 @@ static void bes_ispi_reset(DeviceState *dev)
     s->regs_slave[ISPI_CS_CHIPID][0] = 0x1700;  /* chip id 0x170 */
     s->regs_slave[ISPI_CS_PMU][0] = 0x18F0;     /* metal id 0x18F */
     s->regs_slave[ISPI_CS_PMU][1] = 0x0650;     /* PMU 1806P */
+    s->pmu_gpio_isr = 0;
+    bes_ispi_pmu_irq_update(s);
 }
 
 static void bes_ispi_realize(DeviceState *dev, Error **errp)
@@ -247,6 +295,7 @@ static void bes_ispi_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
     qdev_init_gpio_in_named(dev, bes_ispi_pmu_gpio_in, "pmu-gpio",
                             BES_ISPI_PMU_GPIOS);
+    qdev_init_gpio_out_named(dev, &s->pmu_irq, "pmu-irq", 1);
 }
 
 static void bes_ispi_class_init(ObjectClass *klass, const void *data)

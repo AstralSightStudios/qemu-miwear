@@ -85,10 +85,11 @@ static const BesBoard bes_boards[] = {
         /* 两个侧键接 PMU GPIO，按下接地：AP 板级按键初始化
          * sub_1081D65C 的按键表（PSRAM 0x185F0C0C，8 字节一项：键号、
          * 引脚、iomux 配置、有效电平 0）= {键 2: 114, 键 1: 113}。
-         * 键 1 / 2 与 HOME / DOWN 的对应待按键中断建模后实测。 */
+         * 实测（miwear 输入管理器日志 btn_queue_cb）：114 是 HOME（表冠），
+         * 113 是 DOWN。宿主键 Home / Page Down。 */
         .keys = {
-            { "home", Q_KEY_CODE_HOME, 113, true },
-            { "down", Q_KEY_CODE_PGDN, 114, true },
+            { "home", Q_KEY_CODE_HOME, 114, true },
+            { "down", Q_KEY_CODE_PGDN, 113, true },
         },
     },
 };

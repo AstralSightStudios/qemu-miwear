@@ -292,6 +292,9 @@ static const int best1700_bt_rx_irq[] = { 104, 105, 43, 119 };
 #define BEST1700_ISPI_BASE       0x4000A000
 /* hal_gpio 的 99..164 号脚是 PMU GPIO（见 bes_ispi.c） */
 #define BEST1700_PMU_GPIO_FIRST  99
+/* PMU 中断线：AP pmu_set_irq_handler（ITCM 0x137E3C）把 0x134B9C 装在
+ * 向量 16 + 23、优先级 0xA0，并开 NVIC 23 */
+#define BEST1700_PMU_IRQ         23
 
 /* UART = PL011（BES reg_uart，与 best1503 同 IP）。基址与中断号：
  * BSP hal_uart.o .rodata.uart = {0x4000B000 .. irq 22}, {0x4000C000 ..
@@ -1538,6 +1541,8 @@ static void best1700_init(MachineState *machine, BesImage *img,
 
     sysbus_realize_and_unref(SYS_BUS_DEVICE(ispi), &error_fatal);
     best1700_map(SYS_BUS_DEVICE(ispi), 0, BEST1700_ISPI_BASE);
+    qdev_connect_gpio_out_named(ispi, "pmu-irq", 0,
+                                qdev_get_gpio_in(armv7m, BEST1700_PMU_IRQ));
 
     /* 板上的按键：宿主按键 → GPIO 输入；99 号起是 PMU GPIO（经 ISPI） */
     {

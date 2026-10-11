@@ -32,6 +32,8 @@ struct BesIspiState {
     uint16_t regs_slave[16][0x400];
 
     uint32_t pmu_gpio_in;       /* PMU GPIO input levels, survive reset */
+    uint32_t pmu_gpio_isr;      /* PMU GPIO interrupt status */
+    qemu_irq pmu_irq;           /* the PMU's interrupt line */
 };
 
 #endif
