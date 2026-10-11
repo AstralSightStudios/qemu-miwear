@@ -9,23 +9,40 @@
  *      - 0x500009BC: returns 4 bytes, high word is 0xF303 (chip id)
  *      - 0x50000064: returns 4 bytes (touch id)
  *      - 0x50008938: returns 4 bytes (channel count 28x28)
+ *      - 0x50000918: firmware state; raydium_read_touchdata
+ *        (sub_10885A9C, via sub_1088585C) reads no report unless bit 14
+ *        is set
+ *      - 0x5000093C: calibration data; raydium_check_cc_ready
+ *        (sub_108868A4) takes all-zero (or all-0xFF) for missing CC data
+ *        and starts a calibration + flash burn, which the model cannot do
  *   2) 1-byte register address:
  *      - reg 0x06: firmware version 0x000F1804 (4 bytes)
  *      - reg 0x08: display resolution 466x466 (4 bytes)
- *      - reg 0x00: 16-byte touch report packet:
+ *      - reg 0x00: 16-byte touch report packet, as parsed by the AP's
+ *        raydium_read_touchdata (sub_10885A9C) and
+ *        raydium_handler_touch_event (sub_108858CC):
  *          [0] = report update flag (1 if new event)
- *          [1] = active points count (1 if down/move, 0 if up)
- *          [2] = gesture (0)
- *          [3] = 0x40 (normal touch status flag)
- *          [4] = point 0 id (0)
+ *          [1] = number of points (0..2; a second point is read from
+ *                reg 0x03). The handler reports a touch only for a
+ *                non-zero count, so a lift is one point in state UP.
+ *          [2] = gesture (0 = none)
+ *          [3] = status, bits 7:6 must be 01 (0x40); bits 1:0 set
+ *                make the driver read a gesture block from reg 0x07
+ *          [4] = point 0 id
  *          [5..6] = point 0 X (little endian)
  *          [7..8] = point 0 Y (little endian)
- *          [13] = state (1=DOWN, 2=UP, 3=MOVE)
- *        This layout is provisional: it has not been checked against the
- *        driver's report parser yet.
+ *          [13] = point 0 state (1=DOWN, 2=UP, 3=MOVE)
+ *        Points are 11 bytes apart.
  * The probe passes (chip id, touch id, firmware version equal to the one
- * in /vendor/touch, so no upgrade); the CC calibration handshake that
- * follows is not modelled and times out after about 3 s.
+ * in /vendor/touch, so no upgrade; CC data present, so no calibration).
+ *
+ * Interrupt: INT goes low while a report is waiting and is released when
+ * the report has been read. The driver reacts to the falling edge
+ * (GPIO 73 is edge-triggered) and keeps the pin's interrupt disabled
+ * from its handler until the worker has read the report, so the next
+ * report is only signalled a scan period later; a report left unread
+ * for RAYDIUM_RETRIGGER_MS is signalled again, as a lost edge would
+ * otherwise stall the queue for good.
  *
  * Touches come from the host pointer (absolute pointer device).
  *
@@ -34,13 +51,16 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/input/raydium_ts.h"
 #include "ui/input.h"
 #include "trace.h"
 
-#define RAYDIUM_QUEUE   16
+#define RAYDIUM_QUEUE           16
+#define RAYDIUM_SCAN_MS         8       /* gap between two reports */
+#define RAYDIUM_RETRIGGER_MS    100     /* re-signal an unread report */
 
 typedef struct {
     uint8_t state;      /* 1=DOWN, 2=UP, 3=MOVE */
@@ -68,6 +88,8 @@ struct RaydiumTsState {
     /* event queue */
     RaydiumEvent q[RAYDIUM_QUEUE];
     unsigned q_head, q_count;
+    bool int_low;               /* INT asserted for the queue head */
+    QEMUTimer *int_timer;       /* next report / re-signal */
 
     /* host pointer */
     int abs_x, abs_y;
@@ -75,10 +97,36 @@ struct RaydiumTsState {
     int last_x, last_y;
 };
 
-static void raydium_ts_update_irq(RaydiumTsState *s)
+static void raydium_ts_int_arm(RaydiumTsState *s, int ms)
 {
-    /* Active-low interrupt line */
-    qemu_set_irq(s->irq, s->q_count == 0);
+    timer_mod(s->int_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + ms);
+}
+
+/* signal the queue head: a falling edge on INT */
+static void raydium_ts_int_assert(RaydiumTsState *s)
+{
+    if (s->int_low) {
+        qemu_set_irq(s->irq, 1);
+    }
+    s->int_low = true;
+    qemu_set_irq(s->irq, 0);
+    raydium_ts_int_arm(s, RAYDIUM_RETRIGGER_MS);
+}
+
+static void raydium_ts_int_release(RaydiumTsState *s)
+{
+    s->int_low = false;
+    qemu_set_irq(s->irq, 1);
+    timer_del(s->int_timer);
+}
+
+static void raydium_ts_int_timer(void *opaque)
+{
+    RaydiumTsState *s = opaque;
+
+    if (s->q_count) {
+        raydium_ts_int_assert(s);
+    }
 }
 
 static void raydium_ts_push(RaydiumTsState *s, uint8_t state, int x, int y)
@@ -94,7 +142,9 @@ static void raydium_ts_push(RaydiumTsState *s, uint8_t state, int x, int y)
     tail->y = y;
     s->q_count++;
     trace_raydium_ts_event(state, x, y);
-    raydium_ts_update_irq(s);
+    if (!s->int_low && !timer_pending(s->int_timer)) {
+        raydium_ts_int_assert(s);
+    }
 }
 
 static int raydium_ts_event(I2CSlave *i2c, enum i2c_event event)
@@ -115,10 +165,9 @@ static int raydium_ts_event(I2CSlave *i2c, enum i2c_event event)
             if (s->q_count) {
                 s->q_head = (s->q_head + 1) % RAYDIUM_QUEUE;
                 s->q_count--;
-                /* Raise then lower to generate an edge if more events remain */
-                qemu_set_irq(s->irq, 1);
+                raydium_ts_int_release(s);
                 if (s->q_count) {
-                    qemu_set_irq(s->irq, 0);
+                    raydium_ts_int_arm(s, RAYDIUM_SCAN_MS);
                 }
             }
         }
@@ -194,6 +243,14 @@ static uint8_t raydium_ts_recv(I2CSlave *i2c)
             default: byte = 0x00; break;
             }
             break;
+        case 0x50000918:
+            /* firmware state: bit 14 = running, reports available */
+            byte = s->read_idx == 1 ? 0x40 : 0x00;
+            break;
+        case 0x5000093C:
+            /* calibration (CC) data present */
+            byte = s->read_idx == 0 ? 0x01 : 0x00;
+            break;
         default:
             byte = 0;
             break;
@@ -227,7 +284,7 @@ static uint8_t raydium_ts_recv(I2CSlave *i2c)
                 RaydiumEvent *ev = &s->q[s->q_head];
                 switch (s->read_idx) {
                 case 0: byte = 0x01; break;
-                case 1: byte = (ev->state == 2) ? 0 : 1; break;
+                case 1: byte = 1; break;
                 case 2: byte = 0x00; break;
                 case 3: byte = 0x40; break;
                 case 4: byte = 0x00; break;
@@ -337,7 +394,7 @@ static void raydium_ts_reset(DeviceState *dev)
     s->btn_reported = false;
     s->last_x = 0;
     s->last_y = 0;
-    raydium_ts_update_irq(s);
+    raydium_ts_int_release(s);
 }
 
 static void raydium_ts_realize(DeviceState *dev, Error **errp)
@@ -362,6 +419,7 @@ static void raydium_ts_init(Object *obj)
     RaydiumTsState *s = RAYDIUM_TS(obj);
 
     qdev_init_gpio_out_named(DEVICE(obj), &s->irq, "irq", 1);
+    s->int_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, raydium_ts_int_timer, s);
 }
 
 static const Property raydium_ts_props[] = {
