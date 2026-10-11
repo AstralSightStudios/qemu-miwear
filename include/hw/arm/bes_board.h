@@ -74,6 +74,13 @@ typedef struct BesBoard {
     uint32_t nand_blocks;
 
     BesBoardKey keys[BES_BOARD_MAX_KEYS];   /* name NULL ends the list */
+
+    /*
+     * PMU GPADC channel inputs in mV, what the board wires to each channel
+     * (battery divider, NTCs, hardware-version strap); all 0 = the PMU
+     * model's defaults (the p67 wiring)
+     */
+    uint32_t gpadc_mv[8];
 } BesBoard;
 
 /* a chip: builds the SoC around the firmware and the board's devices */

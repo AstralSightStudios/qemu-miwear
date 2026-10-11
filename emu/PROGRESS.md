@@ -194,9 +194,32 @@ AONCMU/CMU 魔术值 → UART（console, qemu chardev 直通终端）→ TIMER/S
 - [x] NFC 控制器（NCI 2.0 over I2C6@0x28，VEN=GPIO69、数据就绪=GPIO77）+ eSE（HCI/ETSI 12，无 applet）；NFC 栈初始化不再卡 42 秒
 - [x] 越过配对 / 出厂预置绑定（p67 经 emu/mknor.py 写入 persist 属性；q63 经 emu/mksensornor.py --bound KEY 写入 Sensor NOR，CP 核自动迁移至 miwear_record.db 并跳过向导直接进入表盘）
 - [x] 蓝牙端到端通信与 AstroBox 接入（p67/q63 双向广播与寻呼重连、SSP 配对、链路加密、RFCOMM 5 / SPP、L1 握手、ADMIN LOGIN 鉴权读取电量与设备信息全部实测通过）
+- [x] 小米手环 11（q66，best1503）：PSRAM MRR、按板 GPADC、CST92xx 触摸，进开机向导
 - [ ] 快应用环境验证
 
 ## 7. 最新变更
+
+- **2026-10-11 (5)（q66 小米手环 11：进开机向导，触摸可用）**：
+  q66 4.100.177 与 p67 同为 best1503（boot info `CHIP=best1503`），差异全在板级与两处
+  芯片外设行为：
+  ①**PSRAM 厂商识别**：sub_C0C7D10 以 MGR 命令 6（模式寄存器读）读 MR1，轮询 REG_404 bit1
+  等 RX FIFO，[4:0]=0x0D 走 APMemory 路径；此前命令 6 只在 v6（best1700）实现，读回 0
+  → ASSERT hal_psram_polling:2266，_assert 打日志又递归异常直至栈溢出。bes_psram 现对
+  best1503 也执行 MRR，MR1 复位为 property vendor-id（best1503 = 0x0D）。
+  ②**电池电压**：GPADC 通道接法随板而变——q66 电池在 ch2（adc ioctl sub_C357D7C），
+  soft_gauge 配置 0x20081324 换算 vbat = 7.0 × mV；沿用 p67 的 ch2=250 mV（p67 的 NTC）
+  得 1750 mV，开机 5 秒即 `miwear_system_poweroff reason:LOWBAT`。板级 profile 新增
+  gpadc_mv[]（q66：ch2 571 mV = 4.0 V，ch3/ch5 NTC 450 mV = 25 ℃，表 0x20081370）。
+  ③**触摸 Hynitron CST92xx**（新模型 hw/input/hynitron_ts.c）：配置表 0x200812C4 先试
+  cst92xx @0x5A（mi2c 3，INT 27），不应答才转 zinitix。协议见文件头（A0 xx 引导、
+  bank/addr 读 0xCACA<<16|0x9217、D1 xx 工作模式回显、D0 00 报点、D0 48 ESD）。
+  ④**产品识别**：q66 固件的型号表还列了 o6610/o66lj，按"镜像里出现次数最多的产品"选板
+  （bes_image_count），q66 17 次 vs o66 2 次。
+  ⑤**屏与存储**：212×520（panel.ic.DEFAULT），TE = GPIO 65（sub_C0C5B78）；/misc 是
+  `mount -t littlefs -o ro /dev/facmode /misc`（0xFC0000），/nv 才在 0xFE0000 →
+  mknor.py --profile q66；resource 分区 65536 页 → mknand.py --profile q66。
+  实测：带 vela_resource.bin 启动约 4 秒进"设置语言"，点 English 进入配对二维码页；
+  出厂 did/mac_bt 生效。未做：板号 ADC（hw version）为 0 → 固件按非 NFC 版运行。
 
 - **2026-10-11 (4)（q63：预置绑定数据流打通、LE广播与Page重连、AstroBox端到端鉴权通信跑通）**：
   ①**q63 绑定数据流逆向与 Sensor NOR 预置（emu/mksensornor.py --bound KEY）**：

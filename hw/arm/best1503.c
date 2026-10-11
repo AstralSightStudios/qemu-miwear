@@ -469,6 +469,17 @@ static void best1503_init(MachineState *machine, BesImage *img,
      * 固件 MMIO 指针表 0x200B08B8[0] 实证；SDK hal_analogif_best1503.c */
     {
         DeviceState *pmu = qdev_new(TYPE_BES_PMU);
+        bool wired = false;
+        int i;
+
+        for (i = 0; i < ARRAY_SIZE(board->gpadc_mv); i++) {
+            wired |= board->gpadc_mv[i] != 0;
+        }
+        for (i = 0; wired && i < ARRAY_SIZE(board->gpadc_mv); i++) {
+            g_autofree char *prop = g_strdup_printf("gpadc-ch%d-mv", i);
+
+            qdev_prop_set_uint32(pmu, prop, board->gpadc_mv[i]);
+        }
         sysbus_realize_and_unref(SYS_BUS_DEVICE(pmu), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(pmu), 0, 0x40009000);
     }

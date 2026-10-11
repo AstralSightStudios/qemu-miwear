@@ -22,15 +22,20 @@ backup restore sub_C6B79A0). Properties the Bluetooth bind path reads:
                      property (default C0:FF:EE:15:03:01)
 The defaults identify an emulated unit; they are not any real band's.
 
-Geometry: partition "nv" first=32512 nblocks=256 in 512-byte MTD blocks
-(bes_partition_init boot log), i.e. offset 0xFE0000, 128 KiB. littlefs
-disk version 2.1, block 8 KiB x 16, read/prog 512, name_max 32, as found
-in the superblock the firmware itself writes there.
+Geometry: the /misc partition (bes_partition_init boot log, 512-byte MTD
+blocks) is 128 KiB, littlefs disk version 2.1, block 8 KiB x 16,
+read/prog 512, name_max 32, as found in the superblock each firmware
+itself writes:
+  p67 (Band 10 Pro): "nv" first=32512, offset 0xFE0000, mounted
+      `-o autoformat /dev/nv /misc`
+  q66 (Band 11): "facmode" first=32256, offset 0xFC0000, mounted
+      `-o ro /dev/facmode /misc` (its "nv" at 0xFE0000 is /nv, which
+      the firmware formats itself)
 
 Requires littlefs-python (pip install littlefs-python).
 
-usage: emu/mknor.py [--out FILE] [--did N] [--psn S] [--mac-bt ADDR]
-                    [--prop KEY=VALUE ...]
+usage: emu/mknor.py [--profile p67|q66] [--out FILE] [--did N] [--psn S]
+                    [--mac-bt ADDR] [--prop KEY=VALUE ...]
 """
 
 import argparse
@@ -44,7 +49,7 @@ except ImportError:
     sys.exit("emu/mknor.py needs littlefs-python: pip install littlefs-python")
 
 FLASH_SIZE = 0x1000000
-NV_OFFSET = 32512 * 512
+MISC_OFFSET = {"p67": 32512 * 512, "q66": 32256 * 512}
 NV_BLOCK = 8192
 NV_BLOCKS = 16
 NV_IO = 512
@@ -66,6 +71,8 @@ def nv_partition(props):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--profile", choices=sorted(MISC_OFFSET),
+                    default="p67", help="board the image is for")
     ap.add_argument("--out", default="emu/nor.img")
     ap.add_argument("--did", default="1503000001",
                     help="ro.factory.did (decimal)")
@@ -92,14 +99,15 @@ def main():
         props.append((key, value))
 
     image = bytearray(b"\xff" * FLASH_SIZE)
+    offset = MISC_OFFSET[args.profile]
     nv = nv_partition(props)
-    image[NV_OFFSET:NV_OFFSET + len(nv)] = nv
+    image[offset:offset + len(nv)] = nv
     tmp = args.out + ".tmp"
     with open(tmp, "wb") as out:
         out.write(image)
     os.replace(tmp, args.out)
     print("%s: %d MiB NOR, /misc/factory.prop at 0x%x: %s" %
-          (args.out, FLASH_SIZE >> 20, NV_OFFSET,
+          (args.out, FLASH_SIZE >> 20, offset,
            ", ".join(k for k, _ in props)))
 
 

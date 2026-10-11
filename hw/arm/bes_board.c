@@ -19,6 +19,7 @@
 #include "hw/arm/machines-qom.h"
 #include "hw/input/gpio_keys.h"
 #include "hw/input/zinitix_ts.h"
+#include "hw/input/hynitron_ts.h"
 #include "hw/input/raydium_ts.h"
 #include "hw/misc/cw2215.h"
 #include "hw/misc/sgm25062.h"
@@ -56,6 +57,43 @@ static const BesBoard bes_boards[] = {
         .nand_oob_size = 64,
         .nand_pages_per_block = 64,
         .nand_blocks = 4096,
+        /* 无实体按键 */
+    },
+    {
+        .name = "q66",
+        .desc = "Xiaomi Smart Band 11",
+        .chip = "best1503",
+        .product = "q66",
+        /* 依据为 q66 4.100.155 IDB（4.100.177 实测行为一致）。
+         * 212x520：panel_simple 动态识别（DCS 0xDA 读 ID）落空后用
+         * panel.ic.DEFAULT，panel_getvideoinfo 日志 xres 212 yres 520；
+         * TE 脚 = sub_C0C5B78 返回的 0x41（te_gpio_irq_handler 校验
+         * byte_200FB7A8，由 sub_C934DE4 写入）。 */
+        .panel_width = 212,
+        .panel_height = 520,
+        .lcd_te_gpio = 65,
+        /* 触摸配置表 0x200812C4（get_touch_cfg sub_C3659B4，32 字节
+         * 一项）：cst92xx 0x5A / zinitix 0x20 / sitronix 0x55，均在 mi2c
+         * 适配器 3（sub_C6DF2A8(3)；适配器 N = hal I2C N，
+         * sub_C35CBC0），400kHz；引脚表 0x200812A0：reset 28、
+         * interrupt 27、vcc_en 74。board_hynitron_setup 先试 cst92xx，
+         * 只有 I2C 不应答时才转 zinitix，故装 CST92xx。 */
+        .touch = { TYPE_HYNITRON_TS, 3, 0x5A, 27 },
+        /* 板号 0（board.binfos "bt"）：board_bsp_product_init 记
+         * "not support nfc"，NFC 栈不启动，不装 */
+        /* NAND：固件按 512MB 表分区（实测日志 resource first 0
+         * nblocks 65536、nand_data first 65536 nblocks 196608），
+         * vela_resource.bin（120946688 字节）装入 resource 分区 */
+        .nand_id = 0xC8F4C8,
+        .nand_page_size = 2048,
+        .nand_oob_size = 64,
+        .nand_pages_per_block = 64,
+        .nand_blocks = 4096,
+        /* GPADC（adc ioctl sub_C357D7C）：ch2 电池电压，soft_gauge
+         * 配置 0x20081324 换算 vbat = 0 + 7.0 * mV，4.0V = 571 mV；ch5
+         * 电池 NTC（get_bat_temp_cool sub_C6EF428，表 0x20081370 中
+         * 443..457 mV = 25 C）、ch3 第二路 NTC，均取 450 mV。 */
+        .gpadc_mv = { [2] = 571, [3] = 450, [5] = 450 },
         /* 无实体按键 */
     },
     {

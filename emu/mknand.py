@@ -8,10 +8,14 @@ bes.flash NAND model (nand-image property) expects.
 Factory content: the resource romfs (vela_resource.bin, normally written
 by OTA with `dd of=/dev/resource`) is placed at the start of the
 "resource" partition. Partition layout from the firmware's
-bes_board_nand_initialize (sub_C20AB44), 512MB table 0x2CCC72C0:
-resource first=0 nblocks=0x19000 pages, nand_data/coredump/nand_nv after.
+bes_board_nand_initialize, 512MB table:
+  p67 (Band 10 Pro, sub_C20AB44, table 0x2CCC72C0): resource first=0
+      nblocks=0x19000 pages, nand_data/coredump/nand_nv after
+  q66 (Band 11, boot log): resource first=0 nblocks=65536 pages,
+      nand_data first=65536 nblocks=196608
 
-usage: emu/mknand.py [--resource FILE] [--out FILE] [--first-page N]
+usage: emu/mknand.py [--profile p67|q66] [--resource FILE] [--out FILE]
+                     [--first-page N]
 """
 
 import argparse
@@ -23,11 +27,13 @@ OOB = 64
 PPB = 64
 BLOCKS = 4096
 RESOURCE_FIRST = 0
-RESOURCE_PAGES = 0x19000
+RESOURCE_PAGES = {"p67": 0x19000, "q66": 65536}
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--profile", choices=sorted(RESOURCE_PAGES),
+                    default="p67", help="board the image is for")
     ap.add_argument("--resource", help="romfs image for /dev/resource")
     ap.add_argument("--out", default="emu/nand.img")
     ap.add_argument("--first-page", type=lambda x: int(x, 0),
@@ -39,9 +45,10 @@ def main():
     if args.resource:
         with open(args.resource, "rb") as f:
             res = f.read()
-        if len(res) > RESOURCE_PAGES * PAGE:
+        pages = RESOURCE_PAGES[args.profile]
+        if len(res) > pages * PAGE:
             sys.exit("resource image (%d bytes) does not fit the %d-page "
-                     "resource partition" % (len(res), RESOURCE_PAGES))
+                     "resource partition" % (len(res), pages))
 
     oob = b"\xff" * OOB
     erased_block = (b"\xff" * (PAGE + OOB)) * PPB
