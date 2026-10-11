@@ -26,6 +26,7 @@ config BEST1503
     select BES_PSC
     select NCI_NFCC
     select ZINITIX_TS
+    select HYNITRON_TS
     select VSI_VGLITE
 
 config BEST1700

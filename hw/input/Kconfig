@@ -41,6 +41,10 @@ config ZINITIX_TS
     bool
     depends on I2C
 
+config HYNITRON_TS
+    bool
+    depends on I2C
+
 config RAYDIUM_TS
     bool
     depends on I2C

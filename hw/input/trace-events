@@ -60,6 +60,12 @@ zinitix_ts_command(uint16_t cmd) "command 0x%04x"
 zinitix_ts_write(uint16_t reg, uint16_t val) "reg 0x%04x = 0x%04x"
 zinitix_ts_gesture(uint16_t code) "wake gesture %u"
 
+# hynitron_ts.c
+hynitron_ts_event(uint8_t state, int x, int y) "state=%u x=%d y=%d"
+hynitron_ts_write(uint16_t cmd, uint8_t data, unsigned len) "command 0x%04x data 0x%02x (%u bytes)"
+hynitron_ts_read(uint16_t cmd, unsigned off, uint8_t val) "command 0x%04x +%u = 0x%02x"
+hynitron_ts_gesture(uint8_t code) "wake gesture %u"
+
 # raydium_ts.c
 raydium_ts_event(uint8_t state, int x, int y) "state=%u x=%d y=%d"
 raydium_ts_read(uint32_t addr, uint8_t val) "addr=0x%08x val=0x%02x"
