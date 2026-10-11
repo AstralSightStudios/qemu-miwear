@@ -223,6 +223,7 @@ static uint64_t bes_i2c_read(void *opaque, hwaddr offset, unsigned size)
     case 0x10: /* DATA_CMD read pops the RX fifo */
         if (s->rx_cnt) {
             v = s->rxfifo[s->rx_r];
+            trace_bes_i2c_rx(s->iomem.addr, v);
             s->rx_r = (s->rx_r + 1) % I2C_FIFO_DEPTH;
             s->rx_cnt--;
         } else {
@@ -286,7 +287,10 @@ static void bes_i2c_write(void *opaque, hwaddr offset, uint64_t val,
         }
         break;
     case 0x08: s->sar = val; break;
-    case 0x10: bes_i2c_data_cmd_write(s, val); break;
+    case 0x10:
+        trace_bes_i2c_data_cmd(s->iomem.addr, val);
+        bes_i2c_data_cmd_write(s, val);
+        break;
     case 0x14: case 0x18: case 0x1C:
     case 0x20: case 0x24: case 0x28:
         s->scl_cfg[(offset - 0x14) / 4] = val; break;
