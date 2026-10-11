@@ -48,6 +48,24 @@ enum {
     BTSS_SIDES,
 };
 
+#define BTSS_ADV_SETS       4
+#define BTSS_ADV_DATA_MAX   251         /* one Extended Advertising Report */
+#define BTSS_ADV_LEGACY     0xFF        /* set of the legacy commands */
+
+/* one LE advertising set (Vol 4 Part E 7.8.53); legacy PDUs carry 31 */
+typedef struct BesBtssAdvSet {
+    bool used;
+    bool enabled;
+    uint8_t handle;                     /* BTSS_ADV_LEGACY: legacy commands */
+    uint16_t props;                     /* Advertising_Event_Properties */
+    uint8_t own_addr_type;              /* 0 public, else random */
+    uint8_t random[6];                  /* LE Set Adv Set Random Address */
+    uint8_t data_len;
+    uint8_t rsp_len;
+    uint8_t data[BTSS_ADV_DATA_MAX];
+    uint8_t rsp[BTSS_ADV_DATA_MAX];
+} BesBtssAdvSet;
+
 /* per-controller state written by its host */
 typedef struct BesBtssHost {
     uint8_t bdaddr[6];                  /* least significant octet first */
@@ -71,6 +89,12 @@ typedef struct BesBtssHost {
     bool replied;
     uint32_t passkey;
     QEMUTimer *inq_timer;               /* Inquiry_Length expiry */
+    /* LE broadcast */
+    uint8_t le_random[6];               /* LE Set Random Address */
+    BesBtssAdvSet adv[BTSS_ADV_SETS];
+    bool le_scan;                       /* scanning enabled */
+    bool le_scan_ext;                   /* ... with the extended commands */
+    bool le_scan_active;                /* scan requests: scan responses too */
 } BesBtssHost;
 
 typedef enum {
@@ -101,6 +125,8 @@ typedef struct BesBtssLink {
     bool mitm;                          /* association model protects MITM */
     bool passkey_entry;
     uint32_t numeric;
+    bool page_wait;                     /* target not page scanning yet */
+    int64_t page_deadline_ms;           /* Page_Timeout of that page */
 } BesBtssLink;
 
 struct BesBtssState {
@@ -136,6 +162,7 @@ struct BesBtssState {
     bool radio_open;
     int64_t air_free_ns;                /* end of the last ACL baseband packet */
     QEMUTimer *air_timer;               /* the channel is free again */
+    QEMUTimer *page_timer;              /* page waiting for a page scan */
     uint8_t rbuf[BES_BTSS_RADIO_BUF];
     unsigned rlen;
 };

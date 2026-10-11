@@ -17,12 +17,32 @@ cpu=sensor,fs=/misc /misc) and its property service loads
 as on p67 (see emu/mknor.py for the properties the Bluetooth bind path
 reads).
 
+--bound KEY provisions the unit as already bound to a phone (as the
+companion app leaves it after a bind), so a host holding KEY can log in
+(AUTH) instead of binding. On best1700 the miwear protocol runs on the cp
+core (vela_cp.bin): at boot it moves each persist.<name> property of its
+record table (miwear_token_key, miwear_beacon_key, miwear_ir_key,
+miwear_user_id, ...; table at 0x1B621D70) into
+/data/misc/bt/miwear_record.db, hex-decoding the value (odd lengths are
+skipped), then deletes the property (miwear_record_read_legacy
+0x1B3F1A80). The bind state itself is ordinary properties, read by the cp
+(device_boot_handle 0x1B3F4044) and the AP:
+  persist.setup_wizard                 1 = bonded (0 no bond, 2 new bond)
+  persist.miwear_companion_device_type 0 = Android (1 = iOS)
+  persist.miwear_companion_device_mac  the phone's BD_ADDR as 12 hex digits,
+                                       least significant byte first
+                                       (save_bond_info 0x1B3F3AE8)
+The cp lets only the companion pair (allow_link_connect_pair_request
+0x1B3F9D90); the default is the peer controller of bes.btss
+(peer-bdaddr), which AstroBox's emulator bridge drives.
+
 littlefs geometry: block 4096 bytes x 64 (the NOR's erase sector), read /
 program 256, name_max 32, disk version 2.0.
 
 Requires littlefs-python (emu/venv).
 
 usage: emu/mksensornor.py [--out FILE] [--did N] [--psn S] [--mac-bt ADDR]
+                          [--bound KEY [--companion ADDR] [--user-id ID]]
                           [--prop KEY=VALUE ...]
 """
 
@@ -66,6 +86,14 @@ def main():
                     help="ro.factory.psn (serial number)")
     ap.add_argument("--mac-bt", default="C0:FF:EE:15:03:01",
                     help="ro.factory.mac_bt (match the bes.btss bdaddr)")
+    ap.add_argument("--bound", metavar="KEY",
+                    help="provision as bound; KEY = 32 hex digits, the "
+                         "token key a host logs in with (AstroBox AuthKey)")
+    ap.add_argument("--companion", default="C0:FF:EE:00:00:01",
+                    help="BD_ADDR of the bound phone (the bes.btss "
+                         "peer-bdaddr)")
+    ap.add_argument("--user-id", default="1000000001",
+                    help="account id of the bound user")
     ap.add_argument("--prop", action="append", default=[],
                     metavar="KEY=VALUE", help="additional factory property")
     ap.add_argument("--block", type=int, default=MISC_BLOCK,
@@ -80,6 +108,21 @@ def main():
         sys.exit("--mac-bt must look like XX:XX:XX:XX:XX:XX")
     props = [("ro.factory.did", args.did), ("ro.factory.psn", args.psn),
              ("ro.factory.mac_bt", args.mac_bt.upper())]
+    if args.bound is not None:
+        key = args.bound.lower()
+        if not re.fullmatch(r"[0-9a-f]{32}", key):
+            sys.exit("--bound expects 32 hex digits")
+        if not re.fullmatch(r"([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}",
+                            args.companion):
+            sys.exit("--companion must look like XX:XX:XX:XX:XX:XX")
+        mac = "".join(reversed(args.companion.lower().split(":")))
+        props += [("persist.miwear_token_key", key),
+                  ("persist.miwear_beacon_key", key),
+                  ("persist.miwear_ir_key", key),
+                  ("persist.miwear_user_id", args.user_id.encode().hex()),
+                  ("persist.setup_wizard", "1"),
+                  ("persist.miwear_companion_device_type", "0"),
+                  ("persist.miwear_companion_device_mac", mac)]
     for kv in args.prop:
         key, sep, value = kv.partition("=")
         if not sep or not key:

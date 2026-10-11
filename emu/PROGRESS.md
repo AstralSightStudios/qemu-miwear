@@ -192,10 +192,40 @@ AONCMU/CMU 魔术值 → UART（console, qemu chardev 直通终端）→ TIMER/S
 - [x] CPU 掉电休眠/唤醒（PSC + AON_CMU 复位向量）、熄屏/手势亮屏、系统时钟校准
 - [x] NSH 交互 shell（调试探针式注入，emu/nsh.py；生产固件本身无 shell）
 - [x] NFC 控制器（NCI 2.0 over I2C6@0x28，VEN=GPIO69、数据就绪=GPIO77）+ eSE（HCI/ETSI 12，无 applet）；NFC 栈初始化不再卡 42 秒
-- [ ] 越过配对（未绑定 → 一直停在开机向导；见 7. ㉞。调试可用 NSH `setprop persist.setup_wizard 1`）
+- [x] 越过配对 / 出厂预置绑定（p67 经 emu/mknor.py 写入 persist 属性；q63 经 emu/mksensornor.py --bound KEY 写入 Sensor NOR，CP 核自动迁移至 miwear_record.db 并跳过向导直接进入表盘）
+- [x] 蓝牙端到端通信与 AstroBox 接入（p67/q63 双向广播与寻呼重连、SSP 配对、链路加密、RFCOMM 5 / SPP、L1 握手、ADMIN LOGIN 鉴权读取电量与设备信息全部实测通过）
 - [ ] 快应用环境验证
 
 ## 7. 最新变更
+
+- **2026-10-11 (4)（q63：预置绑定数据流打通、LE广播与Page重连、AstroBox端到端鉴权通信跑通）**：
+  ①**q63 绑定数据流逆向与 Sensor NOR 预置（emu/mksensornor.py --bound KEY）**：
+  深入逆向 CP 核（vela_cp.bin）：CP 核启动时（`sub_1B3F1A80` `miwear_record_read_legacy`）
+  遍历 persist 属性表（位于 `0x1B621D70`，包含 `persist.miwear_token_key`、`miwear_beacon_key`、
+  `miwear_ir_key`、`miwear_user_id` 等），若长度为偶数则 hex-decode 后写入 `/data/misc/bt/miwear_record.db`
+  （UnQLite 格式嵌入式数据库），写完后删除旧 persist 属性。
+  手环的绑定状态受普通属性控制（`device_boot_handle` `0x1B3F4044` 与 `save_bond_info` `0x1B3F3AE8`）：
+    * `persist.setup_wizard=1`（1 = 已绑定 bonded；0 = 未绑定；2 = 新绑定进行中）；
+    * `persist.miwear_companion_device_type=0`（0 = Android 手机；1 = iOS）；
+    * `persist.miwear_companion_device_mac`（绑定的手机/主机蓝牙 MAC 地址，12 位小端十六进制字符串，如 C0:FF:EE:00:00:01 写作 010000eecfc0）。
+  CP 核安全策略（`allow_link_connect_pair_request` `0x1B3F9D90`）严格限制只允许该伴侣设备地址配对。
+  `emu/mksensornor.py` 新增 `--bound KEY [--companion ADDR] [--user-id ID]` 选项，一键生成已绑定的
+  Sensor NOR 镜像，手环启动后自动完成数据迁移并跳过向导，直达表盘主界面！
+  ②**LE 广播与扫描、Page 重连链路模型（hw/misc/bes_btss_link.c）**：
+  已绑定的手环不再应答 BR/EDR Inquiry 搜索，而是按蓝牙规范通过 LE Extended Advertising 发送重连信标（beacon）。
+  完善 `bes_btss_link` 的 LE 广播与扫描能力：
+    * 实现了 LE Set Advertising / Scan / Extended Advertising 命令集（0x2005..0x2042）；
+    * 支持在对端开启扫描时生成标准 LE Advertising Report（0x02）及 LE Extended Advertising Report（0x0D）；
+    * 寻呼（Page）支持标准的 Page_Timeout 等待周期（`page_timer`，按 0.625 ms 时钟槽换算超时）：
+      当手环交替处于 LE 广播与 Page Scan 窗口时，Page 请求保持挂起并在目标控制器打开 Page Scan 时立即握手，
+      彻底解决了快速寻呼时因目标暂未就绪返回 0x04 (Page Timeout) 的偶发失败。
+  ③**AstroBox-NG 蓝牙桥支持与端到端闭环验证**：
+  AstroBox 蓝牙桥（AstroBox-NG 的 bluetooth 模块及前端设置页）：
+    * 开启后台 LE 扫描监听，已绑定手环开机发出的重连广播可自动捕获并显示；
+    * 支持"按地址添加手环"（`add_device`，默认 `C0:FF:EE:15:03:01`），通过 Remote Name Request 解析名称；
+    * 实测验证：q63 从寻呼连接、SSP 配对（手环弹窗配对码并确认）、链路加密（mode 2）、SDP 查询（RFCOMM 5 通道）、
+      SPP 链路建立、L1 帧握手、ADMIN LOGIN（AuthKey）鉴权全部顺利通过！成功读取设备序列号（`QEMU17000000000001`）、
+      固件版本（`4.101.020`）、型号（`M2606W1`）及电量（82%），端到端协议链路 100% 畅通！
 
 - **2026-10-11 (3)（q63：40 秒进向导、配色复原、蓝牙偶发 panic 根治）**：
   ①**启动慢**：80 秒里有 40 秒是 miwear 主线程在支付宝 eSE 开通道上等两次

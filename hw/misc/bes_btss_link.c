@@ -74,6 +74,16 @@
 #define EVT_USER_PASSKEY        0x34
 #define EVT_SSP_COMPLETE        0x36
 #define EVT_PASSKEY_NOTIFY      0x3B
+#define EVT_LE_META             0x3E
+#define LE_ADV_REPORT           0x02    /* subevents of LE Meta */
+#define LE_EXT_ADV_REPORT       0x0D
+
+/* Advertising_Event_Properties (Vol 4 Part E 7.8.53) */
+#define ADV_CONNECTABLE         (1 << 0)
+#define ADV_SCANNABLE           (1 << 1)
+#define ADV_DIRECTED            (1 << 2)
+#define ADV_SCAN_RSP            (1 << 3)    /* report event types only */
+#define ADV_LEGACY              (1 << 4)
 
 /* error codes (Vol 1 Part F) */
 #define ERR_UNKNOWN_CONN        0x02
@@ -186,6 +196,7 @@ static void cmd_complete_addr(BesBtssState *s, int side, uint16_t opcode,
 static void link_down(BesBtssState *s)
 {
     trace_bes_btss_link("link down");
+    timer_del(s->page_timer);
     memset(&s->link, 0, sizeof(s->link));
 }
 
@@ -301,14 +312,307 @@ static void link_remote_name(BesBtssState *s, int side, const uint8_t *p,
     btss_event(s, side, EVT_REMOTE_NAME, ev, sizeof(ev));
 }
 
+/* ---- LE broadcast ---- */
+
+/*
+ * Advertising and scanning (Vol 6 Part B 4.4) without the timing: an
+ * advertising set is seen once when the other controller starts scanning
+ * or when the set is enabled or its data changes while the other scans,
+ * as with duplicate filtering. A scanner using the legacy commands sees
+ * only legacy PDUs; an active scanner also gets the scan response of a
+ * scannable set. Directed advertising and LE connections are not modelled.
+ */
+
+static BesBtssAdvSet *adv_set(BesBtssHost *h, uint8_t handle, bool create)
+{
+    BesBtssAdvSet *unused = NULL;
+    int i;
+
+    for (i = 0; i < BTSS_ADV_SETS; i++) {
+        if (h->adv[i].used && h->adv[i].handle == handle) {
+            return &h->adv[i];
+        }
+        if (!h->adv[i].used && !unused) {
+            unused = &h->adv[i];
+        }
+    }
+    if (!create || !unused) {
+        return NULL;
+    }
+    memset(unused, 0, sizeof(*unused));
+    unused->used = true;
+    unused->handle = handle;
+    return unused;
+}
+
+/* one PDU of set "a" of the other controller, received by "side" */
+static void le_report(BesBtssState *s, int side, BesBtssAdvSet *a, bool rsp)
+{
+    BesBtssHost *t = &s->host[other(side)];
+    /* no resolving list: types 2/3 fall back to public/random */
+    bool random = a->own_addr_type & 1;
+    const uint8_t *addr = !random ? t->bdaddr :
+                          a->handle == BTSS_ADV_LEGACY ? t->le_random :
+                          a->random;
+    const uint8_t *data = rsp ? a->rsp : a->data;
+    unsigned len = rsp ? a->rsp_len : a->data_len;
+    uint8_t p[255] = { 0 };
+    uint16_t type;
+
+    if (s->host[side].le_scan_ext) {
+        /* LE Extended Advertising Report (7.7.65.13) */
+        type = a->props & (ADV_CONNECTABLE | ADV_SCANNABLE | ADV_LEGACY);
+        if (rsp) {
+            type |= ADV_SCAN_RSP;
+        }
+        if (len > 255 - 26) {
+            len = 255 - 26;
+            type |= 2 << 5;         /* Data_Status: truncated */
+        }
+        p[0] = LE_EXT_ADV_REPORT;
+        p[1] = 1;                   /* Num_Reports */
+        stw_le_p(p + 2, type);
+        p[4] = random;
+        memcpy(p + 5, addr, 6);
+        p[11] = 0x01;               /* Primary_PHY: LE 1M */
+        p[12] = a->props & ADV_LEGACY ? 0x00 : 0x01;
+        p[13] = 0xFF;               /* Advertising_SID: none */
+        p[14] = 0x7F;               /* TX_Power: not available */
+        p[15] = (uint8_t)-40;       /* RSSI */
+        p[25] = len;                /* p[16..24]: no periodic, no direct */
+        memcpy(p + 26, data, len);
+        btss_event(s, side, EVT_LE_META, p, 26 + len);
+    } else {
+        /* LE Advertising Report (7.7.65.2) of a legacy PDU */
+        len = MIN(len, 31u);
+        p[0] = LE_ADV_REPORT;
+        p[1] = 1;
+        p[2] = rsp ? 0x04 :                            /* SCAN_RSP */
+               a->props & ADV_CONNECTABLE ? 0x00 :     /* ADV_IND */
+               a->props & ADV_SCANNABLE ? 0x02 :       /* ADV_SCAN_IND */
+               0x03;                                   /* ADV_NONCONN_IND */
+        p[3] = random;
+        memcpy(p + 4, addr, 6);
+        p[10] = len;
+        memcpy(p + 11, data, len);
+        p[11 + len] = (uint8_t)-40;
+        btss_event(s, side, EVT_LE_META, p, 12 + len);
+    }
+}
+
+/* the other controller's set "a", as far as "side" can see it now */
+static void le_see(BesBtssState *s, int side, BesBtssAdvSet *a)
+{
+    BesBtssHost *h = &s->host[side];
+
+    if (!h->le_scan || !a->enabled || !side_present(s, other(side)) ||
+        (a->props & ADV_DIRECTED) ||
+        (!h->le_scan_ext && !(a->props & ADV_LEGACY))) {
+        return;
+    }
+    le_report(s, side, a, false);
+    if (h->le_scan_active && (a->props & ADV_SCANNABLE)) {
+        le_report(s, side, a, true);
+    }
+}
+
+static void le_scan_enable(BesBtssState *s, int side, uint16_t opcode,
+                           const uint8_t *p, unsigned plen)
+{
+    BesBtssHost *h = &s->host[side];
+    BesBtssHost *t = &s->host[other(side)];
+    bool start = plen >= 1 && p[0] && !h->le_scan;
+    uint8_t status = 0x00;
+    int i;
+
+    if (plen >= 1) {
+        h->le_scan = p[0];
+        h->le_scan_ext = opcode == 0x2042;
+    }
+    btss_cmd_complete(s, side, opcode, &status, 1);
+    for (i = 0; start && i < BTSS_ADV_SETS; i++) {
+        if (t->adv[i].used) {
+            le_see(s, side, &t->adv[i]);
+        }
+    }
+}
+
+/* (Extended) Advertising / Scan Response Data: the fragment Operation */
+static void adv_data(BesBtssState *s, int side, BesBtssAdvSet *a, bool rsp,
+                     uint8_t op, const uint8_t *data, unsigned len)
+{
+    uint8_t *buf = rsp ? a->rsp : a->data;
+    uint8_t *n = rsp ? &a->rsp_len : &a->data_len;
+
+    switch (op) {
+    case 1:                         /* first fragment */
+    case 3:                         /* complete data */
+        *n = 0;
+        /* fall through */
+    case 0:                         /* intermediate fragment */
+    case 2:                         /* last fragment */
+        len = MIN(len, (unsigned)BTSS_ADV_DATA_MAX - *n);
+        memcpy(buf + *n, data, len);
+        *n += len;
+        break;
+    default:                        /* 4: unchanged data */
+        return;
+    }
+    if (op >= 2) {
+        le_see(s, other(side), a);
+    }
+}
+
+static void adv_enable(BesBtssState *s, int side, BesBtssAdvSet *a, bool on)
+{
+    bool start = on && !a->enabled;
+
+    a->enabled = on;
+    if (start) {
+        le_see(s, other(side), a);
+    }
+}
+
+/* the LE broadcast commands of controller "side" */
+static void le_record(BesBtssState *s, int side, uint16_t opcode,
+                      const uint8_t *p, unsigned plen)
+{
+    /* legacy Advertising_Type -> event properties of a legacy PDU */
+    static const uint16_t legacy_props[] = {
+        ADV_LEGACY | ADV_SCANNABLE | ADV_CONNECTABLE,       /* ADV_IND */
+        ADV_LEGACY | ADV_DIRECTED | ADV_CONNECTABLE | 1 << 3,   /* high duty */
+        ADV_LEGACY | ADV_SCANNABLE,                         /* ADV_SCAN_IND */
+        ADV_LEGACY,                                         /* NONCONN */
+        ADV_LEGACY | ADV_DIRECTED | ADV_CONNECTABLE,        /* low duty */
+    };
+    BesBtssHost *h = &s->host[side];
+    BesBtssAdvSet *a;
+    unsigned i, n;
+
+    switch (opcode) {
+    case 0x2005:                    /* LE Set Random Address */
+        if (plen >= 6) {
+            memcpy(h->le_random, p, 6);
+        }
+        break;
+    case 0x2006:                    /* LE Set Advertising Parameters */
+        a = adv_set(h, BTSS_ADV_LEGACY, true);
+        if (a && plen >= 6 && p[4] < ARRAY_SIZE(legacy_props)) {
+            a->props = legacy_props[p[4]];
+            a->own_addr_type = p[5];
+        }
+        break;
+    case 0x2008:                    /* LE Set Advertising Data */
+    case 0x2009:                    /* LE Set Scan Response Data */
+        a = adv_set(h, BTSS_ADV_LEGACY, true);
+        if (a && plen >= 1) {
+            adv_data(s, side, a, opcode == 0x2009, 3, p + 1,
+                     MIN(p[0], MIN(plen - 1, 31u)));
+        }
+        break;
+    case 0x200A:                    /* LE Set Advertising Enable */
+        a = adv_set(h, BTSS_ADV_LEGACY, true);
+        if (a && plen >= 1) {
+            adv_enable(s, side, a, p[0]);
+        }
+        break;
+    case 0x200B:                    /* LE Set Scan Parameters */
+        if (plen >= 1) {
+            h->le_scan_active = p[0];
+        }
+        break;
+    case 0x2035:                    /* LE Set Adv Set Random Address */
+        a = plen >= 7 ? adv_set(h, p[0], true) : NULL;
+        if (a) {
+            memcpy(a->random, p + 1, 6);
+        }
+        break;
+    case 0x2036:                    /* LE Set Extended Advertising Params */
+        a = plen >= 11 ? adv_set(h, p[0], true) : NULL;
+        if (a) {
+            a->props = lduw_le_p(p + 1);
+            a->own_addr_type = p[10];
+        }
+        break;
+    case 0x2037:                    /* LE Set Extended Advertising Data */
+    case 0x2038:                    /* LE Set Extended Scan Response Data */
+        a = plen >= 4 ? adv_set(h, p[0], true) : NULL;
+        if (a) {
+            adv_data(s, side, a, opcode == 0x2038, p[1], p + 4,
+                     MIN(p[3], plen - 4));
+        }
+        break;
+    case 0x2039:                    /* LE Set Extended Advertising Enable */
+        if (plen < 2) {
+            break;
+        }
+        if (!p[1] && !p[0]) {       /* no sets listed: disable all */
+            for (i = 0; i < BTSS_ADV_SETS; i++) {
+                h->adv[i].enabled = false;
+            }
+        }
+        for (i = 0, n = p[1]; i < n && 2 + 4 * i + 4 <= plen; i++) {
+            a = adv_set(h, p[2 + 4 * i], false);
+            if (a) {
+                adv_enable(s, side, a, p[0]);
+            }
+        }
+        break;
+    case 0x203C:                    /* LE Remove Advertising Set */
+        a = plen >= 1 ? adv_set(h, p[0], false) : NULL;
+        if (a) {
+            a->used = false;
+        }
+        break;
+    case 0x203D:                    /* LE Clear Advertising Sets */
+        memset(h->adv, 0, sizeof(h->adv));
+        break;
+    case 0x2041:                    /* LE Set Extended Scan Parameters */
+        if (plen >= 4) {            /* the first PHY's Scan_Type */
+            h->le_scan_active = p[3];
+        }
+        break;
+    }
+}
+
 /* ---- connection setup ---- */
+
+/* deliver a page once its target scans for pages, or let it time out */
+static void page_check(BesBtssState *s)
+{
+    int side = s->link.central, t = other(side);
+    uint8_t ev[10];
+
+    if (s->link.state != BTSS_LINK_PAGING || !s->link.page_wait) {
+        return;
+    }
+    if (s->host[t].scan_enable & 0x02) {
+        s->link.page_wait = false;
+        timer_del(s->page_timer);
+        memcpy(ev, s->host[side].bdaddr, 6);
+        memcpy(ev + 6, s->host[side].cod, 3);
+        ev[9] = 0x01;               /* ACL */
+        btss_event(s, t, EVT_CONN_REQUEST, ev, sizeof(ev));
+    } else if (qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) >=
+               s->link.page_deadline_ms) {
+        trace_bes_btss_link("page timeout");
+        ev_conn_complete(s, side, ERR_PAGE_TIMEOUT, s->host[t].bdaddr);
+        link_down(s);
+    } else {
+        timer_mod(s->page_timer, s->link.page_deadline_ms);
+    }
+}
+
+static void page_timer_cb(void *opaque)
+{
+    page_check(opaque);
+}
 
 static void link_create_connection(BesBtssState *s, int side,
                                    const uint8_t *p, unsigned plen)
 {
     BesBtssHost *h = &s->host[side];
     int t = other(side);
-    uint8_t ev[10];
 
     if (plen < 13) {
         btss_cmd_status(s, side, 0x0405, ERR_INVALID_PARAMS);
@@ -320,18 +624,23 @@ static void link_create_connection(BesBtssState *s, int side,
         return;
     }
     btss_cmd_status(s, side, 0x0405, 0x00);
-    if (!addr_is(s, t, p) || !side_present(s, t) ||
-        !(s->host[t].scan_enable & 0x02)) {
+    if (!addr_is(s, t, p) || !side_present(s, t)) {
         ev_conn_complete(s, side, ERR_PAGE_TIMEOUT, p);
         return;
     }
     trace_bes_btss_link("paging");
     s->link.state = BTSS_LINK_PAGING;
     s->link.central = side;
-    memcpy(ev, h->bdaddr, 6);
-    memcpy(ev + 6, h->cod, 3);
-    ev[9] = 0x01;                   /* ACL */
-    btss_event(s, t, EVT_CONN_REQUEST, ev, sizeof(ev));
+    /*
+     * A page lasts up to the pager's Page_Timeout (slots of 0.625 ms); a
+     * target that does not scan for pages now may still start within it
+     * (hosts open page scan windows, e.g. the band between its LE
+     * advertising bursts).
+     */
+    s->link.page_wait = true;
+    s->link.page_deadline_ms = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+                               h->page_timeout * 5 / 8;
+    page_check(s);
 }
 
 static void link_create_connection_cancel(BesBtssState *s, int side,
@@ -356,7 +665,7 @@ static void link_accept(BesBtssState *s, int side, const uint8_t *p,
 {
     int i;
 
-    if (plen < 7 || s->link.state != BTSS_LINK_PAGING ||
+    if (plen < 7 || s->link.state != BTSS_LINK_PAGING || s->link.page_wait ||
         s->link.central == side || !addr_is(s, other(side), p)) {
         btss_cmd_status(s, side, 0x0409, ERR_UNKNOWN_CONN);
         return;
@@ -379,7 +688,7 @@ static void link_accept(BesBtssState *s, int side, const uint8_t *p,
 static void link_reject(BesBtssState *s, int side, const uint8_t *p,
                         unsigned plen)
 {
-    if (plen < 7 || s->link.state != BTSS_LINK_PAGING ||
+    if (plen < 7 || s->link.state != BTSS_LINK_PAGING || s->link.page_wait ||
         s->link.central == side || !addr_is(s, other(side), p)) {
         btss_cmd_status(s, side, 0x040A, ERR_UNKNOWN_CONN);
         return;
@@ -801,6 +1110,9 @@ void btss_link_host_reset(BesBtssState *s, int side)
     h->acl_len = 0;
     h->ssp = h->sc = h->le = false;
     h->key_valid = h->replied = false;
+    memset(h->le_random, 0, sizeof(h->le_random));
+    memset(h->adv, 0, sizeof(h->adv));
+    h->le_scan = h->le_scan_ext = h->le_scan_active = false;
 }
 
 /* commands that only configure the controller: record what the air sees */
@@ -824,6 +1136,10 @@ static void link_record(BesBtssState *s, int side, uint16_t opcode,
     case 0x0C1A:                    /* Write Scan Enable */
         if (plen >= 1) {
             h->scan_enable = p[0];
+        }
+        if (s->link.page_wait && (h->scan_enable & 0x02)) {
+            /* the Connection Request follows this command's completion */
+            timer_mod(s->page_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL));
         }
         break;
     case 0x0C24:                    /* Write Class of Device */
@@ -861,6 +1177,9 @@ static void link_record(BesBtssState *s, int side, uint16_t opcode,
         if (plen >= 1) {
             h->sc = p[0];
         }
+        break;
+    default:
+        le_record(s, side, opcode, p, plen);
         break;
     }
 }
@@ -916,6 +1235,9 @@ bool btss_link_command(BesBtssState *s, int side, uint16_t opcode,
         return true;
     case 0x080B:
         link_switch_role(s, side, p, plen);
+        return true;
+    case 0x200C: case 0x2042:
+        le_scan_enable(s, side, opcode, p, plen);
         return true;
     default:
         link_record(s, side, opcode, p, plen);
@@ -1157,6 +1479,7 @@ void btss_link_realize(BesBtssState *s, Error **errp)
     s->host[BTSS_PEER].inq_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                                 inquiry_peer_expired, s);
     s->air_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, air_free, s);
+    s->page_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, page_timer_cb, s);
     qemu_chr_fe_set_handlers(&s->radio, radio_can_receive, radio_receive,
                              radio_event, NULL, s, NULL, true);
 }
