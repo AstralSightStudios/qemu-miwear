@@ -331,7 +331,8 @@ static int vgl_expand(uint32_t v, unsigned bits)
 {
     uint32_t max = (1u << bits) - 1;
 
-    return bits >= 8 ? (int)(v & 0xFF) : (int)((v * 255 + max / 2) / max);
+    v &= max;
+    return bits >= 8 ? (int)v : (int)((v * 255 + max / 2) / max);
 }
 
 /* raw packed pixel -> RGBA 0..255 as stored */
