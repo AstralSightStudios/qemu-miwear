@@ -513,7 +513,7 @@ static bool vgl_sampler_open(VsiVgliteState *s, VglSampler *sm, bool paint)
     sm->h = size >> 16;
     sm->tile = (cfg >> 12) & 3;
     sm->filter = (cfg >> 16) & 3;
-    sm->premul = cfg & (1u << 24);
+    sm->premul = !paint && (cfg & (1u << 24));
     vgl_abgr(vgl_st(s, paint ? ST_PAINT_BORDER : ST_IMAGE_BORDER),
              sm->border);
     vgl_premultiply(sm->border);
@@ -825,9 +825,10 @@ static bool vgl_pe_open(VsiVgliteState *s, VglPE *pe, int y0, int y1)
     pe->paint = CTRL_PAINT(pe->ctrl);
     vgl_abgr(vgl_st(s, ST_COLOR), pe->color);
     memcpy(pe->color_pm, pe->color, sizeof(pe->color));
-    if (pe->ctrl & CTRL_IN_PREMULT) {
-        vgl_premultiply(pe->color_pm);
-    }
+    /*
+     * Drivers set bit 28 (in_premult) when the render target is not
+     * premultiplied; the pen colour from LVGL is already premultiplied.
+     */
     if (pe->ctrl & CTRL_UNMODELLED) {
         qemu_log_mask(LOG_UNIMP, "vsi.vglite: control 0x%08x: colour "
                       "transform / pixel matrix / mask not modelled\n",
