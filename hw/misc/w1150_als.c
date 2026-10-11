@@ -2,10 +2,11 @@
  * W1150 ambient light / PPG front end (Band 9 Pro, n67)
  *
  * The AP firmware's w11xx driver (sub_C3913A0, "init w1150 light device")
- * reads the device on I2C5 at 0x48 and accepts the part when the identity
- * byte is 0x1A (cmp r6, #0x1A after uxtb). Until the register map is
- * modelled the device answers every read with that identity byte and
- * accepts writes without effect, which is all the probe needs.
+ * reads the device on I2C5 at 0x48 and accepts the part only when the
+ * identity byte equals 0xE5 and matches the driver's table (sub_C3913A0,
+ * the loop over 2e e1 e5 ea e0 e6 e8). Until the register map is modelled
+ * the device answers every read with that identity byte and accepts writes
+ * without effect, which is all the probe needs.
  *
  * This code is licensed under the GPL version 2 or later.
  */
@@ -14,7 +15,7 @@
 #include "hw/i2c/i2c.h"
 
 #define TYPE_W1150_ALS "w1150.als"
-#define W1150_ID        0x1A
+#define W1150_ID        0xE5
 
 static uint8_t w1150_recv(I2CSlave *i2c)
 {
