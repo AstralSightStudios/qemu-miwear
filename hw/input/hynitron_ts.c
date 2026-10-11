@@ -78,6 +78,7 @@
 #define HYN_MODE_DEEP_SLEEP     0x05
 #define HYN_MODE_IDLE_SLEEP     0x07
 #define HYN_MODE_NORMAL         0x09
+#define HYN_MODE_REPORT         0x1D
 #define HYN_MODE_WEAR_ON        0x23
 #define HYN_MODE_WEAR_OFF       0x24
 #define HYN_MODE_WRIST_ON       0x25
@@ -214,6 +215,7 @@ static void hyn_mode(HynitronTsState *s, uint8_t mode)
 {
     switch (mode) {
     case HYN_MODE_NORMAL:
+    case HYN_MODE_REPORT:
     case HYN_MODE_DEBUG_INFO:
         hyn_sleep(s, false, false);
         break;

@@ -161,14 +161,12 @@ static const BesBoard bes_boards[] = {
         .desc = "Xiaomi Smart Band 9 Pro",
         .chip = "best1503",
         .product = "n67",
-        /* 未验证：启动在显示前的 PMU 阶段就停了，面板尺寸、CASET 与 TE 脚
-         * 都还没有实测，下面的数值只是占位。 */
         .panel_width = 336,
         .panel_height = 480,
-        .lcd_te_gpio = 65,
+        .lcd_te_gpio = 47,
         /* CST9217 @0x5A on I2C3，INT GPIO 27 */
-        /* 触摸在 I2C5（0x40063000）：固件对 0x5A 的访问全部落在该总线上 */
-        .touch = { TYPE_HYNITRON_TS, 5, 0x5A, 27, true, 0x9220 },
+        /* 触摸在 I2C5（0x40063000）：固件对 0x5A 的访问全部落在该总线上，INT GPIO 76 (0x4C) */
+        .touch = { TYPE_HYNITRON_TS, 5, 0x5A, 76, true, 0x9217 },
         /* W1150 light device on I2C5 at 0x48 (sub_C3913A0 w11xx init) */
         .light = { "w1150.als", 5, 0x48, -1 },
         /* NAND：固件表 nand_system first 0 nblocks 57600、nand_data
