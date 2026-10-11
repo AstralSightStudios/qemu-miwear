@@ -197,6 +197,38 @@ AONCMU/CMU 魔术值 → UART（console, qemu chardev 直通终端）→ TIMER/S
 
 ## 7. 最新变更
 
+- **2026-10-11 (2)（q63：GPU 出图、触摸/按键可用、偶发启动停滞根治）**：
+  现在 q63 约 80 秒进入 OOBE 欢迎页，点箭头进"选择语言"，再进配对页。
+  ①**GPU**：q63 的 VGLite 与 best1503 同一型号，改用现成的
+  hw/misc/vsi_vglite.c（删掉临时的 vglite 骨架；客户 ID 属性 0x420）。
+  q63 固件用标准 4.x 命令编码（CALL=0x6、NOP=0x8，与 vsi_vglite 一致；
+  早先"CALL=0x18000000"的结论是错的）。补了线性/径向渐变（色带在
+  paint 图像槽，系数在 0x0A03..0x0A0B，公式见文件头）和 clear（op 4）。
+  帧缓冲 0x20160000/0x201FF100 双缓冲，GPU 经 DTCM AXI 别名 0x21xxxxxx
+  访问；LCDC 与 LVGL 都是内存 B,G,R（开机 logo 本来就是蓝色）。
+  ②**侧键**：两个键是 PMU GPIO 113（DOWN）/114（HOME，表冠），低有效，
+  电平在 PMU 0xBC/0xBD；原来读 0 = 一直按着，输入管理器刷长按、事件队列
+  溢出。bes_ispi 加 "pmu-gpio" 输入与 PMU GPIO 中断（每 8 脚一组，
+  0xBE+{0,6,11,17}：+0 清、+1 使能；状态 0xDE/0xDF；"pmu-irq" 接 AP
+  NVIC 23）。宿主 Home = HOME，Page Down = DOWN。
+  ③**触摸**：驱动先读固件状态 0x50000918 要 bit14；抬起必须报点数 1；
+  驱动在中断里关脚中断、读完才开，模型改为读走后 8ms 再拉低 INT、
+  100ms 未读重发；CC 数据寄存器 0x5000093C 报非 0 免去开机校准烧录。
+  ④**偶发启动停滞（约 1/6，开机 logo 不动）根因**：BES 定时器计数含 0
+  态（hal_timer 为 n 拍写 Load = n - 1），QEMU 的 SP804 早一拍中断；
+  hwtimer_handler 两次读系统定时器都判"未到"时只记 irq early 就返回、
+  不再重设硬件定时器，该核所有 tickless 睡眠永不唤醒（sensor 卡在
+  cp 侧 rptun 建链的 10ms 轮询里，cp/AP 随之停住；"控制台停在 connmand
+  而系统继续跑"也是同一原因，NSH 睡死）。arm_timer 加 count-zero 属性，
+  best1700 全部 SP804 打开。修后 12 次启动全部进 OOBE。
+  ⑤仍未解决：cp 偶发 panic（蓝牙协议栈 bluelet_thread 写 HCI 时，约
+  1/30，崩溃头被 AP 的大段转储冲掉，尚未抓到断言内容）→ AP 复位 → TEE
+  "Start pmu reboot" 后模拟器停住；OOBE 文字颜色固件给的就是 #333333
+  （是否设计如此待真机对照）；控制中心部分图标资源缺失；TEE 复位不生效。
+  新增调试手段：-trace best1700_cmu_isys（核间邮箱）、arm_timer_*、
+  raydium_ts_*；sensor 日志每次 hal_trace_printf 一行；QMP
+  input-send-event 点屏（坐标 0..32767 映射到 466）、send-key 按键。
+
 - **2026-10-11（q63：卡死/重启的连环原因查清，卡在 GPU）**：
   用户现象：MI logo → 黑屏 → 再 logo → HyperOS 图标 → 卡死。逐个查清：
   ①**内存被冲**（sensor 向量表清零 / TEE 向量表填满 0x75 → lockup 或
