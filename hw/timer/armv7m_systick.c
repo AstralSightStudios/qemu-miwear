@@ -166,6 +166,10 @@ static MemTxResult systick_write(void *opaque, hwaddr addr,
     case 0x4: /* SysTick Reload Value.  */
         ptimer_transaction_begin(s->ptimer);
         ptimer_set_limit(s->ptimer, value & 0xffffff, 0);
+        if ((s->control & SYSTICK_ENABLE) && (value & 0xffffff)) {
+            /* a zero reload stopped the counter while ENABLE stayed set */
+            ptimer_run(s->ptimer, 0);
+        }
         ptimer_transaction_commit(s->ptimer);
         break;
     case 0x8: /* SysTick Current Value. */
