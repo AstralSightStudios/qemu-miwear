@@ -295,10 +295,10 @@ static uint32_t hyn_mem_word(HynitronTsState *s)
     return 0;
 }
 
-/* hyn92xx accepts double tap as 1, cst92xx as 2 */
+/* Xiaomi hyn92xx/cst92xx drivers accept double tap as 1 (shifted << 4 = 0x10) */
 static uint8_t hyn_gesture_code(HynitronTsState *s)
 {
-    if (s->hyn92xx && s->gesture == HYN_GESTURE_DOUBLE_TAP) {
+    if (s->gesture == HYN_GESTURE_DOUBLE_TAP) {
         return 1;
     }
     return s->gesture;
@@ -478,7 +478,6 @@ static void hyn_input_event(DeviceState *dev, QemuConsole *src,
 /* gesture sleep: only a finished double tap or slide up wakes the host */
 static void hyn_gesture_sync(HynitronTsState *s, int x, int y)
 {
-    int64_t now;
 
     if (s->btn == s->btn_reported) {
         return;
@@ -496,17 +495,9 @@ static void hyn_gesture_sync(HynitronTsState *s, int x, int y)
         s->gesture = HYN_GESTURE_SLIDE_UP;
     } else if (ABS(x - s->down_x) <= HYN_TAP_SLOP &&
                ABS(y - s->down_y) <= HYN_TAP_SLOP) {
-        now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
-        if (now - s->last_tap_ms <= HYN_DOUBLE_TAP_MS &&
-            ABS(x - s->last_tap_x) <= HYN_TAP_SLOP * 2 &&
-            ABS(y - s->last_tap_y) <= HYN_TAP_SLOP * 2) {
-            s->gesture = HYN_GESTURE_DOUBLE_TAP;
-            s->last_tap_ms = INT64_MIN;
-        } else {
-            s->last_tap_ms = now;
-            s->last_tap_x = x;
-            s->last_tap_y = y;
-        }
+        /* In emulator, any tap on the sleeping screen triggers the wake gesture */
+        s->gesture = HYN_GESTURE_DOUBLE_TAP;
+        s->last_tap_ms = INT64_MIN;
     }
     if (s->gesture) {
         trace_hynitron_ts_gesture(s->gesture);
