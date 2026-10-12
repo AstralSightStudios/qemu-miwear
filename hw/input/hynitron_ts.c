@@ -18,14 +18,20 @@
  *   - work mode (set_work_mode sub_C6E5E38): D1 1E, then a mode command
  *     D1 <m> (09 normal, 01 debug info, 04 gesture sleep, 05 deep sleep,
  *     07 idle sleep, 23/24 wear detection on/off, 25/26 wrist turn
- *     on/off); 00 02 reads the controller's echo, byte 1 = <m>
+ *     on/off); 00 02 reads the controller's echo, byte 1 = <m>.  The
+ *     hyn92xx driver's enter_sleep (sub_C1076DC on Band 10) ends with
+ *     D1 1E, D1 09 after D1 04; the controller stays in gesture sleep,
+ *     which only a wake gesture or a reset (wake_up sub_C109964: reset
+ *     line, then bootloader commands) ends
  *   - firmware info, in debug info mode (get_firmware_info sub_C6E6260):
  *     D1 FC, D2 00, D2 04 (project id | ic type << 16), D2 08 (version)
  *     and D2 1C, their sum; D2 0C firmware checksum; D1 F4 tx / rx / key
  *     channel counts
  *   - ESD watchdog (sub_C6E66A8, sub_C1586EC; every 50 ms): D0 48, then a
- *     read whose byte 0 is 0x20 while the controller runs and byte 1 the
- *     wrist turn (bit 1) and wear detection (bit 0) states
+ *     read whose byte 0 is 0x20 while the controller runs (0xA0 in
+ *     gesture sleep: hyn92xx esd_check sub_C10B6A0 re-enters sleep on
+ *     anything else) and byte 1 the wrist turn (bit 1) and wear
+ *     detection (bit 0) states
  *   - report (read_point sub_C6E5C84 / sub_C154400): 10 bytes at D0 00:
  *     [0] id << 4 | state (6 down, 7 move, 0 up), [1] x >> 4, [2] y >> 4,
  *     [3] (x & 15) << 4 | (y & 15), [4] gesture << 4 or palm bit 7,
@@ -89,6 +95,7 @@
 #define HYN_STATE_MOVE          7
 #define HYN_REPORT_MARK         0xAB
 #define HYN_ESD_ALIVE           0x20
+#define HYN_ESD_GESTURE         0xA0
 
 #define HYN_GESTURE_SINGLE_TAP  1
 #define HYN_GESTURE_DOUBLE_TAP  2
@@ -188,26 +195,6 @@ static void hyn_push(HynitronTsState *s, uint8_t state, int x, int y)
     hyn_update_irq(s);
 }
 
-static void hyn_mode(HynitronTsState *s, uint8_t mode);
-
-/* the report or wake gesture was fetched */
-static void hyn_ack(HynitronTsState *s)
-{
-    if (s->gesture) {
-        s->gesture = 0;
-        if (s->asleep) {
-            hyn_mode(s, HYN_MODE_NORMAL);
-        }
-        qemu_irq_raise(s->irq);
-    } else if (s->q_count) {
-        s->q_head = (s->q_head + 1) % HYN_QUEUE;
-        s->q_count--;
-        /* release the line so the next report is a fresh edge */
-        qemu_irq_raise(s->irq);
-    }
-    hyn_update_irq(s);
-}
-
 static void hyn_sleep(HynitronTsState *s, bool asleep, bool deep)
 {
     s->asleep = asleep;
@@ -219,10 +206,34 @@ static void hyn_sleep(HynitronTsState *s, bool asleep, bool deep)
     hyn_update_irq(s);
 }
 
+/* the report or wake gesture was fetched */
+static void hyn_ack(HynitronTsState *s)
+{
+    if (s->gesture) {
+        s->gesture = 0;
+        if (s->asleep) {
+            hyn_sleep(s, false, false);
+            s->mode = HYN_MODE_NORMAL;
+        }
+        qemu_irq_raise(s->irq);
+    } else if (s->q_count) {
+        s->q_head = (s->q_head + 1) % HYN_QUEUE;
+        s->q_count--;
+        /* release the line so the next report is a fresh edge */
+        qemu_irq_raise(s->irq);
+    }
+    hyn_update_irq(s);
+}
+
 static void hyn_mode(HynitronTsState *s, uint8_t mode)
 {
     switch (mode) {
     case HYN_MODE_NORMAL:
+        if (s->asleep && s->hyn92xx) {
+            return;
+        }
+        hyn_sleep(s, false, false);
+        break;
     case HYN_MODE_REPORT:
     case HYN_MODE_DEBUG_INFO:
         hyn_sleep(s, false, false);
@@ -256,6 +267,8 @@ static void hyn_write(HynitronTsState *s)
 
     if ((s->cmd & 0xFF00) != HYN_CMD_BOOT_CMD_PREFIX) {
         s->boot = false;
+    } else if (s->asleep || s->deep) {
+        hyn_sleep(s, false, false);     /* the driver reset the controller */
     }
 
     trace_hynitron_ts_write(s->cmd, n ? d[0] : 0, n);
@@ -336,7 +349,7 @@ static uint8_t hyn_read_byte(HynitronTsState *s, unsigned off)
         return off == 1 ? hyn_echo_mode(s) : 0;
     case HYN_CMD_ESD:
         if (off == 0) {
-            return HYN_ESD_ALIVE;
+            return s->asleep && s->hyn92xx ? HYN_ESD_GESTURE : HYN_ESD_ALIVE;
         }
         return off == 1 ? (s->wrist ? 2 : 0) | (s->wear ? 1 : 0) : 0;
     case HYN_CMD_POINT:
