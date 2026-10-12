@@ -69,6 +69,8 @@ BOOT_TRAILER_SIZE = 8
 
 # Common prefix seen in both p67 AP and BL2 images.
 HEADER_MAGIC0 = 0xFFFFFFFF
+# best1502p packages (REDMI Watch 6) carry the boot-struct magic instead
+HEADER_MAGICS = (HEADER_MAGIC0, 0xBE57EC1C)
 HEADER_VERSION = 0x00050000
 HEADER_RESERVED = 0x00000000
 ENTRY_STUB = b"\x14\x48\x00\x47"  # LDR R0,[PC,#0x50]; BX R0
@@ -274,7 +276,7 @@ def _probe(li):
 
     magic0, version, reserved, boot_info_ptr = struct.unpack("<4I", header)
     if (
-        magic0 != HEADER_MAGIC0
+        magic0 not in HEADER_MAGICS
         or version != HEADER_VERSION
         or reserved != HEADER_RESERVED
         or stub != ENTRY_STUB

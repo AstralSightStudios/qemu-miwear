@@ -5,7 +5,9 @@
  * 从镜像头解析，不写死任何地址，换固件版本自动适配。
  *
  * 格式依据（实测自 vela_ap.bin v3.101.043 / vela_bl2.bin）：
- *   [0x00] magic 0xFFFFFFFF / [0x04] version 0x00050000 / [0x08] 保留
+ *   [0x00] magic 0xFFFFFFFF（best1502p 的 REDMI Watch 6 包为 boot struct
+ *          magic 0xBE57EC1C，其余字段相同）/ [0x04] version 0x00050000 /
+ *          [0x08] 保留
  *   [0x0C] boot info 指针（NC 闪存别名地址）
  *   [0x10] 入口 stub：ldr r0,[pc,#imm]; bx r0
  *   [0x64] stub 取的 mapped 入口指针（奇数 Thumb 指针，指向 stub 之后），
@@ -30,6 +32,7 @@
 #include "qemu/bswap.h"
 
 #define BES_HDR_MAGIC    0xFFFFFFFFu
+#define BES_HDR_MAGIC_BOOT_STRUCT 0xBE57EC1Cu
 #define BES_HDR_VERSION  0x00050000u
 #define BES_HDR_VERSION_SIGNED 0x00050001u
 
@@ -117,8 +120,8 @@ bool bes_image_load(BesImage *img, const char *path, Error **errp)
 
     uint32_t magic = bes_ldl(img->data);
     uint32_t version = bes_ldl(img->data + 0x04);
-    if (magic != BES_HDR_MAGIC || (version != BES_HDR_VERSION &&
-                                   version != BES_HDR_VERSION_SIGNED)) {
+    if ((magic != BES_HDR_MAGIC && magic != BES_HDR_MAGIC_BOOT_STRUCT) ||
+        (version != BES_HDR_VERSION && version != BES_HDR_VERSION_SIGNED)) {
         error_setg(errp, "%s: not a BES image (magic=0x%08x ver=0x%08x)",
                    path, magic, version);
         goto fail;

@@ -10,6 +10,8 @@ tables, 512MB part, page units):
   p67 (Band 10 Pro, sub_C20AB44, table 0x2CCC72C0): "resource" first=0
       nblocks=0x19000 holds the resource romfs (vela_resource.bin, written
       by OTA with `dd of=/dev/resource`); nand_data/coredump/nand_nv after
+  p65 (REDMI Watch 6, best1502p, partition table record "resource"):
+      "resource" first=0 nblocks=112640, nand_data first=112640;
   q66 (Band 11, boot log): "resource" first=0 nblocks=65536, romfs as p67;
       nand_data first=65536 nblocks=196608
   n66 (Band 9) / o66 (Band 10), boot log: "nand_system" first=0
@@ -51,6 +53,7 @@ PARTITIONS = {
     "q66": ("resource", 0, 65536),
     "n66": ("system", 0, 65536),
     "o66": ("system", 0, 65536),
+    "p65": ("resource", 0, 112640),
 }
 
 YAFFS_TAGS = 16
