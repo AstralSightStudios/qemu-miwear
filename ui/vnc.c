@@ -1766,8 +1766,16 @@ static void pointer_event(VncState *vs, uint8_t button_mask,
         [INPUT_BUTTON_WHEEL_DOWN] = 0x10,
     };
     QemuConsole *con = vs->vd->dcl.con;
-    int width = pixman_image_get_width(vs->vd->server);
-    int height = pixman_image_get_height(vs->vd->server);
+    /*
+     * Scale over the framebuffer size the client was told about: the
+     * server image is padded to a multiple of 16 pixels, but after a
+     * DesktopSize update the client only sees the console's true width
+     * (212 for a 212-pixel panel, not 224).
+     */
+    int width = vs->client_width ? vs->client_width
+                                 : pixman_image_get_width(vs->vd->server);
+    int height = vs->client_height ? vs->client_height
+                                   : pixman_image_get_height(vs->vd->server);
 
     if (vs->last_bmask != button_mask) {
         qemu_input_update_buttons(con, bmap, vs->last_bmask, button_mask);
