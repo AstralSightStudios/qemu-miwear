@@ -169,6 +169,14 @@ static void hyn_push(HynitronTsState *s, uint8_t state, int x, int y)
         }
     }
     if (s->q_count == HYN_QUEUE) {
+        if (state == HYN_STATE_UP) {
+            tail = &s->q[(s->q_head + s->q_count - 1) % HYN_QUEUE];
+            tail->state = HYN_STATE_UP;
+            tail->x = x;
+            tail->y = y;
+            trace_hynitron_ts_event(state, x, y);
+            hyn_update_irq(s);
+        }
         return;
     }
     tail = &s->q[(s->q_head + s->q_count) % HYN_QUEUE];
@@ -304,30 +312,10 @@ static uint8_t hyn_gesture_code(HynitronTsState *s)
     return s->gesture;
 }
 
-/* hyn92xx echoes the mode command byte; Xiaomi's cst92xx echoes the enum */
+/* hyn92xx and cst92xx echo the mode command byte */
 static uint8_t hyn_echo_mode(HynitronTsState *s)
 {
-    if (s->mode == 0x1E) {
-        return 0x1E;
-    }
-    if (s->hyn92xx) {
-        return s->mode;
-    }
-    switch (s->mode) {
-    case 0x09: return 0;   /* ENUM_MODE_NORMAL */
-    case 0x0D: return 4;
-    case 0x0A: return 5;
-    case 0x14: return 6;
-    case 0x01: return 7;
-    case 0x25: return 9;
-    case 0x26: return 10;
-    case 0x23: return 11;
-    case 0x24: return 12;
-    case 0x10: return 16;
-    case 0x11: return 17;
-    case 0x12: return 18;
-    default:   return s->mode;
-    }
+    return s->mode;
 }
 
 static uint8_t hyn_read_byte(HynitronTsState *s, unsigned off)
@@ -508,8 +496,8 @@ static void hyn_gesture_sync(HynitronTsState *s, int x, int y)
 static void hyn_input_sync(DeviceState *dev)
 {
     HynitronTsState *s = HYNITRON_TS(dev);
-    int x = MIN(s->abs_x, (int)s->width - 1);
-    int y = MIN(s->abs_y, (int)s->height - 1);
+    int x = CLAMP(s->abs_x, 0, (int)s->width - 1);
+    int y = CLAMP(s->abs_y, 0, (int)s->height - 1);
 
     if (s->boot || s->deep) {
         s->btn_reported = s->btn;
