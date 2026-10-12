@@ -24,6 +24,8 @@ config BEST1503
     select BES_BTSS
     select BES_GPIO
     select BES_PSC
+    select BEST1700_DSI
+    select SY6103X
     select NCI_NFCC
     select ZINITIX_TS
     select HYNITRON_TS

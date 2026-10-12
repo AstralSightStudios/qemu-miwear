@@ -41,7 +41,9 @@ typedef struct BesBoardI2C {
     uint8_t addr;
     int irq_gpio;               /* interrupt / data-ready line, -1 = none */
     bool hyn92xx;               /* true = Hynitron hyn92xx driver, false = Xiaomi cst92xx */
-    uint32_t part_no;           /* touch IC part number (0 = default) */
+    uint32_t part_no;           /* touch IC part number / Zinitix
+                                 * hardware id (0 = default) */
+    uint32_t fw_version;        /* Zinitix register version (0 = default) */
 } BesBoardI2C;
 
 typedef struct BesBoard {
@@ -58,11 +60,15 @@ typedef struct BesBoard {
      * full-screen frame), 0 for panels whose GRAM is the visible area */
     uint32_t panel_x_offset;
     uint32_t panel_y_offset;
+    /* panel on a MIPI DSI host (best1502p 0x40230000) instead of the
+     * LCDC's QSPI: its DCS 0x04 ID bytes, low byte first; 0 = no DSI */
+    uint32_t dsi_panel_id;
 
     BesBoardI2C touch;
     BesBoardI2C light;          /* ambient light / PPG front end, -1 irq */
     BesBoardI2C nfc;
     BesBoardI2C gauge;          /* battery fuel gauge */
+    BesBoardI2C charger;        /* battery charger */
     BesBoardI2C sensor_switch;  /* load switch on the sensor core's I2C */
     int nfc_ven_gpio;           /* NFC enable, SoC output */
     /*

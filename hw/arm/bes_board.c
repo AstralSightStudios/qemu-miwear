@@ -22,6 +22,7 @@
 #include "hw/input/hynitron_ts.h"
 #include "hw/input/raydium_ts.h"
 #include "hw/misc/cw2215.h"
+#include "hw/misc/sy6103x.h"
 #include "hw/misc/sgm25062.h"
 #include "hw/misc/nci_nfcc.h"
 #include "system/reset.h"
@@ -179,6 +180,43 @@ static const BesBoard bes_boards[] = {
         /* 未配 GPADC：沿用 n66 的 ch2/ch3/ch5 标定时固件把电池读成 38 mV，判低电量关机 */
     },
     {
+        .name = "p65",
+        .desc = "REDMI Watch 6",
+        .chip = "best1502p",
+        .product = "p65",
+        /* lcdc log "rel_screen_w = 432, rel_screen_h = 514"; the rm690c0's
+         * full-screen CASET is 24..455 */
+        .panel_width = 432,
+        .panel_height = 514,
+        .panel_x_offset = 24,
+        /* rm690c0 "vsn p01" (lcd probe sub_C4DE4DC accepts 0x200135/45,
+         * 0x200235/45 for rm690c0, 0x3001xx for icna3312) */
+        .dsi_panel_id = 0x200145,
+        /* charger probe sub_C4DE158: I2C0 0x07, SY6103X then SC7061 */
+        .charger = { TYPE_SY6103X, 0, 0x07, -1 },
+        /* W1150 on I2C5 at 0x48 (sub_C4DEE58 / sub_C4EE348); without it the
+         * probe's error path frees a static pointer and asserts */
+        .light = { "w1150.als", 5, 0x48, -1 },
+        /* touch (sub_C4DE8BC): Zinitix on I2C5 at 0x20, interrupt pin
+         * 0x10C4C = GPIO 76, reset 0x1404D = GPIO 77; Hynitron fallback.
+         * Hardware id and register version as in the driver's bundled
+         * image (0x3C16DD64: 0x4502, fw 9.0, reg 0xD2), else it reflashes
+         * the controller for 25 s on every boot */
+        .touch = { TYPE_ZINITIX_TS, 5, 0x20, 76, false, 0x4502, 0xD2 },
+        /* GPADC ch6 = VBAT / 5 (vbat read sub_C4F70F0 returns 5 * mV,
+         * boot shuts down below 3300 mV): 800 mV = 4.0 V */
+        .gpadc_mv = { [2] = 250, [4] = 816, [5] = 250, [6] = 800 },
+        /* NAND：固件分区表（512MB 档）resource first 0 nblocks 112640、
+         * nand_data first 112640 nblocks 149504 */
+        .nand_id = 0xC8F4C8,
+        .nand_page_size = 2048,
+        .nand_oob_size = 64,
+        .nand_pages_per_block = 64,
+        .nand_blocks = 4096,
+        /* TE: hal_dsi_te_gpio_irq_handler pin (0x3C48EA0E at run time) */
+        .lcd_te_gpio = 65,
+    },
+    {
         /* 板级外设逐个查实后补入 */
         .name = "q63",
         .desc = "Xiaomi Watch S5 (best1700)",
@@ -236,6 +274,8 @@ static const struct {
       ARM_CPU_TYPE_NAME("cortex-m33") },
     { "best1700", "BEST1700 (Cortex-M55)",
       ARM_CPU_TYPE_NAME("cortex-m55") },
+    { "best1502p", "BEST1502P (Cortex-M33)",
+      ARM_CPU_TYPE_NAME("cortex-m33") },
 };
 
 static GSList *bes_socs;

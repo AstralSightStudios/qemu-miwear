@@ -34,6 +34,7 @@
 #include "hw/misc/bes_pmu.h"
 #include "hw/misc/bes_i2c.h"
 #include "hw/misc/bes_lcdc.h"
+#include "hw/misc/best1700_dsi.h"
 #include "hw/misc/bes_dma.h"
 #include "hw/misc/bes_btss.h"
 #include "hw/misc/bes_gpio.h"
@@ -75,6 +76,9 @@
 #define BEST1503_DMA0_IRQ         3
 #define BEST1503_DMA1_IRQ         4
 #define BEST1503_FLASH1_DMA_REQ   6
+/* best1502p：DMA1 外设表（p65 0x3C2E1EF8）0b 1c 0d ...，外设 28 在下标 1，
+ * 数据口表同下标为 0x40500008 */
+#define BEST1502P_FLASH1_DMA_REQ  1
 /* BT 子系统（BT 核本体不模拟，bes.btss 扮演邮箱对端 + 空闲 HCI 控制器）：
  *   BT_CMU 0xD0330000（SDK；固件 RX 完成写 +0x54，sub_C2315BC）
  *   邮箱指针表 0xC0004000（固件 hal_intersys 表 0x2CCDACC0/0x2CCDACC8）
@@ -103,6 +107,21 @@
  * 向量偏移 0x158）。芯片标识是驱动 vg_lite_options 要求的值
  * （sub_C0FDA48：0x265 / 0x2002 / 0x424 / eco 0）。 */
 #define BEST1503_GPU_BASE         0x40220000
+/* best1502p 传感器子系统的 NOR（plat_addr_map_best1502p.h SENS_FLASH_*；
+ * vela_sensor.bin 的 boot info：FLASH_SIZE=0x400000）。AP 经第三个 flash
+ * 控制器（hal_norflash id 2，基址表 0x201700B8[2]）读它的启动头再起传感器核
+ * （sub_C968DFC），镜像在 0 偏移（ota.sh 整个 dd 到 /dev/sensor） */
+#define BEST1502P_SENS_FLASH_CTRL_BASE 0x50160000
+#define BEST1502P_SENS_FLASH_BASE      0x26000000
+#define BEST1502P_SENS_FLASH_NC_BASE   0x22000000
+#define BEST1502P_SENS_FLASHX_BASE     0x06000000
+#define BEST1502P_SENS_FLASHX_NC_BASE  0x02000000
+#define BEST1502P_SENS_FLASH_SIZE      0x400000
+
+/* best1502p MIPI DSI host: 0x40230000 (p65 dsi_read sub_C96D7E0),
+ * DSI_IRQn = 11 (best1502p.h) */
+#define BEST1502P_DSI_BASE        0x40230000
+#define BEST1502P_DSI_IRQ         11
 #define BEST1503_GPU_IRQ          70
 /* PSRAM PHY：SDK plat_addr_map_best1503.h:284 候选值，经固件运行时行为
  * 证实（PHY 校准时序公式 0x60/0x64 在 48MHz 下逐位吻合，见 bes_psram.c） */
@@ -181,6 +200,11 @@
  */
 #define BEST1503_SRAM_BASE       0x20000000
 #define BEST1503_SRAM_SIZE       0x160000
+/* best1502p（REDMI Watch 6）：plat_addr_map_best1502p.h RAM0..RAM9 =
+ * 0x20000000..0x20200000（2MB），RAMX0..9 同址减 0x1FE00000。AP 启动时
+ * 自己把两段代码从 flash 拷到 RAM7/RAM8（0x20166200、0x20173E60），经
+ * RAMX 0x366200.. 执行，flash 里的 veneer 即指向那里 */
+#define BEST1502P_SRAM_SIZE      0x200000
 #define BEST1503_RAMX_BASE       0x00200000
 
 /*
@@ -201,7 +225,7 @@
 #define BEST1503_AON_TIMER_FRQ   16384
 
 /* best1503.h:215 __NVIC_PRIO_BITS=3；:145 USER_IRQn_QTY=78 → 取整 80 */
-#define BEST1503_NUM_IRQ         80
+#define BEST1503_NUM_IRQ         96   /* best1502p 有 94 条 */
 #define BEST1503_NUM_PRIO_BITS   3
 
 /*
@@ -222,6 +246,11 @@ static ARMCPU *g_cpu;
  */
 static void best1503_cpu_reset(void *opaque)
 {
+    /* A system reset boots from the boot ROM vectors at 0. The wake-up
+     * vector the firmware leaves in AON_CMU MCU_VTOR is for PSC power-up
+     * only; bes_aoncmu's own reset clears it too, but sysbus devices are
+     * reset after this handler. */
+    object_property_set_uint(OBJECT(opaque), "init-svtor", 0, &error_abort);
     cpu_reset(CPU(opaque));
 }
 
@@ -232,6 +261,47 @@ static void best1503_bootvec_reset(void *opaque)
 
     vec[0] = g_img->msp;
     vec[1] = g_img->entry | 1;  /* Thumb */
+}
+
+static void best1502p_sens_flash_init(MachineState *machine,
+                                      MemoryRegion *sysmem)
+{
+    static const hwaddr bases[] = {
+        BEST1502P_SENS_FLASH_BASE, BEST1502P_SENS_FLASH_NC_BASE,
+        BEST1502P_SENS_FLASHX_BASE, BEST1502P_SENS_FLASHX_NC_BASE,
+    };
+    static MemoryRegion alias[ARRAY_SIZE(bases)];
+    g_autofree char *path = bes_machine_sensor_image(machine);
+    g_autofree char *image = NULL;
+    GError *gerr = NULL;
+    DeviceState *fc;
+    gsize len = 0;
+    int i;
+
+    if (path && !g_file_get_contents(path, &image, &len, &gerr)) {
+        error_report("best1502p: %s", gerr->message);
+        exit(1);
+    }
+    if (len > BEST1502P_SENS_FLASH_SIZE) {
+        error_report("best1502p: %s is larger than the sensor flash", path);
+        exit(1);
+    }
+    if (!path) {
+        warn_report("best1502p: no sensor image (vela_sensor.bin)");
+    }
+
+    fc = qdev_new(TYPE_BES_FLASH);
+    qdev_prop_set_uint32(fc, "size", BEST1502P_SENS_FLASH_SIZE);
+    qdev_prop_set_uint32(fc, "jedec-id", 0xC86016);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(fc), &error_fatal);
+    memcpy(bes_flash_data(BES_FLASH(fc)), image, len);
+    sysbus_mmio_map(SYS_BUS_DEVICE(fc), 0, BEST1502P_SENS_FLASH_CTRL_BASE);
+    for (i = 0; i < ARRAY_SIZE(bases); i++) {
+        memory_region_init_alias(&alias[i], NULL, "best1502p.sens_flash",
+                                 bes_flash_storage(BES_FLASH(fc)), 0,
+                                 BEST1502P_SENS_FLASH_SIZE);
+        memory_region_add_subregion(sysmem, bases[i], &alias[i]);
+    }
 }
 
 static void best1503_init(MachineState *machine, BesImage *img,
@@ -258,6 +328,11 @@ static void best1503_init(MachineState *machine, BesImage *img,
     qdev_prop_set_uint8(armv7m, "num-prio-bits", BEST1503_NUM_PRIO_BITS);
     qdev_prop_set_string(armv7m, "cpu-type", ARM_CPU_TYPE_NAME("cortex-m33"));
     qdev_prop_set_bit(armv7m, "enable-bitband", true);
+    if (g_str_equal(board->chip, "best1502p")) {
+        /* mpu_setup (sub_C966A8C) asserts MPU_TYPE.DREGION == 8 */
+        qdev_prop_set_uint32(armv7m, "mpu-ns-regions", 8);
+        qdev_prop_set_uint32(armv7m, "mpu-s-regions", 8);
+    }
     qdev_connect_clock_in(armv7m, "cpuclk", sysclk);
     qdev_connect_clock_in(armv7m, "refclk", sysclk);
     object_property_set_link(OBJECT(armv7m), "memory",
@@ -315,12 +390,15 @@ static void best1503_init(MachineState *machine, BesImage *img,
     }
 
     /* ---- SRAM：SDK 确认物理总量 1.4MB（不依赖固件布局计算） ---- */
-    memory_region_init_ram(&sram, NULL, "best1503.sram", BEST1503_SRAM_SIZE,
+    uint32_t sram_size = g_str_equal(board->chip, "best1502p") ? BEST1502P_SRAM_SIZE
+                                                              : BEST1503_SRAM_SIZE;
+
+    memory_region_init_ram(&sram, NULL, "best1503.sram", sram_size,
                            &error_fatal);
     memory_region_add_subregion(sysmem, BEST1503_SRAM_BASE, &sram);
     /* RAMX 执行别名（QEMU alias 原生同步） */
     memory_region_init_alias(&ramx, NULL, "best1503.ramx", &sram, 0,
-                             BEST1503_SRAM_SIZE);
+                             sram_size);
     memory_region_add_subregion(sysmem, BEST1503_RAMX_BASE, &ramx);
 
     /* ---- .data 段预加载（模拟真机 BL2 的镜像加载） ----
@@ -386,6 +464,10 @@ static void best1503_init(MachineState *machine, BesImage *img,
         sysbus_realize_and_unref(SYS_BUS_DEVICE(fc1), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(fc1), 0, BEST1503_FLASH1_CTRL_BASE);
         sysbus_mmio_map(SYS_BUS_DEVICE(fc1), 1, BEST1503_FLASH1_NC_BASE);
+    }
+
+    if (g_str_equal(board->chip, "best1502p")) {
+        best1502p_sens_flash_init(machine, sysmem);
     }
 
     /* ---- 伪 boot 向量表 @0x0（模拟 boot ROM 跳转，不碰固件） ---- */
@@ -482,6 +564,10 @@ static void best1503_init(MachineState *machine, BesImage *img,
 
             qdev_prop_set_uint32(pmu, prop, board->gpadc_mv[i]);
         }
+        if (g_str_equal(board->chip, "best1502p")) {
+            /* AP 启动 sub_C0C1E40：pmu_read(0x3000) >> 4 须为 0xC0D */
+            qdev_prop_set_uint32(pmu, "chip-id", 0xC0D0);
+        }
         sysbus_realize_and_unref(SYS_BUS_DEVICE(pmu), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(pmu), 0, 0x40009000);
     }
@@ -544,6 +630,17 @@ static void best1503_init(MachineState *machine, BesImage *img,
                                         qdev_get_gpio_in(gpio,
                                                     board->lcd_te_gpio));
         }
+        if (board->dsi_panel_id) {
+            DeviceState *dsi = qdev_new(TYPE_BEST1700_DSI);
+
+            object_property_set_link(OBJECT(dsi), "panel", OBJECT(lcdc),
+                                     &error_fatal);
+            qdev_prop_set_uint32(dsi, "panel-id", board->dsi_panel_id);
+            sysbus_realize_and_unref(SYS_BUS_DEVICE(dsi), &error_fatal);
+            sysbus_mmio_map(SYS_BUS_DEVICE(dsi), 0, BEST1502P_DSI_BASE);
+            sysbus_connect_irq(SYS_BUS_DEVICE(dsi), 0,
+                               qdev_get_gpio_in(armv7m, BEST1502P_DSI_IRQ));
+        }
 
         /* 板上的触摸控制器：报点坐标系 = 面板尺寸，中断脚接 GPIO */
         if (board->touch.type) {
@@ -554,6 +651,14 @@ static void best1503_init(MachineState *machine, BesImage *img,
             qdev_prop_set_uint32(DEVICE(tp), "height", board->panel_height);
             if (object_property_find(OBJECT(tp), "part-no") && board->touch.part_no) {
                 qdev_prop_set_uint32(DEVICE(tp), "part-no", board->touch.part_no);
+            }
+            if (object_property_find(OBJECT(tp), "hw-id") && board->touch.part_no) {
+                qdev_prop_set_uint32(DEVICE(tp), "hw-id", board->touch.part_no);
+            }
+            if (object_property_find(OBJECT(tp), "reg-version") &&
+                board->touch.fw_version) {
+                qdev_prop_set_uint32(DEVICE(tp), "reg-version",
+                                     board->touch.fw_version);
             }
             if (object_property_find(OBJECT(tp), "hyn92xx")) {
                 qdev_prop_set_bit(DEVICE(tp), "hyn92xx", board->touch.hyn92xx);
@@ -566,6 +671,10 @@ static void best1503_init(MachineState *machine, BesImage *img,
         }
 
         /* 板上的 NFC 控制器：数据就绪脚入、VEN 脚出 */
+        if (board->charger.type) {
+            i2c_slave_create_simple(i2c_bus[board->charger.bus],
+                                    board->charger.type, board->charger.addr);
+        }
         if (board->light.type) {
             I2CSlave *als = i2c_slave_new(board->light.type, board->light.addr);
 
@@ -631,7 +740,9 @@ static void best1503_init(MachineState *machine, BesImage *img,
         if (fc1) {
             sysbus_connect_irq(SYS_BUS_DEVICE(fc1), 0,
                                qdev_get_gpio_in_named(dma[1], "dma-req",
-                                                      BEST1503_FLASH1_DMA_REQ));
+                                    g_str_equal(board->chip, "best1502p") ?
+                                    BEST1502P_FLASH1_DMA_REQ :
+                                    BEST1503_FLASH1_DMA_REQ));
         }
     }
 
@@ -689,9 +800,20 @@ static const BesSoc best1503_soc = {
     .init = best1503_init,
 };
 
+/*
+ * best1502p (REDMI Watch 6, p65) on the best1503 model: the SDK's
+ * plat_addr_map_best1502p.h keeps the best1503 peripheral map and adds
+ * RAM7..9, a sensor subsystem and more IRQ lines (USER_IRQn_QTY 94).
+ */
+static const BesSoc best1502p_soc = {
+    .chip = "best1502p",
+    .init = best1503_init,
+};
+
 static void best1503_register(void)
 {
     bes_soc_register(&best1503_soc);
+    bes_soc_register(&best1502p_soc);
 }
 
 type_init(best1503_register)
