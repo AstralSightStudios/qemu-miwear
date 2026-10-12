@@ -512,6 +512,10 @@ bes_i2c_rx(uint64_t base, uint8_t val) "ctrl@0x%"PRIx64" rx 0x%02x"
 cw2215_read(uint8_t reg, uint8_t val) "reg 0x%02x -> 0x%02x"
 cw2215_write(uint8_t reg, uint8_t val) "reg 0x%02x = 0x%02x"
 
+# sy6103x.c
+sy6103x_read(uint8_t reg, uint8_t val) "reg 0x%02x -> 0x%02x"
+sy6103x_write(uint8_t reg, uint8_t val) "reg 0x%02x = 0x%02x"
+
 # best1700_bthrom.c
 best1700_bth_log(const char *line) "%s"
 

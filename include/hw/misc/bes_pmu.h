@@ -25,8 +25,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(BesPmuState, BES_PMU)
 #define BES_PMU_REG_CHIP_ID     0x00    /* read-only chip id field */
 #define BES_PMU_REG_WDT_RESET_TIMER 0x36 /* reset period (ms); write = feed */
 #define BES_PMU_REG_WDT_CFG     0x37    /* bit8 WDT_EN, bit7 WDT_RESET_EN */
+#define BES_PMU_REG_WDT_IRQ_TIMER 0x4D  /* IRQ stage (ms), before the reset stage */
 
-#define BES_PMU_CHIP_ID_VAL     0x1530  /* "1503" in bits[15:4] */
 #define BES_PMU_REG_SEQ_CTRL    0xF8    /* bits 14|3 start the 0xF7..0xFE sequence */
 #define BES_PMU_REG_SEQ_STATUS  0xFC    /* bit 11 = sequence finished */
 #define BES_PMU_SEQ_START       0x4008
@@ -44,6 +44,7 @@ struct BesPmuState {
     uint8_t  cur_page[BES_ISPI_DEVS];   /* selected page per device */
     uint16_t regs[BES_ISPI_DEVS][BES_ISPI_PAGES][256];
     uint32_t gpadc_mv[8];       /* GPADC channel input voltages (mV) */
+    uint32_t chip_id;           /* PMU reg 0: CHIPID[15:4] | REVID[3:0] */
     QEMUTimer *wdt_timer;       /* PMU watchdog (0x36 ms period) */
 };
 

@@ -13,7 +13,7 @@
  *      RESET_SET/CLR             0x10/0x14
  *      MOD_CLK_ENABLE/DISABLE    0x40/0x44
  *      TOP_CLK1_ENABLE/DISABLE   0xA0/0xA4
- *      GBL_RESET_SET/CLR         0xC8/0xCC
+ *      GBL_RESET_SET/CLR         0xC8/0xCC (bit 7 GLOBAL_RESETN: chip reset)
  *      ORESETN_SET/CLR           0xD8/0xDC
  *      MANUAL_OCLK_ENABLE/DISABLE 0xE0/0xE4
  *    (reg_aoncmu_best1503.h:23-86 layout; BES set/clr convention)
@@ -44,6 +44,7 @@
 #include "qapi/error.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/misc/bes_aoncmu.h"
+#include "system/runstate.h"
 #include "target/arm/arm-powerctl.h"
 
 #define AONCMU_NREGS  (0x200 / 4)   /* cover through CAP_CLK_CFG @0x108 */
@@ -70,6 +71,8 @@ static const BesSetClrPair aoncmu_setclr[] = {
 #define AONCMU_OFF_MEMSC0       0x24
 #define AONCMU_OFF_MEMSC_STATUS 0x34
 #define AONCMU_OFF_GBL_RESET_PULSE 0xC4
+#define AONCMU_OFF_GBL_RESET_SET 0xC8
+#define AONCMU_GLOBAL_RESETN    (1 << 7)    /* reg_aoncmu_best1502p.h */
 #define AONCMU_OFF_MCU_VTOR     0x78
 #define AONCMU_MCU_VTOR_MASK    0xFFFFFF80
 #define AONCMU_MCU_CPUID        0
@@ -160,6 +163,10 @@ static void bes_aoncmu_write(void *opaque, hwaddr offset, uint64_t value,
     if (offset == AONCMU_OFF_RESET_PULSE ||
         offset == AONCMU_OFF_GBL_RESET_PULSE) {
         return;   /* pulse: consume, no state */
+    }
+    if (offset == AONCMU_OFF_GBL_RESET_SET && (value & AONCMU_GLOBAL_RESETN)) {
+        /* hal_cmu_sys_reboot: reset_set(HAL_CMU_MOD_GLOBAL) */
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
     }
     if (p) {
         if (is_set) {

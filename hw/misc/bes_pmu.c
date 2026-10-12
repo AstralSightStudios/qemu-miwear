@@ -29,7 +29,8 @@
  *     word is pending, BSY clear (transfers complete instantly)
  *   - SSPDR write executes one command word; read pops the RX word
  *   - per-device paged 16-bit register files
- *   - PMU (device 3): chip id at offset 0; WDT (0x36 period in ms, 0x37
+ *   - PMU (device 3): chip id at offset 0 (property chip-id: 0x1530 on
+ *     best1503, CHIPID 0xC0D on best1502p, reg_pmu_best1502p.h); WDT (0x36 period in ms, 0x37
  *     WDT_EN|WDT_RESET_EN, programmed by pmu_shutdown's fallback
  *     sub_C0E7C00) resets the system when it expires unfed
  *   - PMU 0xF7..0xFE (page 0): a self-timed analog sequence. Writing
@@ -64,7 +65,8 @@
 #define SSP_SR_BSY      (1 << 4)
 
 /* PMU WDT (SDK pmu_best1503.c pmu_wdt_config/start/feed):
- * 0x36 WDT_RESET_TIMER = reset period in ms, writing it also feeds;
+ * 0x4D WDT_IRQ_TIMER then 0x36 WDT_RESET_TIMER (ms) run back to back,
+ * writing either feeds (p65 configures 30000 + 100);
  * 0x37 WDT_CFG bit8 WDT_EN + bit7 WDT_RESET_EN arm the watchdog.
  * The reset fires only when the armed timer expires without feeding —
  * arming alone must NOT reset (the rtc_enable path arms a multi-second
@@ -78,7 +80,10 @@ static void bes_pmu_wdt_expire(void *opaque)
 static void bes_pmu_wdt_reload(BesPmuState *s)
 {
     uint16_t cfg = s->regs[BES_ISPI_DEV_PMU][0][BES_PMU_REG_WDT_CFG];
-    uint16_t period_ms =
+    /* the IRQ timer runs first (its interrupt is the firmware's last
+     * chance to feed), then the reset timer */
+    uint32_t period_ms =
+        s->regs[BES_ISPI_DEV_PMU][0][BES_PMU_REG_WDT_IRQ_TIMER] +
         s->regs[BES_ISPI_DEV_PMU][0][BES_PMU_REG_WDT_RESET_TIMER];
 
     if ((cfg & 0x180) == 0x180 && period_ms) {
@@ -119,7 +124,7 @@ static void bes_pmu_exec(BesPmuState *s, uint32_t cmd)
     if (cmd & (1u << 26)) {
         /* read command: produce the RX word */
         if (dev == BES_ISPI_DEV_PMU && off == BES_PMU_REG_CHIP_ID) {
-            val = BES_PMU_CHIP_ID_VAL;
+            val = s->chip_id;
         } else if (dev == BES_ISPI_DEV_PMU && page == 0 &&
                    off == BES_PMU_REG_SEQ_STATUS) {
             val = s->regs[dev][page][off];
@@ -162,7 +167,8 @@ static void bes_pmu_exec(BesPmuState *s, uint32_t cmd)
     s->regs[dev][page][off] = val;
 
     if (dev == BES_ISPI_DEV_PMU && page == 0 &&
-        (off == BES_PMU_REG_WDT_RESET_TIMER || off == BES_PMU_REG_WDT_CFG)) {
+        (off == BES_PMU_REG_WDT_RESET_TIMER || off == BES_PMU_REG_WDT_CFG ||
+         off == BES_PMU_REG_WDT_IRQ_TIMER)) {
         bes_pmu_wdt_reload(s);
     }
 }
@@ -306,6 +312,7 @@ static const Property bes_pmu_props[] = {
     DEFINE_PROP_UINT32("gpadc-ch5-mv", BesPmuState, gpadc_mv[5], 250),
     DEFINE_PROP_UINT32("gpadc-ch6-mv", BesPmuState, gpadc_mv[6], 0),
     DEFINE_PROP_UINT32("gpadc-ch7-mv", BesPmuState, gpadc_mv[7], 0),
+    DEFINE_PROP_UINT32("chip-id", BesPmuState, chip_id, 0x1530),
 };
 
 static void bes_pmu_class_init(ObjectClass *klass, const void *data)

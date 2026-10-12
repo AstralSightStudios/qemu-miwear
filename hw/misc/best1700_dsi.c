@@ -22,9 +22,19 @@
  *   +0x48  bit 1 enables the panel's TE reporting (hal_dsi_teirq_enable)
  *
  * DCS writes go to the panel model (bes_lcdc_panel_dcs). The panel's TE
- * output (gpio input "te") latches the TE flag. Reads are not answered:
- * the firmware times out after 100 ms and carries on (it reads the panel
- * ID once at init). Everything else is plain storage.
+ * output (gpio input "te") latches the TE flag.
+ *
+ * DCS reads (best1502p dsi_read, p65 sub_C96D7E0): the firmware clears
+ * flag bit 19, sends 0x37 (maximum return size in byte 1) and 0x06 (the
+ * DCS command in byte 1) with +0x14 = len << 16 | 0xE106, then reads +0x10
+ * until bits [12:8] (bytes waiting) are 0 with bit 19 (read done) set;
+ * each read of +0x10 returns the next byte in bits [7:0] and consumes it.
+ * The bytes are one pad byte, then the response packet: data identifier,
+ * two data bytes (short) or the word count (long), ECC, payload. With the
+ * "panel-id" property set, DCS 0x04 returns its three ID bytes (low byte
+ * first) and any other read returns zeros. Without it reads are not
+ * answered and the firmware times out (q63 reads the ID once at init).
+ * Everything else is plain storage.
  *
  * This code is licensed under the GPL version 2 or later.
  */
@@ -48,11 +58,18 @@
 #define DSI_IRQ_FLAGS       0x00FF0000u
 #define DSI_IRQ_TE          (1u << 23)
 #define DSI_IRQ_TE_EN       (1u << 31)
+#define DSI_IRQ_RX_DONE     (1u << 19)
+#define DSI_IRQ_RX_COUNT    0x1F00u
 #define DSI_TE_CTRL_EN      (1u << 1)
 
 #define DT_DCS_WRITE0       0x05
 #define DT_DCS_WRITE1       0x15
 #define DT_DCS_LONG         0x39
+#define DT_DCS_READ         0x06
+#define DT_MAX_RET_SIZE     0x37
+#define DT_RESP_LONG        0x1C
+#define DT_RESP_SHORT1      0x21
+#define DT_RESP_SHORT2      0x22
 
 static void best1700_dsi_update_irq(Best1700DsiState *s)
 {
@@ -102,13 +119,53 @@ static void best1700_dsi_send(Best1700DsiState *s)
     s->len = 0;
 }
 
+static void best1700_dsi_dcs_read(Best1700DsiState *s)
+{
+    uint8_t cmd = s->regs[DSI_TX_HDR / 4] >> 8;
+    unsigned n = MIN(MAX(s->max_ret, 1), sizeof(s->rx) - 5), i;
+    uint8_t data[sizeof(s->rx)] = { 0 };
+
+    if (!s->panel_id) {
+        return;
+    }
+    if (cmd == 0x04) {
+        data[0] = s->panel_id;
+        data[1] = s->panel_id >> 8;
+        data[2] = s->panel_id >> 16;
+    }
+    s->rx_len = 0;
+    s->rx[s->rx_len++] = 0;
+    if (n <= 2) {
+        s->rx[s->rx_len++] = n == 1 ? DT_RESP_SHORT1 : DT_RESP_SHORT2;
+        s->rx[s->rx_len++] = data[0];
+        s->rx[s->rx_len++] = data[1];
+        s->rx[s->rx_len++] = 0;
+    } else {
+        s->rx[s->rx_len++] = DT_RESP_LONG;
+        s->rx[s->rx_len++] = n;
+        s->rx[s->rx_len++] = 0;
+        s->rx[s->rx_len++] = 0;
+        for (i = 0; i < n; i++) {
+            s->rx[s->rx_len++] = data[i];
+        }
+    }
+    s->rx_pos = 0;
+    s->flags |= DSI_IRQ_RX_DONE;
+}
+
 static uint64_t best1700_dsi_read(void *opaque, hwaddr offset, unsigned size)
 {
     Best1700DsiState *s = opaque;
+    uint32_t v;
 
     switch (offset) {
     case DSI_IRQ:
-        return (s->regs[DSI_IRQ / 4] & ~DSI_IRQ_FLAGS) | s->flags;
+        v = (s->regs[DSI_IRQ / 4] & ~(DSI_IRQ_FLAGS | DSI_IRQ_RX_COUNT | 0xFF)) |
+            s->flags;
+        if (s->rx_pos < s->rx_len) {
+            v |= (s->rx_len - s->rx_pos) << 8 | s->rx[s->rx_pos++];
+        }
+        return v;
     case DSI_TX_CTRL:
         return s->regs[DSI_TX_CTRL / 4] & ~0x30u;       /* never busy */
     default:
@@ -143,7 +200,15 @@ static void best1700_dsi_write(void *opaque, hwaddr offset, uint64_t val,
          * values written here switch link modes */
         if ((val >> 16) &&
             ((val & 0xFFFF) == 0x0005 || (val & 0xFFFF) == 0xE104)) {
-            best1700_dsi_send(s);
+            if ((s->regs[DSI_TX_HDR / 4] & 0x3F) == DT_MAX_RET_SIZE) {
+                s->max_ret = s->regs[DSI_TX_HDR / 4] >> 8 & 0xFF;
+                s->len = 0;
+            } else {
+                best1700_dsi_send(s);
+            }
+        } else if ((val >> 16) && (val & 0xFFFF) == 0xE106 &&
+                   (s->regs[DSI_TX_HDR / 4] & 0x3F) == DT_DCS_READ) {
+            best1700_dsi_dcs_read(s);
         }
         break;
     default:
@@ -167,6 +232,8 @@ static void best1700_dsi_reset(DeviceState *dev)
     memset(s->regs, 0, sizeof(s->regs));
     s->flags = 0;
     s->len = 0;
+    s->rx_len = s->rx_pos = 0;
+    s->max_ret = 0;
 }
 
 static void best1700_dsi_init(Object *obj)
@@ -183,6 +250,7 @@ static void best1700_dsi_init(Object *obj)
 static const Property best1700_dsi_props[] = {
     DEFINE_PROP_LINK("panel", Best1700DsiState, panel, TYPE_DEVICE,
                      DeviceState *),
+    DEFINE_PROP_UINT32("panel-id", Best1700DsiState, panel_id, 0),
 };
 
 static void best1700_dsi_class_init(ObjectClass *klass, const void *data)

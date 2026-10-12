@@ -17,7 +17,11 @@
  *     version 0x0121, register version 0x0013
  *   - firmware update check (ts_check_need_upgrade sub_C3F78AC): the
  *     checksum result register 0x012C must read 0x55AA and 0x0014 must
- *     equal the hardware id, otherwise the driver reflashes the controller
+ *     equal the hardware id, otherwise the driver reflashes the controller.
+ *     The REDMI Watch 6 (p65) driver (sub_C4E775C) first writes a flash
+ *     address (0xBFFC, 0x0018) to 0xCC01 and reads four bytes back from
+ *     it, which must be the 0xA5A5A5A5 end-of-image mark, then compares
+ *     0x0012 / 0x0121 / 0x0013 with the versions of its bundled image
  *   - ESD watchdog (sub_C3F815C, every few seconds): register 0x001C must
  *     read 0x5A49 while the controller runs, otherwise it is reset (the
  *     real device log has no such resets)
@@ -76,6 +80,8 @@
 #define ZT_CHECKSUM_OK          0x55AA
 #define ZT_REG_INFO             0x09D2      /* 12 bytes, hw id at +8 */
 #define ZT_REG_CHIP_ID          0xCC00
+#define ZT_REG_FLASH_READ       0xCC01      /* address in, two words out */
+#define ZT_FLASH_END_MARK       0xA5A5
 #define ZT_REG_VENDOR_CMD       0xC000      /* first step of power-up */
 
 #define ZT_GESTURE_DOUBLE_TAP   1
@@ -187,6 +193,9 @@ static uint16_t zt_reg_read(ZinitixTsState *s, uint16_t reg)
         return e ? (e->sub << 8) | (e->sub & ZT_SUB_UP ? 0 : 8) : 0;
     case ZT_REG_GESTURE:
         return s->gesture;
+    case ZT_REG_FLASH_READ:
+    case ZT_REG_FLASH_READ + 1:
+        return ZT_FLASH_END_MARK;
     default:
         return s->regs[reg];
     }

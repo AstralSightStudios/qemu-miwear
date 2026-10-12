@@ -228,6 +228,10 @@ config CW2215
     bool
     depends on I2C
 
+config SY6103X
+    bool
+    depends on I2C
+
 config BES_I2C
     bool
     select I2C

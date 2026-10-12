@@ -24,6 +24,10 @@ struct Best1700DsiState {
     uint32_t flags;             /* event flags, bits [23:16] of +0x10 */
     uint8_t payload[256];       /* long packet being assembled */
     unsigned len;
+    uint32_t panel_id;          /* DCS 0x04 answer, 0 = reads unanswered */
+    uint8_t max_ret;            /* last maximum return packet size */
+    uint8_t rx[16];             /* read response bytes being popped */
+    unsigned rx_len, rx_pos;
 };
 
 #endif
