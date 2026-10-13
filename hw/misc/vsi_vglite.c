@@ -55,8 +55,14 @@
  *   0x0A25 image config: format ([3:0], [5:4] order, [11:9] index / 2222,
  *          [30:29] 24-bit group), [13:12] tiling outside the image
  *          (0 border colour 0x0A27, 1 pad, 2 repeat, 3 reflect), [17:16]
- *          filter, bit 24 premultiply texels; 0x0A29 address, 0x0A2B
- *          stride, 0x0A2F width | height << 16
+ *          filter (0 point, 1 linear, 2 bilinear, 3 3x3 Gaussian), bit 24
+ *          premultiply texels; 0x0A29 address, 0x0A2B stride, 0x0A2F
+ *          width | height << 16. Texel coordinates are not centred: point
+ *          and Gaussian sampling take texel floor(s), (bi)linear blends
+ *          floor(s) and floor(s) + 1 by frac(s). The q63 firmware's blur
+ *          (466 -> 93 Gaussian, 2x bilinear steps down to 23, a 3x3
+ *          Gaussian pass, bilinear steps back up) programs its offsets for
+ *          exactly that: 2:1 steps sample half way between two texels.
  *   0x0A04-0x0A09, 0x0A24, 0x0A26, 0x0A28, 0x0A2A, 0x0A2E pattern paint
  *          image (affine coordinate generator)
  *   gradients reuse the paint image as the colour ramp (vg_lite_update_
@@ -651,10 +657,27 @@ static void vgl_sample(VglSampler *sm, int x, int y, int c[4])
         vgl_texel(sm, (int)floorf(s), (int)floorf(t), c);
         return;
     }
+    if (sm->filter == 3) {
+        static const int g[3] = { 1, 2, 1 };
+        int i0 = (int)floorf(s), j0 = (int)floorf(t), acc[4] = { 0 };
+        int tx[4], i, j;
+
+        for (j = -1; j <= 1; j++) {
+            for (i = -1; i <= 1; i++) {
+                vgl_texel(sm, i0 + i, j0 + j, tx);
+                for (k = 0; k < 4; k++) {
+                    acc[k] += tx[k] * g[i + 1] * g[j + 1];
+                }
+            }
+        }
+        for (k = 0; k < 4; k++) {
+            c[k] = (acc[k] + 8) >> 4;
+        }
+        return;
+    }
     {
-        float fs = s - 0.5f, ft = t - 0.5f;
-        int i0 = (int)floorf(fs), j0 = (int)floorf(ft);
-        int wx = (int)((fs - i0) * 256.0f), wy = (int)((ft - j0) * 256.0f);
+        int i0 = (int)floorf(s), j0 = (int)floorf(t);
+        int wx = (int)((s - i0) * 256.0f), wy = (int)((t - j0) * 256.0f);
         int t00[4], t10[4], t01[4], t11[4];
 
         vgl_texel(sm, i0, j0, t00);
