@@ -12,4 +12,7 @@
 #define TYPE_CW2215 "cw2215"
 OBJECT_DECLARE_SIMPLE_TYPE(CW2215State, CW2215)
 
+/* the cell's state of charge (percent) and voltage, at run time */
+void cw2215_set_battery(CW2215State *s, uint32_t soc, uint32_t voltage_mv);
+
 #endif

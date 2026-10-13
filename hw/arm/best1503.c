@@ -124,6 +124,9 @@
 #define BEST1502P_PWRKEY_PIN       82
 #define BEST1502P_PWRKEY_LEVEL_REG 0x40086040
 #define BEST1503_PMU_IRQ           42
+/* PMU 充电器插拔中断未合并进 PMU_IRQn 时走 CHARGER_IRQn = 74（best1503.h；
+ * best1502p 没有这条线，只能合并） */
+#define BEST1503_CHARGER_IRQ       74
 
 static uint64_t best1502p_pwrkey_read(void *opaque, hwaddr offset,
                                       unsigned size)
@@ -338,7 +341,7 @@ static void best1503_init(MachineState *machine, BesImage *img,
     static MemoryRegion flash, flash_cached, flash_nc, flash_xnc, sram, ramx;
     static MemoryRegion psram, psram_nc, psramx;
     Clock *sysclk;
-    DeviceState *armv7m, *gpio, *fc1 = NULL, *pmu = NULL;
+    DeviceState *armv7m, *gpio, *fc1 = NULL, *pmu = NULL, *charger = NULL;
 
     /* firmware layout: parsed by the machine (single source of truth) */
     g_img = img;
@@ -596,11 +599,16 @@ static void best1503_init(MachineState *machine, BesImage *img,
         }
         sysbus_realize_and_unref(SYS_BUS_DEVICE(pmu), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(pmu), 0, 0x40009000);
+        sysbus_connect_irq(SYS_BUS_DEVICE(pmu), 0,
+                           qdev_get_gpio_in(armv7m, BEST1503_PMU_IRQ));
+        if (!g_str_equal(board->chip, "best1502p")) {
+            qdev_connect_gpio_out_named(pmu, "charger-irq", 0,
+                                        qdev_get_gpio_in(armv7m,
+                                                    BEST1503_CHARGER_IRQ));
+        }
         if (g_str_equal(board->chip, "best1502p")) {
             static MemoryRegion pwrkey;
 
-            sysbus_connect_irq(SYS_BUS_DEVICE(pmu), 0,
-                               qdev_get_gpio_in(armv7m, BEST1503_PMU_IRQ));
             memory_region_init_io(&pwrkey, OBJECT(pmu), &best1502p_pwrkey_ops,
                                   pmu, "best1502p.pwrkey", 4);
             memory_region_add_subregion_overlap(sysmem,
@@ -707,10 +715,10 @@ static void best1503_init(MachineState *machine, BesImage *img,
                                                     board->touch.irq_gpio));
         }
 
-        /* 板上的 NFC 控制器：数据就绪脚入、VEN 脚出 */
         if (board->charger.type) {
-            i2c_slave_create_simple(i2c_bus[board->charger.bus],
-                                    board->charger.type, board->charger.addr);
+            charger = DEVICE(i2c_slave_create_simple(i2c_bus[board->charger.bus],
+                                                     board->charger.type,
+                                                     board->charger.addr));
         }
         if (board->light.type) {
             I2CSlave *als = i2c_slave_new(board->light.type, board->light.addr);
@@ -718,6 +726,7 @@ static void best1503_init(MachineState *machine, BesImage *img,
             i2c_slave_realize_and_unref(als, i2c_bus[board->light.bus], &error_fatal);
         }
 
+        /* 板上的 NFC 控制器：数据就绪脚入、VEN 脚出 */
         if (board->nfc.type) {
             I2CSlave *nfc = i2c_slave_new(board->nfc.type, board->nfc.addr);
 
@@ -744,6 +753,24 @@ static void best1503_init(MachineState *machine, BesImage *img,
                 in = qdev_get_gpio_in(gpio, board->keys[n].gpio);
             }
             qdev_connect_gpio_out_named(keys, "key", n, in);
+        }
+
+        /* 电池：PMU GPADC 与 AC_ON、充电芯片、插入检测脚 */
+        {
+            BesBatteryLinks links = {
+                .pmu = BES_PMU(pmu),
+                .plug = board->battery.plug_gpio ?
+                        qdev_get_gpio_in(gpio, board->battery.plug_gpio) :
+                        NULL,
+            };
+
+            if (charger) {
+                links.charger_vbus = qdev_get_gpio_in_named(charger,
+                                                            "vbus", 0);
+                links.charger_full = qdev_get_gpio_in_named(charger,
+                                                            "full", 0);
+            }
+            bes_machine_attach_battery(machine, &links);
         }
     }
 

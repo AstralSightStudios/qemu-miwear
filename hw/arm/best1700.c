@@ -45,6 +45,7 @@
 #include "target/arm/multiprocessing.h"
 #include "hw/arm/boot.h"
 #include "hw/arm/bes_board.h"
+#include "hw/misc/cw2215.h"
 #include "hw/misc/bes_image.h"
 #include "hw/misc/bes_flash.h"
 #include "hw/misc/best1700_cmu.h"
@@ -969,6 +970,7 @@ static void best1700_init(MachineState *machine, BesImage *img,
     static MemoryRegion psram, psram_nc, sram_s, bth_ram, aon_ram;
     Clock *sysclk;
     DeviceState *armv7m;
+    I2CSlave *gauge = NULL;
 
     /* firmware layout: parsed by the machine (single source of truth) */
     g_img = img;
@@ -1293,8 +1295,9 @@ static void best1700_init(MachineState *machine, BesImage *img,
 
         /* 板级 I2C 器件（profile） */
         if (board->gauge.type) {
-            i2c_slave_create_simple(ap_i2c_bus[board->gauge.bus],
-                                    board->gauge.type, board->gauge.addr);
+            gauge = i2c_slave_create_simple(ap_i2c_bus[board->gauge.bus],
+                                            board->gauge.type,
+                                            board->gauge.addr);
         }
     }
 
@@ -1613,6 +1616,23 @@ static void best1700_init(MachineState *machine, BesImage *img,
                                        pin - BEST1700_PMU_GPIO_FIRST) :
                 qdev_get_gpio_in(gpio, pin));
         }
+    }
+
+    /* 电池：电量计与插入检测脚 */
+    {
+        int pin = board->battery.plug_gpio;
+        BesBatteryLinks links = {
+            .gauge = gauge ? CW2215(gauge) : NULL,
+            .ac_on = qdev_get_gpio_in_named(ispi, "ac-on", 0),
+        };
+
+        if (pin >= BEST1700_PMU_GPIO_FIRST) {
+            links.plug = qdev_get_gpio_in_named(ispi, "pmu-gpio",
+                                                pin - BEST1700_PMU_GPIO_FIRST);
+        } else if (pin) {
+            links.plug = qdev_get_gpio_in(gpio, pin);
+        }
+        bes_machine_attach_battery(machine, &links);
     }
 
     /*

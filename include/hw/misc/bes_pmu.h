@@ -43,16 +43,23 @@ struct BesPmuState {
     bool     ispi_rx_valid;
     uint8_t  cur_page[BES_ISPI_DEVS];   /* selected page per device */
     uint16_t regs[BES_ISPI_DEVS][BES_ISPI_PAGES][256];
-    uint32_t gpadc_mv[8];       /* GPADC channel input voltages (mV) */
+    uint32_t gpadc_mv[8];       /* GPADC channel inputs (mV), properties */
+    uint32_t gpadc_uv[8];       /* the inputs in uV, settable at run time */
     uint32_t chip_id;           /* PMU reg 0: CHIPID[15:4] | REVID[3:0] */
     bool pwrkey_irq;            /* 0x5E is the power key event register */
     bool pwrkey_pressed;
     uint16_t pwrkey_events;     /* 0x5E bit 15 press, bit 14 release */
+    bool ac_on;                 /* VBUS present at the AC_ON detector */
+    uint16_t chg_events;        /* 0x5E AC_ON_DET_IN / _OUT latches */
     qemu_irq irq;               /* PMU_IRQn */
+    qemu_irq charger_irq;       /* CHARGER_IRQn (interrupts not merged) */
     QEMUTimer *wdt_timer;       /* PMU watchdog (0x36 ms period) */
 };
 
 /* the power key's level (AON IOMUX reports it, best1502p) */
 bool bes_pmu_pwrkey_pressed(BesPmuState *s);
+
+/* drive a GPADC channel's input (battery divider, VBUS sense, ...) */
+void bes_pmu_set_gpadc_uv(BesPmuState *s, unsigned ch, uint32_t uv);
 
 #endif

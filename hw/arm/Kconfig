@@ -26,6 +26,8 @@ config BEST1503
     select BES_PSC
     select BEST1700_DSI
     select SY6103X
+    select SC7061
+    select HP4560X
     select NCI_NFCC
     select ZINITIX_TS
     select HYNITRON_TS

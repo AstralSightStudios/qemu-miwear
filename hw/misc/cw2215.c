@@ -23,9 +23,10 @@
  * gauge and the boot-time low battery check (low_vol_loop_chargeing)
  * keeps the device in its charging loop for 20 minutes.
  *
- * The cell is a constant one: voltage, charge, temperature and health
- * come from properties. Writes are stored, so the driver reads back the
- * profile it wrote; the gauge reports itself ready at once.
+ * Voltage, charge, temperature and health come from properties; the
+ * board moves charge and voltage at run time (cw2215_set_battery).
+ * Writes are stored, so the driver reads back the profile it wrote; the
+ * gauge reports itself ready at once.
  *
  * This code is licensed under the GPL version 2 or later.
  */
@@ -94,6 +95,12 @@ static uint8_t cw2215_reg(CW2215State *s, uint8_t reg)
     default:
         return s->regs[reg];
     }
+}
+
+void cw2215_set_battery(CW2215State *s, uint32_t soc, uint32_t voltage_mv)
+{
+    s->soc = soc;
+    s->voltage_mv = voltage_mv;
 }
 
 static int cw2215_event(I2CSlave *i2c, enum i2c_event event)

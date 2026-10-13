@@ -5,12 +5,16 @@
  * (charger probe sub_C4DE158 on I2C0, address 0x07, 400 kHz):
  *   0x60     chip id, the probe (sub_C4F443C) wants 0x98
  *   0x08     status, bits [4:3] the charge state (sub_C4F3C50:
- *            0 not charging, 1 pre-charge, 2 fast charge, 3 done)
+ *            0 not charging, 1 pre-charge, 2 fast charge, 3 done), bit 2
+ *            power good (the Band 9 Pro driver logs its changes as "dpm",
+ *            sub_C4FD340)
  *   0x00..   configuration the probe writes from its table
  *            (register, keep mask, value) and reads back
  * A register pointer write starts every transfer; reads and writes then
- * walk consecutive registers. Writes are stored; the charger reports no
- * charging (the board has no USB power).
+ * walk consecutive registers. Writes are stored.
+ *
+ * The input lines are the board's: "vbus" = a charger is plugged in,
+ * "full" = the cell is charged (charge done instead of fast charge).
  *
  * This code is licensed under the GPL version 2 or later.
  */
@@ -21,6 +25,9 @@
 #include "trace.h"
 
 #define SY_STATUS           0x08
+#define SY_STATUS_PG        0x04
+#define SY_CHRG_FAST        (2 << 3)
+#define SY_CHRG_DONE        (3 << 3)
 #define SY_CHIP_ID          0x60
 #define SY_CHIP_ID_VAL      0x98
 
@@ -30,7 +37,18 @@ struct SY6103XState {
     uint8_t regs[256];
     uint8_t ptr;
     bool ptr_set;               /* first byte of a write transfer seen */
+    bool vbus;
+    bool full;
 };
+
+static uint8_t sy6103x_reg(SY6103XState *s, uint8_t reg)
+{
+    if (reg == SY_STATUS) {
+        return s->vbus ? SY_STATUS_PG |
+                         (s->full ? SY_CHRG_DONE : SY_CHRG_FAST) : 0;
+    }
+    return s->regs[reg];
+}
 
 static int sy6103x_event(I2CSlave *i2c, enum i2c_event event)
 {
@@ -45,7 +63,7 @@ static int sy6103x_event(I2CSlave *i2c, enum i2c_event event)
 static uint8_t sy6103x_recv(I2CSlave *i2c)
 {
     SY6103XState *s = SY6103X(i2c);
-    uint8_t v = s->regs[s->ptr];
+    uint8_t v = sy6103x_reg(s, s->ptr);
 
     trace_sy6103x_read(s->ptr, v);
     s->ptr++;
@@ -79,6 +97,22 @@ static void sy6103x_reset(DeviceState *dev)
     s->ptr_set = false;
 }
 
+static void sy6103x_vbus(void *opaque, int n, int level)
+{
+    SY6103X(opaque)->vbus = level;
+}
+
+static void sy6103x_full(void *opaque, int n, int level)
+{
+    SY6103X(opaque)->full = level;
+}
+
+static void sy6103x_init(Object *obj)
+{
+    qdev_init_gpio_in_named(DEVICE(obj), sy6103x_vbus, "vbus", 1);
+    qdev_init_gpio_in_named(DEVICE(obj), sy6103x_full, "full", 1);
+}
+
 static void sy6103x_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -94,6 +128,7 @@ static const TypeInfo sy6103x_info = {
     .name = TYPE_SY6103X,
     .parent = TYPE_I2C_SLAVE,
     .instance_size = sizeof(SY6103XState),
+    .instance_init = sy6103x_init,
     .class_init = sy6103x_class_init,
 };
 

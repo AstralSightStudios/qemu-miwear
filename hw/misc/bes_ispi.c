@@ -70,6 +70,10 @@
  *   状态非 0 时拉高 "pmu-irq"（AP NVIC 23，pmu_set_irq_handler 0x137E3C
  *   挂 0x134B9C；1806P 上它每次都调 GPIO 类处理函数 0x135394，由其读
  *   0xDE/0xDF 并按位清除）。
+ *   163 / 164 号脚是 PMU 0x5E（充电器状态）的位：163 = AC_ON（bit 2，
+ *   ITCM 0x137D3C 即 pmu_charger_get_status，插入为 0 = PMU_CHARGER_
+ *   PLUGIN），164 = bit 9 取反。AC_ON 由 "ac-on" 输入线给出（板上 VBUS），
+ *   充电器插拔板级驱动经 hal_gpio 163 读取（plug_in_handle）。
  *
  * PSRAM 模拟 PHY（片选 5，psramphy_best1700.o 以 0x5051/0x5052 访问，
  * 高 4 位即片选）：reg 0x51 为 DLL 状态，bit6 = 锁定、bit7 = 全 0、
@@ -135,6 +139,8 @@ static void bes_ispi_tx(BesIspiState *s, uint32_t value, unsigned size)
                            (reg == PMU_REG_GPIO_IN0 ||
                             reg == PMU_REG_GPIO_IN1)) {
                     v = s->pmu_gpio_in >> (reg == PMU_REG_GPIO_IN1 ? 16 : 0);
+                } else if (ISPI_CS(s) == ISPI_CS_PMU && reg == 0x5E) {
+                    v = (v & ~4) | (s->ac_on ? 4 : 0);
                 } else if (ISPI_CS(s) == ISPI_CS_PMU &&
                            (reg == PMU_REG_GPIO_IRQ0 ||
                             reg == PMU_REG_GPIO_IRQ1)) {
@@ -286,6 +292,11 @@ static void bes_ispi_reset(DeviceState *dev)
     bes_ispi_pmu_irq_update(s);
 }
 
+static void bes_ispi_ac_on(void *opaque, int n, int level)
+{
+    BES_ISPI(opaque)->ac_on = level;
+}
+
 static void bes_ispi_realize(DeviceState *dev, Error **errp)
 {
     BesIspiState *s = BES_ISPI(dev);
@@ -295,6 +306,7 @@ static void bes_ispi_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
     qdev_init_gpio_in_named(dev, bes_ispi_pmu_gpio_in, "pmu-gpio",
                             BES_ISPI_PMU_GPIOS);
+    qdev_init_gpio_in_named(dev, bes_ispi_ac_on, "ac-on", 1);
     qdev_init_gpio_out_named(dev, &s->pmu_irq, "pmu-irq", 1);
 }
 

@@ -232,6 +232,14 @@ config SY6103X
     bool
     depends on I2C
 
+config SC7061
+    bool
+    depends on I2C
+
+config HP4560X
+    bool
+    depends on I2C
+
 config BES_I2C
     bool
     select I2C

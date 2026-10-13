@@ -25,8 +25,120 @@
 #include "hw/misc/sy6103x.h"
 #include "hw/misc/sgm25062.h"
 #include "hw/misc/nci_nfcc.h"
+#include "hw/misc/sc7061.h"
+#include "hw/misc/hp4560x.h"
+#include "hw/misc/bes_pmu.h"
+#include "hw/core/irq.h"
+#include "qapi/visitor.h"
 #include "system/reset.h"
 #include "target/arm/cpu-qom.h"
+
+/*
+ * The soft gauges' VBAT -> charge tables, VBAT in uV by percent, copied
+ * from each firmware (the table its gauge picks at room temperature for
+ * the battery the emulated board reports). Firmware versions of a
+ * product share them.
+ */
+/* p67: 0x2CD05168 (sub_C3DC460, 11..50 C) */
+static const uint32_t bes_ocv_p67[101] = {
+    3500100, 3554200, 3605400, 3630600, 3640800, 3645000,
+    3650200, 3655600, 3660000, 3665400, 3671800, 3680200,
+    3688600, 3695700, 3702200, 3709000, 3715200, 3721100,
+    3726100, 3730400, 3735100, 3739700, 3745000, 3750000,
+    3754600, 3759600, 3763900, 3768600, 3773200, 3777500,
+    3782200, 3786500, 3791200, 3796100, 3800800, 3805800,
+    3810400, 3815700, 3821300, 3826500, 3832100, 3838000,
+    3844200, 3850100, 3856300, 3862800, 3869600, 3876400,
+    3883600, 3891300, 3898800, 3906800, 3915500, 3924500,
+    3934400, 3945600, 3957400, 3969800, 3982200, 3994200,
+    4006000, 4017800, 4028000, 4039500, 4051000, 4062800,
+    4074200, 4086000, 4096200, 4108000, 4120100, 4131900,
+    4144000, 4156400, 4168500, 4180900, 4193000, 4205100,
+    4217100, 4229600, 4241300, 4253700, 4265200, 4277300,
+    4288500, 4302700, 4313600, 4323500, 4333700, 4343900,
+    4353200, 4362200, 4371200, 4379600, 4388000, 4395700,
+    4403500, 4411200, 4419000, 4428000, 4438500,
+};
+/* n67: 0x2C5E3670 (3.1.175, sub_C154950; -10..50 C) */
+static const uint32_t bes_ocv_n67[101] = {
+    3500200, 3557500, 3603000, 3639300, 3658300, 3665100,
+    3670000, 3672500, 3675000, 3676800, 3679300, 3685400,
+    3693400, 3699600, 3705700, 3711200, 3718000, 3722900,
+    3728500, 3732800, 3736500, 3742000, 3746900, 3751200,
+    3756800, 3761100, 3766000, 3770300, 3774000, 3778900,
+    3782600, 3786900, 3791200, 3795500, 3799200, 3804100,
+    3808400, 3813400, 3817700, 3822600, 3827500, 3833000,
+    3838600, 3844100, 3849700, 3855200, 3861300, 3867500,
+    3874300, 3880400, 3887800, 3894600, 3902600, 3910600,
+    3919200, 3928400, 3938900, 3949300, 3961000, 3972100,
+    3983800, 3994800, 4005900, 4016400, 4026800, 4037300,
+    4048400, 4058800, 4069900, 4081000, 4092600, 4103700,
+    4114800, 4126500, 4137500, 4149200, 4160900, 4173200,
+    4184900, 4196600, 4208300, 4220000, 4232300, 4244000,
+    4255700, 4267300, 4279000, 4289500, 4300600, 4311000,
+    4321500, 4331900, 4342400, 4351600, 4360900, 4370700,
+    4379300, 4388500, 4397100, 4405800, 4415000,
+};
+/* p65: the 10 C and up table of sub_C4F71F0 (file offset 0x1AFC48) */
+static const uint32_t bes_ocv_p65[101] = {
+    3500000, 3573000, 3623000, 3643000, 3653000, 3657000,
+    3662000, 3665000, 3669000, 3677000, 3686000, 3693000,
+    3700000, 3706000, 3712000, 3717000, 3722000, 3726000,
+    3729000, 3734000, 3738000, 3742000, 3746000, 3750000,
+    3753000, 3756000, 3761000, 3764000, 3768000, 3772000,
+    3775000, 3779000, 3783000, 3788000, 3791000, 3796000,
+    3801000, 3806000, 3810000, 3816000, 3821000, 3826000,
+    3831000, 3837000, 3843000, 3849000, 3855000, 3862000,
+    3868000, 3876000, 3882000, 3891000, 3900000, 3908000,
+    3917000, 3928000, 3938000, 3949000, 3960000, 3970000,
+    3981000, 3992000, 4002000, 4012000, 4023000, 4034000,
+    4044000, 4056000, 4066000, 4077000, 4089000, 4101000,
+    4112000, 4124000, 4136000, 4148000, 4160000, 4172000,
+    4184000, 4196000, 4208000, 4220000, 4232000, 4244000,
+    4255000, 4267000, 4279000, 4289000, 4301000, 4311000,
+    4322000, 4331000, 4342000, 4352000, 4362000, 4371000,
+    4381000, 4391000, 4402000, 4415000, 4432000,
+};
+/* n66 and o66: 0x2C72F0F8 (sub_C4E3A38, battery id 0 at 25 C) */
+static const uint32_t bes_ocv_n66[101] = {
+    3478000, 3540000, 3590000, 3631000, 3665000, 3686000,
+    3692000, 3697000, 3698000, 3700000, 3701000, 3707000,
+    3714000, 3722000, 3727000, 3733000, 3739000, 3745000,
+    3750000, 3755000, 3759000, 3762000, 3768000, 3772000,
+    3777000, 3783000, 3788000, 3793000, 3799000, 3804000,
+    3808000, 3812000, 3816000, 3820000, 3823000, 3828000,
+    3832000, 3836000, 3841000, 3845000, 3850000, 3855000,
+    3860000, 3866000, 3871000, 3882000, 3889000, 3895000,
+    3901000, 3908000, 3916000, 3924000, 3932000, 3941000,
+    3952000, 3964000, 3976000, 3989000, 4001000, 4012000,
+    4023000, 4033000, 4043000, 4054000, 4064000, 4075000,
+    4085000, 4096000, 4108000, 4119000, 4130000, 4142000,
+    4153000, 4165000, 4176000, 4189000, 4200000, 4211000,
+    4224000, 4235000, 4248000, 4259000, 4283000, 4294000,
+    4306000, 4317000, 4328000, 4339000, 4349000, 4360000,
+    4370000, 4379000, 4389000, 4398000, 4408000, 4417000,
+    4425000, 4435000, 4444000, 4454000, 4464000,
+};
+/* q66: 0x2008213C (4.100.155, sub_C36582C "xwd": no battery id; 25..45 C) */
+static const uint32_t bes_ocv_q66[101] = {
+    3451000, 3531000, 3591000, 3637000, 3674000, 3689000,
+    3693000, 3697000, 3698000, 3699000, 3700000, 3703000,
+    3711000, 3719000, 3724000, 3730000, 3736000, 3743000,
+    3748000, 3752000, 3756000, 3760000, 3764000, 3769000,
+    3774000, 3779000, 3783000, 3788000, 3793000, 3797000,
+    3801000, 3805000, 3808000, 3812000, 3816000, 3820000,
+    3823000, 3828000, 3831000, 3836000, 3840000, 3845000,
+    3850000, 3855000, 3860000, 3866000, 3871000, 3877000,
+    3883000, 3889000, 3896000, 3903000, 3911000, 3919000,
+    3928000, 3940000, 3952000, 3964000, 3976000, 3988000,
+    3998000, 4008000, 4018000, 4028000, 4039000, 4049000,
+    4060000, 4071000, 4082000, 4093000, 4104000, 4115000,
+    4127000, 4138000, 4150000, 4162000, 4174000, 4186000,
+    4198000, 4210000, 4222000, 4234000, 4246000, 4259000,
+    4270000, 4283000, 4294000, 4307000, 4318000, 4329000,
+    4340000, 4350000, 4361000, 4371000, 4382000, 4392000,
+    4402000, 4412000, 4422000, 4432000, 4442000,
+};
 
 static const BesBoard bes_boards[] = {
     {
@@ -58,6 +170,18 @@ static const BesBoard bes_boards[] = {
         .nand_oob_size = 64,
         .nand_pages_per_block = 64,
         .nand_blocks = 4096,
+        /* charger probe sub_C404878: I2C3 0x07, SC7061 (revision 7 or 4
+         * at 0x01) else HP4570; without one the soft gauge is not
+         * registered either */
+        .charger = { TYPE_SC7061, 3, 0x07, -1 },
+        /* soft gauge: VBAT = 4.9 x ch4 (sub_C3DC1B8), VBUS = 6.8824 x ch3
+         * (sub_C3DC740) */
+        .battery = {
+            .ocv_uv = bes_ocv_p67, .lookup = BES_OCV_UP_TO,
+            .vbat_ch = 4, .vbat_ratio = 4900,
+            .vbus_ch = 3, .vbus_ratio = 6882,
+            .pmu_ac_on = true,
+        },
         /* 无实体按键 */
     },
     {
@@ -95,6 +219,18 @@ static const BesBoard bes_boards[] = {
          * 电池 NTC（get_bat_temp_cool sub_C6EF428，表 0x20081370 中
          * 443..457 mV = 25 C）、ch3 第二路 NTC，均取 450 mV。 */
         .gpadc_mv = { [2] = 571, [3] = 450, [5] = 450 },
+        /* charger table off_2CA09A20: SC7061 (0x07 at 0x01), HP4570,
+         * SY6105, all on I2C0 0x07 (get_charger_cfg 0x200815BC) */
+        .charger = { TYPE_SC7061, 0, 0x07, -1 },
+        /* plug detect: "plugin" device's "detect" pin, GPIO 83, low =
+         * plugged in (board_plug_in_initialize in sub_C35C370) */
+        .battery = {
+            .ocv_uv = bes_ocv_q66, .lookup = BES_OCV_FROM,
+            .ui_permille = 1055,
+            .vbat_ch = 2, .vbat_ratio = 7000,
+            .plug_gpio = 83, .plug_active_low = true,
+            .pmu_ac_on = true,
+        },
         /* 无实体按键 */
     },
     {
@@ -130,6 +266,21 @@ static const BesBoard bes_boards[] = {
         /* 板号 ADC 用 PMU 默认 ch4 816 mV：hw 版本表 0x2C698FC8
          * 701..900 mV = 3（实测 "get_hw_ver: vol=815, hwver=3"）。
          * 无实体按键 */
+        /* hp4560x_initialize (sub_C39F92C): I2C0 0x07; plug-in reaches it
+         * through the PMU charger interrupt (hp4560x_charger_handler) */
+        .charger = { TYPE_HP4560X, 0, 0x07, -1 },
+        /* GPADC: ch3 the battery NTC (sub_C166A34, table 0x2C5EF3A8
+         * 443..459 mV = 25 C; 0 mV reads 70 C), ch4 the board id strap */
+        .gpadc_mv = { [3] = 450, [4] = 816, [5] = 250 },
+        /* soft gauge: VBAT = 7.0 x ch2 (sub_C166994); coulomb counting
+         * moves its charge by at most 1% a poll, shown x1.055
+         * (gauge_detect_worker sub_C1672A0) */
+        .battery = {
+            .ocv_uv = bes_ocv_n66, .lookup = BES_OCV_FROM,
+            .ui_permille = 1055,
+            .vbat_ch = 2, .vbat_ratio = 7000,
+            .pmu_ac_on = true,
+        },
     },
     {
         .name = "o66",
@@ -156,6 +307,14 @@ static const BesBoard bes_boards[] = {
         /* 板载 GPADC：ch2=电池分压(571 mV 对应 4.0V)，ch3/ch5=NTC 测温
          * (450 mV 对应室温 25℃，低过 84 mV 会报 70℃ 触发过温保护) */
         .gpadc_mv = { [2] = 571, [3] = 450, [5] = 450 },
+        /* the Band 9 charger code and tables: hp4560x then sc7061 */
+        .charger = { TYPE_HP4560X, 0, 0x07, -1 },
+        .battery = {
+            .ocv_uv = bes_ocv_n66, .lookup = BES_OCV_FROM,
+            .ui_permille = 1055,
+            .vbat_ch = 2, .vbat_ratio = 7000,
+            .pmu_ac_on = true,
+        },
     },
     {
         .name = "n67",
@@ -178,6 +337,18 @@ static const BesBoard bes_boards[] = {
         .nand_pages_per_block = 64,
         .nand_blocks = 4096,
         /* 未配 GPADC：沿用 n66 的 ch2/ch3/ch5 标定时固件把电池读成 38 mV，判低电量关机 */
+        /* charger probe sub_C0C9F18: I2C3 0x07, SY6103X (0x98 at 0x60),
+         * then HP4560, then SC7061 (6 at 0x01) */
+        .charger = { TYPE_SY6103X, 3, 0x07, -1 },
+        /* soft gauge: VBAT = 4.9 x ch4 (sub_C0E3BB0), looked up 50 mV
+         * lower while discharging (sub_C154950); VBUS = 6.8824 x ch3
+         * (sub_C0E3D00); online comes from the PMU charger interrupt */
+        .battery = {
+            .ocv_uv = bes_ocv_n67, .lookup = BES_OCV_UP_TO,
+            .vbat_ch = 4, .vbat_ratio = 4900, .load_uv = 50000,
+            .vbus_ch = 3, .vbus_ratio = 6882,
+            .pmu_ac_on = true,
+        },
     },
     {
         .name = "p65",
@@ -211,6 +382,13 @@ static const BesBoard bes_boards[] = {
          * ch6 VBAT / 5 (sub_C4F70F0, boot shuts down below 3300 mV):
          * 800 mV = 4.0 V */
         .gpadc_mv = { [2] = 600, [3] = 600, [6] = 800 },
+        /* soft gauge sub_C4F5C88: VBAT = 5 x ch6, VBUS = 6 x ch4 */
+        .battery = {
+            .ocv_uv = bes_ocv_p65, .lookup = BES_OCV_UP_TO,
+            .vbat_ch = 6, .vbat_ratio = 5000,
+            .vbus_ch = 4, .vbus_ratio = 6000,
+            .pmu_ac_on = true,
+        },
         /* NAND：固件分区表（512MB 档）resource first 0 nblocks 112640、
          * nand_data first 112640 nblocks 149504 */
         .nand_id = 0xC8F4C8,
@@ -253,6 +431,11 @@ static const BesBoard bes_boards[] = {
         /* CW2215：AP 电池驱动 board_cw2215_initialize 在 I2C 3
          * （0x40076000）地址 0x64 读芯片 ID（实测 I2C 访问） */
         .gauge = { TYPE_CW2215, 3, 0x64, -1 },
+        /* the board's charger plug detect (plug_in_handle) reads hal_gpio
+         * 163, the PMU's AC_ON (bes_ispi.c). Charger online and charge
+         * state come from the SGM41551 at I2C3 0x6B, not modelled: the
+         * firmware reports a charger connected whatever this says. */
+        .battery = { .pmu_ac_on = true },
         /* sensor bes_switch_setup (0x0c09af0c): bus 2, address 0x18.
          * Its bus number matches the BTH hal_i2c controller ID. */
         .sensor_switch = { TYPE_SGM25062, 2, 0x18, -1 },
@@ -405,6 +588,155 @@ DeviceState *bes_board_create_keys(const BesBoard *board)
     return dev;
 }
 
+/* ---- battery ---- */
+
+/* the level the board's soft gauge shows for VBAT (uV), as it reads its
+ * table */
+static unsigned bes_battery_shown(const BesBoardBattery *b, uint64_t uv)
+{
+    const uint32_t *t = b->ocv_uv;
+    uint64_t milli;
+    unsigned i;
+
+    if (b->lookup == BES_OCV_UP_TO) {
+        for (i = 0; i < 100 && uv > t[i]; i++) {
+        }
+        return i;
+    }
+    if (uv < t[0]) {
+        return 0;
+    }
+    for (i = 0; i < 100 && uv >= t[i + 1]; i++) {
+    }
+    milli = i == 100 ? 100000 :
+            i * 1000 + (uv - t[i]) * 1000 / (t[i + 1] - t[i]);
+    return MIN(milli * (b->ui_permille ? b->ui_permille : 1000) / 1000000,
+               100);
+}
+
+/*
+ * The VBAT divider's GPADC input (uV) at which the board's soft gauge
+ * shows level%. The firmware reads whole millivolts at the pin, so this
+ * is the whole millivolt nearest the middle of the level's VBAT band that
+ * still reads as that level.
+ */
+static uint32_t bes_battery_vbat_pin_uv(const BesBoardBattery *b,
+                                        unsigned level, bool charging)
+{
+    const uint32_t *t = b->ocv_uv;
+    uint32_t load = charging ? 0 : b->load_uv;
+    uint64_t mid;
+    int64_t mv, best = -1;
+
+    if (b->lookup == BES_OCV_UP_TO) {
+        mid = level ? (t[level - 1] + t[level]) / 2 : t[0] - 20000;
+    } else {
+        /* table level at the middle of [level, level + 1) once scaled,
+         * in 1/1000 percent */
+        uint32_t milli = (level * 2 + 1) * 500ULL * 1000 /
+                         (b->ui_permille ? b->ui_permille : 1000);
+        unsigned i = milli / 1000;
+
+        mid = i >= 100 ? t[100] + 10000 :
+              t[i] + (uint64_t)(t[i + 1] - t[i]) * (milli % 1000) / 1000;
+    }
+    mid += load;
+    for (mv = mid / b->vbat_ratio - 4; mv <= mid / b->vbat_ratio + 4; mv++) {
+        uint64_t uv = mv * b->vbat_ratio;
+
+        if (uv >= load && bes_battery_shown(b, uv - load) == level &&
+            (best < 0 || llabs((int64_t)uv - (int64_t)mid) <
+                         llabs(best * b->vbat_ratio - (int64_t)mid))) {
+            best = mv;
+        }
+    }
+    if (best < 0) {
+        best = (mid + b->vbat_ratio / 2) / b->vbat_ratio;
+    }
+    /* a quarter millivolt over, so the conversion back truncates to it */
+    return best * 1000 + 250;
+}
+
+/* drive the board from battery-level / battery-charging */
+static void bes_battery_apply(BesMachineState *bms)
+{
+    const BesBoardBattery *b;
+    BesBatteryLinks *l = &bms->battery;
+    bool plugged = bms->battery_charging;
+    bool full = bms->battery_level >= 100;
+
+    if (!bms->board) {
+        return;
+    }
+    b = &bms->board->battery;
+    if (l->gauge) {
+        /* a typical Li-ion cell, 3.5 V empty .. 4.4 V full */
+        cw2215_set_battery(l->gauge, bms->battery_level,
+                           3500 + 9 * bms->battery_level);
+    }
+    if (l->pmu && b->ocv_uv) {
+        bes_pmu_set_gpadc_uv(l->pmu, b->vbat_ch,
+                             bes_battery_vbat_pin_uv(b, bms->battery_level,
+                                                     plugged));
+    }
+    if (l->pmu && b->vbus_ratio) {
+        bes_pmu_set_gpadc_uv(l->pmu, b->vbus_ch,
+                             plugged ? 5000000000ULL / b->vbus_ratio : 0);
+    }
+    if (b->pmu_ac_on) {
+        qemu_set_irq(l->pmu ? qdev_get_gpio_in_named(DEVICE(l->pmu), "ac-on",
+                                                     0) : l->ac_on,
+                     plugged);
+    }
+    qemu_set_irq(l->charger_vbus, plugged);
+    qemu_set_irq(l->charger_full, full);
+    qemu_set_irq(l->plug, plugged != b->plug_active_low);
+}
+
+void bes_machine_attach_battery(MachineState *ms, const BesBatteryLinks *l)
+{
+    BesMachineState *bms = BES_MACHINE(ms);
+
+    bms->battery = *l;
+    bes_battery_apply(bms);
+}
+
+static void bes_get_battery_level(Object *obj, Visitor *v, const char *name,
+                                  void *opaque, Error **errp)
+{
+    visit_type_uint8(v, name, &BES_MACHINE(obj)->battery_level, errp);
+}
+
+static void bes_set_battery_level(Object *obj, Visitor *v, const char *name,
+                                  void *opaque, Error **errp)
+{
+    BesMachineState *bms = BES_MACHINE(obj);
+    uint8_t level;
+
+    if (!visit_type_uint8(v, name, &level, errp)) {
+        return;
+    }
+    if (level > 100) {
+        error_setg(errp, "battery-level is a percentage (0..100)");
+        return;
+    }
+    bms->battery_level = level;
+    bes_battery_apply(bms);
+}
+
+static bool bes_get_battery_charging(Object *obj, Error **errp)
+{
+    return BES_MACHINE(obj)->battery_charging;
+}
+
+static void bes_set_battery_charging(Object *obj, bool value, Error **errp)
+{
+    BesMachineState *bms = BES_MACHINE(obj);
+
+    bms->battery_charging = value;
+    bes_battery_apply(bms);
+}
+
 /* ---- machines ---- */
 
 static void bes_machine_init(MachineState *ms)
@@ -459,6 +791,7 @@ static void bes_machine_init(MachineState *ms)
                 img->cached_base, img->nc_base, img->entry, img->msp,
                 img->size);
     bms->soc = soc;
+    bms->board = board;
     soc->init(ms, img, board);
 }
 
@@ -470,6 +803,7 @@ static void bes_machine_reset(MachineState *ms, ResetType type)
     if (bms->soc->reset) {
         bms->soc->reset(ms);
     }
+    bes_battery_apply(bms);
 }
 
 static char *bes_get_profile(Object *obj, Error **errp)
@@ -569,6 +903,11 @@ char *bes_machine_tee_image(MachineState *ms)
                                      "vela_tee.bin");
 }
 
+static void bes_machine_instance_init(Object *obj)
+{
+    BES_MACHINE(obj)->battery_level = 80;
+}
+
 static void bes_machine_finalize(Object *obj)
 {
     BesMachineState *bms = BES_MACHINE(obj);
@@ -632,6 +971,23 @@ static void bes_machine_class_init(ObjectClass *oc, const void *data)
                                           "chips that have one; default: "
                                           "vela_sensor.bin next to the "
                                           "-kernel firmware, empty for none");
+    object_class_property_add(oc, "battery-level", "uint8",
+                              bes_get_battery_level, bes_set_battery_level,
+                              NULL, NULL);
+    object_class_property_set_description(oc, "battery-level",
+                                          "battery charge in percent "
+                                          "(default 80), settable while "
+                                          "running: the fuel gauge's charge, "
+                                          "or the cell voltage the "
+                                          "firmware's soft gauge reads it "
+                                          "from");
+    object_class_property_add_bool(oc, "battery-charging",
+                                   bes_get_battery_charging,
+                                   bes_set_battery_charging);
+    object_class_property_set_description(oc, "battery-charging",
+                                          "a charger is plugged in (VBUS, "
+                                          "plug detect, charger IC status); "
+                                          "settable while running");
     object_class_property_add_str(oc, "sensor-nor", bes_get_sensor_nor,
                                   bes_set_sensor_nor);
     object_class_property_set_description(oc, "sensor-nor",
@@ -673,6 +1029,7 @@ static const TypeInfo bes_machine_types[] = {
         .parent = TYPE_MACHINE,
         .abstract = true,
         .instance_size = sizeof(BesMachineState),
+        .instance_init = bes_machine_instance_init,
         .instance_finalize = bes_machine_finalize,
         .class_size = sizeof(BesMachineClass),
         .class_init = bes_machine_class_init,

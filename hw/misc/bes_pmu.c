@@ -52,7 +52,19 @@
  *     channel's input voltage with the converter's typical transfer
  *     curve, the one hal_gpadc_adc2volt_calib (sub_C22EB5C) assumes for
  *     an uncalibrated part: 800 mV -> 15968, 1050 mV -> 20816.
- *     Board-level channel inputs are properties (gpadc-chN-mv).
+ *     Board-level channel inputs are properties (gpadc-chN-mv); the board
+ *     moves the battery and VBUS sense inputs at run time
+ *     (bes_pmu_set_gpadc_uv).
+ *   - charger detection (SDK pmu_best1503.c pmu_charger_*): input "ac-on"
+ *     is VBUS at the PMU's AC_ON detector. 0x5E (PMU_REG_CHARGER_STATUS)
+ *     bit 2 is its level; a rise latches bit 0 (AC_ON_DET_IN), a fall
+ *     bit 1 (AC_ON_DET_OUT), each once enabled in 0x05 (REG_AC_ON_IN_EN
+ *     bit 9 / _OUT_EN bit 10); latched edges unmasked in 0x05 (bits 11 /
+ *     12) show in 0x5E bits 3 / 4 (INTR_MSKED_CHARGE) and interrupt.
+ *     Writing bit 0 / 1 back clears them. The interrupt is CHARGER_IRQn,
+ *     or with MERGE_INTR (0x37 bit 9) and CHARGE_INTR_MERGED_MSK (0x40
+ *     bit 12) PMU_IRQn, whose unified handler reads 0x5E for both the
+ *     power key and the charger.
  *
  * This code is licensed under the GPL version 2 or later.
  */
@@ -108,13 +120,20 @@ static void bes_pmu_wdt_reload(BesPmuState *s)
 #define GPADC_HV_MV     1050
 #define GPADC_HV_CODE   20816
 
-static uint16_t bes_gpadc_code(uint32_t mv)
+static uint16_t bes_gpadc_code(uint32_t uv)
 {
     int64_t code = GPADC_LV_CODE +
-        ((int64_t)mv - GPADC_LV_MV) * (GPADC_HV_CODE - GPADC_LV_CODE) /
-        (GPADC_HV_MV - GPADC_LV_MV);
+        ((int64_t)uv - GPADC_LV_MV * 1000) * (GPADC_HV_CODE - GPADC_LV_CODE) /
+        ((GPADC_HV_MV - GPADC_LV_MV) * 1000);
 
     return MIN(MAX(code, 0), 0xFFFF);
+}
+
+void bes_pmu_set_gpadc_uv(BesPmuState *s, unsigned ch, uint32_t uv)
+{
+    if (ch < ARRAY_SIZE(s->gpadc_uv)) {
+        s->gpadc_uv[ch] = uv;
+    }
 }
 
 #define BES_PMU_REG_PWRKEY_EV   0x5E
@@ -123,11 +142,64 @@ static uint16_t bes_gpadc_code(uint32_t mv)
 #define BES_PMU_REG_IRQ_EN2     0x41
 #define BES_PMU_PWRKEY_IRQ_EN   0x4000
 
+/* charger detection, SDK reg_pmu_best1503.h */
+#define BES_PMU_REG_CHARGER_CFG 0x05
+#define BES_PMU_AC_ON_IN_EN     0x0200
+#define BES_PMU_AC_ON_OUT_EN    0x0400
+#define BES_PMU_CHARGE_IN_MSK   0x0800
+#define BES_PMU_CHARGE_OUT_MSK  0x1000
+#define BES_PMU_AC_ON           0x0004
+#define BES_PMU_AC_ON_DET_IN    0x0001
+#define BES_PMU_AC_ON_DET_OUT   0x0002
+#define BES_PMU_MERGE_INTR      0x0200      /* in 0x37 */
+#define BES_PMU_REG_IRQ_EN1     0x40
+#define BES_PMU_CHARGE_IRQ_EN   0x1000
+
+/* latched plug edges the firmware unmasked, as 0x5E bits 3 (in) / 4 (out) */
+static uint16_t bes_pmu_chg_masked(BesPmuState *s)
+{
+    uint16_t cfg = s->regs[BES_ISPI_DEV_PMU][0][BES_PMU_REG_CHARGER_CFG];
+    uint16_t v = 0;
+
+    if ((s->chg_events & BES_PMU_AC_ON_DET_IN) &&
+        (cfg & BES_PMU_CHARGE_IN_MSK)) {
+        v |= 1 << 3;
+    }
+    if ((s->chg_events & BES_PMU_AC_ON_DET_OUT) &&
+        (cfg & BES_PMU_CHARGE_OUT_MSK)) {
+        v |= 1 << 4;
+    }
+    return v;
+}
+
 static void bes_pmu_update_irq(BesPmuState *s)
 {
-    qemu_set_irq(s->irq, s->pwrkey_irq && s->pwrkey_events &&
-                 (s->regs[BES_ISPI_DEV_PMU][0][BES_PMU_REG_IRQ_EN2] &
-                  BES_PMU_PWRKEY_IRQ_EN));
+    uint16_t *r = s->regs[BES_ISPI_DEV_PMU][0];
+    bool chg = bes_pmu_chg_masked(s) != 0;
+    bool merged = r[BES_PMU_REG_WDT_CFG] & BES_PMU_MERGE_INTR;
+
+    qemu_set_irq(s->irq, (s->pwrkey_irq && s->pwrkey_events &&
+                          (r[BES_PMU_REG_IRQ_EN2] & BES_PMU_PWRKEY_IRQ_EN)) ||
+                         (chg && merged &&
+                          (r[BES_PMU_REG_IRQ_EN1] & BES_PMU_CHARGE_IRQ_EN)));
+    qemu_set_irq(s->charger_irq, chg && !merged);
+}
+
+static void bes_pmu_ac_on(void *opaque, int n, int level)
+{
+    BesPmuState *s = opaque;
+    uint16_t cfg = s->regs[BES_ISPI_DEV_PMU][0][BES_PMU_REG_CHARGER_CFG];
+
+    if (!!level == s->ac_on) {
+        return;
+    }
+    s->ac_on = level;
+    if (level && (cfg & BES_PMU_AC_ON_IN_EN)) {
+        s->chg_events |= BES_PMU_AC_ON_DET_IN;
+    } else if (!level && (cfg & BES_PMU_AC_ON_OUT_EN)) {
+        s->chg_events |= BES_PMU_AC_ON_DET_OUT;
+    }
+    bes_pmu_update_irq(s);
 }
 
 static void bes_pmu_pwrkey(void *opaque, int n, int level)
@@ -173,11 +245,13 @@ static void bes_pmu_exec(BesPmuState *s, uint32_t cmd)
         } else if (dev == BES_ISPI_DEV_PMU && page == 0 && off == 0x50) {
             val = 0xFF;     /* every channel has a finished conversion */
         } else if (dev == BES_ISPI_DEV_PMU && page == 0 && off == 0x5e) {
-            /* power status: bit 15 = powered on, bit 2 = 0 */
-            val = s->pwrkey_irq ? s->pwrkey_events : 0x8000;
+            /* power key events (or bit 15, powered on), charger detection */
+            val = (s->pwrkey_irq ? s->pwrkey_events : 0x8000) |
+                  (s->ac_on ? BES_PMU_AC_ON : 0) | s->chg_events |
+                  bes_pmu_chg_masked(s);
         } else if (dev == BES_ISPI_DEV_PMU && page == 0 &&
                    off >= 0x56 && off <= 0x5D) {
-            val = bes_gpadc_code(s->gpadc_mv[off - 0x56]);
+            val = bes_gpadc_code(s->gpadc_uv[off - 0x56]);
         } else {
             val = s->regs[dev][page][off];
         }
@@ -203,15 +277,20 @@ static void bes_pmu_exec(BesPmuState *s, uint32_t cmd)
         }
         return;
     }
-    if (dev == BES_ISPI_DEV_PMU && page == 0 && s->pwrkey_irq &&
+    if (dev == BES_ISPI_DEV_PMU && page == 0 &&
         off == BES_PMU_REG_PWRKEY_EV) {
-        s->pwrkey_events &= ~val;
+        /* write 1 to clear: power key and plug edge latches */
+        if (s->pwrkey_irq) {
+            s->pwrkey_events &= ~val;
+        }
+        s->chg_events &= ~val;
         bes_pmu_update_irq(s);
         return;
     }
     s->regs[dev][page][off] = val;
     if (dev == BES_ISPI_DEV_PMU && page == 0 &&
-        off == BES_PMU_REG_IRQ_EN2) {
+        (off == BES_PMU_REG_IRQ_EN1 || off == BES_PMU_REG_IRQ_EN2 ||
+         off == BES_PMU_REG_CHARGER_CFG || off == BES_PMU_REG_WDT_CFG)) {
         bes_pmu_update_irq(s);
     }
 
@@ -335,6 +414,7 @@ static void bes_pmu_reset(DeviceState *dev)
     /* 0x4F: PMU power-on reason / power key / VBUS presence (bit 0 = on) */
     s->regs[BES_ISPI_DEV_PMU][0][0x4F] = 1;
     s->pwrkey_events = 0;
+    s->chg_events = 0;
     timer_del(s->wdt_timer);
 }
 
@@ -346,7 +426,12 @@ static void bes_pmu_realize(DeviceState *dev, Error **errp)
                           "bes.pmu", 0x100);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
+    qdev_init_gpio_out_named(dev, &s->charger_irq, "charger-irq", 1);
     qdev_init_gpio_in_named(dev, bes_pmu_pwrkey, "pwrkey", 1);
+    qdev_init_gpio_in_named(dev, bes_pmu_ac_on, "ac-on", 1);
+    for (int i = 0; i < ARRAY_SIZE(s->gpadc_uv); i++) {
+        s->gpadc_uv[i] = s->gpadc_mv[i] * 1000;
+    }
     s->wdt_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, bes_pmu_wdt_expire, s);
 }
 

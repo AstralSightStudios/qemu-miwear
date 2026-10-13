@@ -46,6 +46,34 @@ typedef struct BesBoardI2C {
     uint32_t fw_version;        /* Zinitix register version (0 = default) */
 } BesBoardI2C;
 
+/* how the firmware's soft gauge reads its VBAT -> charge table */
+typedef enum BesOcvLookup {
+    BES_OCV_UP_TO = 1,          /* L% for VBAT in (ocv[L - 1], ocv[L]] */
+    BES_OCV_FROM,               /* L% from ocv[L] (interpolating) */
+} BesOcvLookup;
+
+/*
+ * What the battery and the charger plug drive on the board. A fuel gauge
+ * IC (BesBoard.gauge) reports the charge itself; otherwise the firmware's
+ * soft gauge converts VBAT through a GPADC divider with its own table.
+ */
+typedef struct BesBoardBattery {
+    const uint32_t *ocv_uv;     /* the firmware's VBAT (uV) at 0..100%;
+                                 * NULL = no soft gauge */
+    BesOcvLookup lookup;
+    uint32_t ui_permille;       /* level shown = table level x this / 1000
+                                 * (BES_OCV_FROM); 0 = 1000 */
+    int vbat_ch;                /* GPADC channel of the VBAT divider */
+    uint32_t vbat_ratio;        /* VBAT / channel input, x1000 */
+    uint32_t load_uv;           /* the gauge looks VBAT up this much lower
+                                 * while discharging */
+    int vbus_ch;                /* GPADC channel sensing VBUS */
+    uint32_t vbus_ratio;        /* VBUS / channel input, x1000; 0 = none */
+    int plug_gpio;              /* plug-in detect line, 0 = none */
+    bool plug_active_low;
+    bool pmu_ac_on;             /* VBUS reaches the PMU's AC_ON detector */
+} BesBoardBattery;
+
 typedef struct BesBoard {
     const char *name;           /* profile=<name> */
     const char *desc;
@@ -94,6 +122,8 @@ typedef struct BesBoard {
      * model's defaults (the p67 wiring)
      */
     uint32_t gpadc_mv[8];
+
+    BesBoardBattery battery;
 } BesBoard;
 
 /* a chip: builds the SoC around the firmware and the board's devices */
@@ -114,6 +144,20 @@ void bes_soc_register(const BesSoc *soc);
 #define TYPE_BES_MACHINE MACHINE_TYPE_NAME("bes-vela")
 OBJECT_DECLARE_TYPE(BesMachineState, BesMachineClass, BES_MACHINE)
 
+/*
+ * The battery's links into the board's devices, filled in by the SoC
+ * (any may be NULL): the PMU's GPADC and AC_ON detector, the fuel gauge,
+ * the charger's "vbus" / "full" inputs and the plug detect line.
+ */
+typedef struct BesBatteryLinks {
+    struct BesPmuState *pmu;
+    struct CW2215State *gauge;
+    qemu_irq charger_vbus;
+    qemu_irq charger_full;
+    qemu_irq plug;
+    qemu_irq ac_on;             /* the PMU's AC_ON detector, if not pmu's */
+} BesBatteryLinks;
+
 struct BesMachineState {
     MachineState parent_obj;
 
@@ -125,6 +169,12 @@ struct BesMachineState {
     char *sensor_nor;
 
     const BesSoc *soc;
+    const BesBoard *board;
+
+    /* battery-level / battery-charging: the cell and the charger plug */
+    uint8_t battery_level;
+    bool battery_charging;
+    BesBatteryLinks battery;
 };
 
 struct BesMachineClass {
@@ -143,5 +193,9 @@ char *bes_machine_sensor_image(MachineState *ms);
 
 /* the board's push buttons as a gpio-keys device, NULL if it has none */
 DeviceState *bes_board_create_keys(const BesBoard *board);
+
+/* hand the board's battery links to the machine, which drives them from
+ * battery-level / battery-charging (now and after every reset) */
+void bes_machine_attach_battery(MachineState *ms, const BesBatteryLinks *l);
 
 #endif
