@@ -203,9 +203,14 @@ static const BesBoard bes_boards[] = {
          * image (0x3C16DD64: 0x4502, fw 9.0, reg 0xD2), else it reflashes
          * the controller for 25 s on every boot */
         .touch = { TYPE_ZINITIX_TS, 5, 0x20, 76, false, 0x4502, 0xD2 },
-        /* GPADC ch6 = VBAT / 5 (vbat read sub_C4F70F0 returns 5 * mV,
-         * boot shuts down below 3300 mV): 800 mV = 4.0 V */
-        .gpadc_mv = { [2] = 250, [4] = 816, [5] = 250, [6] = 800 },
+        /* GPADC, read through /dev/adc by the battery driver: ch2 skin
+         * NTC (sub_C4F6F90), ch3 shell NTC (sub_C4F6D98), both 100k
+         * against a 200k pull-up to 1.8 V (table 0x3C17F730), so 600 mV =
+         * 25 C (0 mV reads 126 C: shutdown "temperature too high");
+         * ch4 VBUS / 6 (sub_C4F72D8, 4.0..5.5 V = plugged in), left at 0;
+         * ch6 VBAT / 5 (sub_C4F70F0, boot shuts down below 3300 mV):
+         * 800 mV = 4.0 V */
+        .gpadc_mv = { [2] = 600, [3] = 600, [6] = 800 },
         /* NAND：固件分区表（512MB 档）resource first 0 nblocks 112640、
          * nand_data first 112640 nblocks 149504 */
         .nand_id = 0xC8F4C8,

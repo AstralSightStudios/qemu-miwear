@@ -40,8 +40,9 @@
  *     analog init sub_C100880) polls 0xFC until bit 11 is set. Modelled
  *     as finishing as soon as it is started.
  *   - power key (property pwrkey-irq, best1502p; p65 PMU irq handler
- *     sub_36C8BC and power key handler 0x36C9B8): 0x5E bit 15 latches a
- *     press, bit 14 a release, written back to clear; PMU_IRQn is raised
+ *     sub_36C8BC and power key handler 0x36C9B8): 0x5E bit 14 latches a
+ *     press, bit 15 a release (POWER_ON_PRESS / POWER_ON_RELEASE in the
+ *     SDK's reg_pmu_best1503.h), written back to clear; PMU_IRQn is raised
  *     while one is latched and 0x41 bit 14 enables the power key
  *     interrupt. The key level itself is read from AON IOMUX +0x40 bit 31
  *     (bes_pmu_pwrkey_pressed). Without the property 0x5E reads 0x8000.
@@ -117,8 +118,8 @@ static uint16_t bes_gpadc_code(uint32_t mv)
 }
 
 #define BES_PMU_REG_PWRKEY_EV   0x5E
-#define BES_PMU_PWRKEY_PRESS    0x8000
-#define BES_PMU_PWRKEY_RELEASE  0x4000
+#define BES_PMU_PWRKEY_PRESS    0x4000
+#define BES_PMU_PWRKEY_RELEASE  0x8000
 #define BES_PMU_REG_IRQ_EN2     0x41
 #define BES_PMU_PWRKEY_IRQ_EN   0x4000
 
