@@ -39,6 +39,12 @@
  *     and ignores the result; Band 9 n66 (sub_C109F58, called from the
  *     analog init sub_C100880) polls 0xFC until bit 11 is set. Modelled
  *     as finishing as soon as it is started.
+ *   - power key (property pwrkey-irq, best1502p; p65 PMU irq handler
+ *     sub_36C8BC and power key handler 0x36C9B8): 0x5E bit 15 latches a
+ *     press, bit 14 a release, written back to clear; PMU_IRQn is raised
+ *     while one is latched and 0x41 bit 14 enables the power key
+ *     interrupt. The key level itself is read from AON IOMUX +0x40 bit 31
+ *     (bes_pmu_pwrkey_pressed). Without the property 0x5E reads 0x8000.
  *   - GPADC (PMU page 0, hal_gpadc sub_C22EE84 / sub_C22EF38): 0x50 is the
  *     conversion-done bitmap, 0x51 its clear, 0x56 + ch the channel code.
  *     Conversions complete instantly. The code is produced from the
@@ -53,6 +59,7 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/timer.h"
+#include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/misc/bes_pmu.h"
 #include "system/runstate.h"
@@ -109,6 +116,36 @@ static uint16_t bes_gpadc_code(uint32_t mv)
     return MIN(MAX(code, 0), 0xFFFF);
 }
 
+#define BES_PMU_REG_PWRKEY_EV   0x5E
+#define BES_PMU_PWRKEY_PRESS    0x8000
+#define BES_PMU_PWRKEY_RELEASE  0x4000
+#define BES_PMU_REG_IRQ_EN2     0x41
+#define BES_PMU_PWRKEY_IRQ_EN   0x4000
+
+static void bes_pmu_update_irq(BesPmuState *s)
+{
+    qemu_set_irq(s->irq, s->pwrkey_irq && s->pwrkey_events &&
+                 (s->regs[BES_ISPI_DEV_PMU][0][BES_PMU_REG_IRQ_EN2] &
+                  BES_PMU_PWRKEY_IRQ_EN));
+}
+
+static void bes_pmu_pwrkey(void *opaque, int n, int level)
+{
+    BesPmuState *s = opaque;
+
+    if (!!level == s->pwrkey_pressed) {
+        return;
+    }
+    s->pwrkey_pressed = level;
+    s->pwrkey_events |= level ? BES_PMU_PWRKEY_PRESS : BES_PMU_PWRKEY_RELEASE;
+    bes_pmu_update_irq(s);
+}
+
+bool bes_pmu_pwrkey_pressed(BesPmuState *s)
+{
+    return s->pwrkey_pressed;
+}
+
 static unsigned bes_pmu_dev(BesPmuState *s)
 {
     return extract32(s->sspcr1, 7, 4);
@@ -135,7 +172,8 @@ static void bes_pmu_exec(BesPmuState *s, uint32_t cmd)
         } else if (dev == BES_ISPI_DEV_PMU && page == 0 && off == 0x50) {
             val = 0xFF;     /* every channel has a finished conversion */
         } else if (dev == BES_ISPI_DEV_PMU && page == 0 && off == 0x5e) {
-            val = 0x8000;   /* power status: bit 15 = powered on, bit 2 = 0 */
+            /* power status: bit 15 = powered on, bit 2 = 0 */
+            val = s->pwrkey_irq ? s->pwrkey_events : 0x8000;
         } else if (dev == BES_ISPI_DEV_PMU && page == 0 &&
                    off >= 0x56 && off <= 0x5D) {
             val = bes_gpadc_code(s->gpadc_mv[off - 0x56]);
@@ -164,7 +202,17 @@ static void bes_pmu_exec(BesPmuState *s, uint32_t cmd)
         }
         return;
     }
+    if (dev == BES_ISPI_DEV_PMU && page == 0 && s->pwrkey_irq &&
+        off == BES_PMU_REG_PWRKEY_EV) {
+        s->pwrkey_events &= ~val;
+        bes_pmu_update_irq(s);
+        return;
+    }
     s->regs[dev][page][off] = val;
+    if (dev == BES_ISPI_DEV_PMU && page == 0 &&
+        off == BES_PMU_REG_IRQ_EN2) {
+        bes_pmu_update_irq(s);
+    }
 
     if (dev == BES_ISPI_DEV_PMU && page == 0 &&
         (off == BES_PMU_REG_WDT_RESET_TIMER || off == BES_PMU_REG_WDT_CFG ||
@@ -285,6 +333,7 @@ static void bes_pmu_reset(DeviceState *dev)
     memset(s->regs, 0, sizeof(s->regs));
     /* 0x4F: PMU power-on reason / power key / VBUS presence (bit 0 = on) */
     s->regs[BES_ISPI_DEV_PMU][0][0x4F] = 1;
+    s->pwrkey_events = 0;
     timer_del(s->wdt_timer);
 }
 
@@ -295,6 +344,8 @@ static void bes_pmu_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->iomem, OBJECT(dev), &bes_pmu_ops, s,
                           "bes.pmu", 0x100);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
+    sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
+    qdev_init_gpio_in_named(dev, bes_pmu_pwrkey, "pwrkey", 1);
     s->wdt_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, bes_pmu_wdt_expire, s);
 }
 
@@ -313,6 +364,7 @@ static const Property bes_pmu_props[] = {
     DEFINE_PROP_UINT32("gpadc-ch6-mv", BesPmuState, gpadc_mv[6], 0),
     DEFINE_PROP_UINT32("gpadc-ch7-mv", BesPmuState, gpadc_mv[7], 0),
     DEFINE_PROP_UINT32("chip-id", BesPmuState, chip_id, 0x1530),
+    DEFINE_PROP_BOOL("pwrkey-irq", BesPmuState, pwrkey_irq, false),
 };
 
 static void bes_pmu_class_init(ObjectClass *klass, const void *data)

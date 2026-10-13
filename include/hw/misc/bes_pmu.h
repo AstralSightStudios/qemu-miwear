@@ -45,7 +45,14 @@ struct BesPmuState {
     uint16_t regs[BES_ISPI_DEVS][BES_ISPI_PAGES][256];
     uint32_t gpadc_mv[8];       /* GPADC channel input voltages (mV) */
     uint32_t chip_id;           /* PMU reg 0: CHIPID[15:4] | REVID[3:0] */
+    bool pwrkey_irq;            /* 0x5E is the power key event register */
+    bool pwrkey_pressed;
+    uint16_t pwrkey_events;     /* 0x5E bit 15 press, bit 14 release */
+    qemu_irq irq;               /* PMU_IRQn */
     QEMUTimer *wdt_timer;       /* PMU watchdog (0x36 ms period) */
 };
+
+/* the power key's level (AON IOMUX reports it, best1502p) */
+bool bes_pmu_pwrkey_pressed(BesPmuState *s);
 
 #endif

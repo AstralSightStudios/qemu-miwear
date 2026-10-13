@@ -26,23 +26,28 @@ else
     DISPLAY_ARGS="-nographic"
 fi
 
-# Pick the console UART: best1700 (q63) uses UART0; best1503 (p67) uses UART2.
+# Pick the console UART: best1700 (q63) uses UART0; best1503 (p67) uses
+# UART2; n67 and best1502p (p65) use UART1.
 CONSOLE_UART=uart2
 case "$PROFILE-$FW" in
     *q63*|*best1700*)
         CONSOLE_UART=uart0
         ;;
+    *n67*|*p65*)
+        CONSOLE_UART=uart1
+        ;;
 esac
 
 if [ -n "$NSH" ]; then
     NSH_GDB=$((NSH + 1))
-    if [ "$CONSOLE_UART" = "uart0" ]; then
-        SERIAL_ARGS="-chardev socket,id=uart0,host=127.0.0.1,port=$NSH,server=on,wait=off,logfile=$OUT/uart0.log"
-        SERIAL_ARGS="$SERIAL_ARGS -serial chardev:uart0 -serial file:$OUT/uart1.log -serial file:$OUT/uart2.log"
-    else
-        SERIAL_ARGS="-chardev socket,id=uart2,host=127.0.0.1,port=$NSH,server=on,wait=off,logfile=$OUT/uart2.log"
-        SERIAL_ARGS="$SERIAL_ARGS -serial file:$OUT/uart0.log -serial file:$OUT/uart1.log -serial chardev:uart2"
-    fi
+    SERIAL_ARGS=""
+    for u in uart0 uart1 uart2; do
+        if [ "$u" = "$CONSOLE_UART" ]; then
+            SERIAL_ARGS="$SERIAL_ARGS -chardev socket,id=$u,host=127.0.0.1,port=$NSH,server=on,wait=off,logfile=$OUT/$u.log -serial chardev:$u"
+        else
+            SERIAL_ARGS="$SERIAL_ARGS -serial file:$OUT/$u.log"
+        fi
+    done
     SERIAL_ARGS="$SERIAL_ARGS -S -gdb tcp:127.0.0.1:$NSH_GDB"
 else
     SERIAL_ARGS="-serial file:$OUT/uart0.log -serial file:$OUT/uart1.log -serial file:$OUT/uart2.log"

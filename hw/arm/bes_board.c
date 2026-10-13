@@ -215,6 +215,12 @@ static const BesBoard bes_boards[] = {
         .nand_blocks = 4096,
         /* TE: hal_dsi_te_gpio_irq_handler pin (0x3C48EA0E at run time) */
         .lcd_te_gpio = 65,
+        /* board_button table 0x3C2B4D40: button 0 GPIO 59 (active low),
+         * button 1 "pin 82" = the PMU power key (best1503.c) */
+        .keys = {
+            { "home", Q_KEY_CODE_HOME, 59, true },
+            { "down", Q_KEY_CODE_PGDN, 82, false },
+        },
     },
     {
         /* 板级外设逐个查实后补入 */

@@ -32,10 +32,21 @@ itself writes:
       `-o ro /dev/facmode /misc` (its "nv" at 0xFE0000 is /nv, which
       the firmware formats itself)
 
-Requires littlefs-python (pip install littlefs-python).
+p65 (REDMI Watch 6) has no /misc: its AP builds the ro.factory.*
+properties at boot (sub_C630050) from a 256-byte record at NOR 0xCC0000
+(read through 0x28CC0000) that the factory line programs:
+   8..13  Bluetooth address, most significant byte first ("xt_test_log
+          mac", sub_C963724; also the controller address)
+  14..21  DID, big-endian 64-bit (ro.factory.did in decimal, did_cqr in hex)
+  22..37  key (16 characters)          39..58  PSN (NUL padded)
+  63..76  FSN                          77..85  SKU
+  168..   sensor / motor / audio calibration (left 0)
+--prop has no place there and is refused for p65.
 
-usage: emu/mknor.py [--profile p67|q66] [--out FILE] [--did N] [--psn S]
-                    [--mac-bt ADDR] [--prop KEY=VALUE ...]
+Requires littlefs-python (pip install littlefs-python) for p67 / q66.
+
+usage: emu/mknor.py [--profile p67|q66|p65] [--out FILE] [--did N]
+                    [--psn S] [--mac-bt ADDR] [--prop KEY=VALUE ...]
 """
 
 import argparse
@@ -43,13 +54,11 @@ import os
 import re
 import sys
 
-try:
-    import littlefs
-except ImportError:
-    sys.exit("emu/mknor.py needs littlefs-python: pip install littlefs-python")
+import struct
 
 FLASH_SIZE = 0x1000000
 MISC_OFFSET = {"p67": 32512 * 512, "q66": 32256 * 512}
+P65_FACTORY_OFFSET = 0xCC0000
 NV_BLOCK = 8192
 NV_BLOCKS = 16
 NV_IO = 512
@@ -58,6 +67,11 @@ LFS_DISK_VERSION = 0x00020001
 
 
 def nv_partition(props):
+    try:
+        import littlefs
+    except ImportError:
+        sys.exit("emu/mknor.py needs littlefs-python: "
+                 "pip install littlefs-python")
     fs = littlefs.LittleFS(block_size=NV_BLOCK, block_count=NV_BLOCKS,
                            read_size=NV_IO, prog_size=NV_IO,
                            name_max=NV_NAME_MAX,
@@ -69,9 +83,20 @@ def nv_partition(props):
     return bytes(fs.context.buffer)
 
 
+def p65_factory_record(args):
+    rec = bytearray(256)
+    rec[8:14] = bytes.fromhex(args.mac_bt.replace(":", ""))
+    rec[14:22] = struct.pack(">Q", int(args.did))
+    rec[22:38] = args.key.encode().ljust(16, b"0")[:16]
+    rec[39:59] = args.psn.encode()[:20].ljust(20, b"\0")
+    rec[63:77] = args.fsn.encode()[:14].ljust(14, b"\0")
+    rec[77:86] = args.sku.encode()[:9].ljust(9, b"\0")
+    return bytes(rec)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--profile", choices=sorted(MISC_OFFSET),
+    ap.add_argument("--profile", choices=sorted(MISC_OFFSET) + ["p65"],
                     default="p67", help="board the image is for")
     ap.add_argument("--out", default="emu/nor.img")
     ap.add_argument("--did", default="1503000001",
@@ -80,6 +105,12 @@ def main():
                     help="ro.factory.psn (serial number)")
     ap.add_argument("--mac-bt", default="C0:FF:EE:15:03:01",
                     help="ro.factory.mac_bt (match the bes.btss bdaddr)")
+    ap.add_argument("--key", default="0123456789ABCDEF",
+                    help="ro.factory.key (p65, 16 characters)")
+    ap.add_argument("--fsn", default="QEMU1502P00001",
+                    help="ro.factory.fsn (p65)")
+    ap.add_argument("--sku", default="M2509W1",
+                    help="ro.factory.sku (p65)")
     ap.add_argument("--prop", action="append", default=[],
                     metavar="KEY=VALUE", help="additional factory property")
     args = ap.parse_args()
@@ -99,16 +130,23 @@ def main():
         props.append((key, value))
 
     image = bytearray(b"\xff" * FLASH_SIZE)
-    offset = MISC_OFFSET[args.profile]
-    nv = nv_partition(props)
-    image[offset:offset + len(nv)] = nv
+    if args.profile == "p65":
+        if args.prop:
+            sys.exit("--prop: p65's factory record has fixed fields only")
+        offset = P65_FACTORY_OFFSET
+        image[offset:offset + 256] = p65_factory_record(args)
+    else:
+        offset = MISC_OFFSET[args.profile]
+        nv = nv_partition(props)
+        image[offset:offset + len(nv)] = nv
     tmp = args.out + ".tmp"
     with open(tmp, "wb") as out:
         out.write(image)
     os.replace(tmp, args.out)
-    print("%s: %d MiB NOR, /misc/factory.prop at 0x%x: %s" %
-          (args.out, FLASH_SIZE >> 20, offset,
-           ", ".join(k for k, _ in props)))
+    print("%s: %d MiB NOR, %s at 0x%x: %s" %
+          (args.out, FLASH_SIZE >> 20,
+           "factory record" if args.profile == "p65" else
+           "/misc/factory.prop", offset, ", ".join(k for k, _ in props)))
 
 
 if __name__ == "__main__":

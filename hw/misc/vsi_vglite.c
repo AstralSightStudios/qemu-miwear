@@ -47,7 +47,11 @@
  *          0x0A13 width | height << 16 (right / bottom clip)
  *   0x0A18-0x0A1A, 0x0A1C-0x0A1E, 0x0A20-0x0A22 image coordinate
  *          generator (float): u = c0 + x0 X + y0 Y, v = c1 + ..,
- *          w = c2 + ..; texel = (u / w * width, v / w * height)
+ *          w = c2 + ..; texel = (u / w * width, v / w * height), or
+ *          (u / w, v / w) for hardware with the math precision fix
+ *          (property "unnormalized"; VGLite 4.x built with
+ *          gcFEATURE_VG_MATH_PRECISION_FIX programs the steps in texels:
+ *          the best1502p driver in p65)
  *   0x0A25 image config: format ([3:0], [5:4] order, [11:9] index / 2222,
  *          [30:29] 24-bit group), [13:12] tiling outside the image
  *          (0 border colour 0x0A27, 1 pad, 2 repeat, 3 reflect), [17:16]
@@ -484,6 +488,7 @@ typedef struct {
     unsigned tile, filter;
     bool premul;
     bool perspective;
+    bool unnormalized;          /* u, v already in texels */
     int border[4];
     float c[3], dx[3], dy[3];
     const uint32_t *clut;
@@ -534,6 +539,7 @@ static bool vgl_sampler_open(VsiVgliteState *s, VglSampler *sm, bool paint)
         }
         sm->perspective = sm->dx[2] != 0.0f || sm->dy[2] != 0.0f ||
                           sm->c[2] != 1.0f;
+        sm->unnormalized = s->unnormalized;
     }
     if (sm->fmt.index) {
         unsigned base = sm->fmt.bits == 8 ? ST_CLUT256 :
@@ -639,8 +645,8 @@ static void vgl_sample(VglSampler *sm, int x, int y, int c[4])
         u /= w;
         v /= w;
     }
-    s = u * sm->w;
-    t = v * sm->h;
+    s = sm->unnormalized ? u : u * sm->w;
+    t = sm->unnormalized ? v : v * sm->h;
     if (sm->filter == 0) {
         vgl_texel(sm, (int)floorf(s), (int)floorf(t), c);
         return;
@@ -1542,6 +1548,7 @@ static const Property vgl_props[] = {
     DEFINE_PROP_UINT32("chip-cid", VsiVgliteState, chip_cid, 0x424),
     DEFINE_PROP_UINT32("chip-date", VsiVgliteState, chip_date, 0),
     DEFINE_PROP_UINT32("eco-id", VsiVgliteState, eco_id, 0),
+    DEFINE_PROP_BOOL("unnormalized", VsiVgliteState, unnormalized, false),
 };
 
 static void vgl_class_init(ObjectClass *klass, const void *data)

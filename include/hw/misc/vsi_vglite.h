@@ -28,6 +28,7 @@ struct VsiVgliteState {
     uint32_t chip_cid;
     uint32_t chip_date;
     uint32_t eco_id;
+    bool unnormalized;          /* image coordinates in texels */
 
     uint32_t clock_control;
     uint32_t intr_status;

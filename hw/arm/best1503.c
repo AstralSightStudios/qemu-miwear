@@ -118,6 +118,31 @@
 #define BEST1502P_SENS_FLASHX_NC_BASE  0x02000000
 #define BEST1502P_SENS_FLASH_SIZE      0x400000
 
+/* best1502p 电源键：hal_gpio 把引脚 82 当作 PMU 电源键（p65 sub_C96EB14），
+ * 电平读 AON IOMUX +0x40 bit 31（sub_36A2F8，1 = 按下），按下/松开经
+ * PMU 中断上报（bes_pmu.c）。PMU_IRQn = 42（best1502p.h / best1503.h） */
+#define BEST1502P_PWRKEY_PIN       82
+#define BEST1502P_PWRKEY_LEVEL_REG 0x40086040
+#define BEST1503_PMU_IRQ           42
+
+static uint64_t best1502p_pwrkey_read(void *opaque, hwaddr offset,
+                                      unsigned size)
+{
+    return (uint64_t)bes_pmu_pwrkey_pressed(BES_PMU(opaque)) << 31;
+}
+
+static void best1502p_pwrkey_write(void *opaque, hwaddr offset,
+                                   uint64_t value, unsigned size)
+{
+}
+
+static const MemoryRegionOps best1502p_pwrkey_ops = {
+    .read = best1502p_pwrkey_read,
+    .write = best1502p_pwrkey_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 4, .max_access_size = 4 },
+};
+
 /* best1502p MIPI DSI host: 0x40230000 (p65 dsi_read sub_C96D7E0),
  * DSI_IRQn = 11 (best1502p.h) */
 #define BEST1502P_DSI_BASE        0x40230000
@@ -313,7 +338,7 @@ static void best1503_init(MachineState *machine, BesImage *img,
     static MemoryRegion flash, flash_cached, flash_nc, flash_xnc, sram, ramx;
     static MemoryRegion psram, psram_nc, psramx;
     Clock *sysclk;
-    DeviceState *armv7m, *gpio, *fc1 = NULL;
+    DeviceState *armv7m, *gpio, *fc1 = NULL, *pmu = NULL;
 
     /* firmware layout: parsed by the machine (single source of truth) */
     g_img = img;
@@ -552,10 +577,10 @@ static void best1503_init(MachineState *machine, BesImage *img,
     /* PMU（模拟电源管理芯片）ISPI 窗口 @0x40009000：
      * 固件 MMIO 指针表 0x200B08B8[0] 实证；SDK hal_analogif_best1503.c */
     {
-        DeviceState *pmu = qdev_new(TYPE_BES_PMU);
         bool wired = false;
         int i;
 
+        pmu = qdev_new(TYPE_BES_PMU);
         for (i = 0; i < ARRAY_SIZE(board->gpadc_mv); i++) {
             wired |= board->gpadc_mv[i] != 0;
         }
@@ -567,9 +592,21 @@ static void best1503_init(MachineState *machine, BesImage *img,
         if (g_str_equal(board->chip, "best1502p")) {
             /* AP 启动 sub_C0C1E40：pmu_read(0x3000) >> 4 须为 0xC0D */
             qdev_prop_set_uint32(pmu, "chip-id", 0xC0D0);
+            qdev_prop_set_bit(pmu, "pwrkey-irq", true);
         }
         sysbus_realize_and_unref(SYS_BUS_DEVICE(pmu), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(pmu), 0, 0x40009000);
+        if (g_str_equal(board->chip, "best1502p")) {
+            static MemoryRegion pwrkey;
+
+            sysbus_connect_irq(SYS_BUS_DEVICE(pmu), 0,
+                               qdev_get_gpio_in(armv7m, BEST1503_PMU_IRQ));
+            memory_region_init_io(&pwrkey, OBJECT(pmu), &best1502p_pwrkey_ops,
+                                  pmu, "best1502p.pwrkey", 4);
+            memory_region_add_subregion_overlap(sysmem,
+                                                BEST1502P_PWRKEY_LEVEL_REG,
+                                                &pwrkey, 1);
+        }
     }
 
     /* I2C 主控 ×5（board init 注册 0/2/3/5 + I2C1；NVIC 见 SDK best1503.h） */
@@ -698,9 +735,15 @@ static void best1503_init(MachineState *machine, BesImage *img,
         keys = bes_board_create_keys(board);
         for (n = 0; keys && n < BES_BOARD_MAX_KEYS && board->keys[n].name;
              n++) {
-            qdev_connect_gpio_out_named(keys, "key", n,
-                                        qdev_get_gpio_in(gpio,
-                                                    board->keys[n].gpio));
+            qemu_irq in;
+
+            if (g_str_equal(board->chip, "best1502p") &&
+                board->keys[n].gpio == BEST1502P_PWRKEY_PIN) {
+                in = qdev_get_gpio_in_named(pmu, "pwrkey", 0);
+            } else {
+                in = qdev_get_gpio_in(gpio, board->keys[n].gpio);
+            }
+            qdev_connect_gpio_out_named(keys, "key", n, in);
         }
     }
 
@@ -710,6 +753,10 @@ static void best1503_init(MachineState *machine, BesImage *img,
 
         object_property_set_link(OBJECT(gpu), "downstream", OBJECT(sysmem),
                                  &error_fatal);
+        if (g_str_equal(board->chip, "best1502p")) {
+            /* p65 的 VGLite 按纹素编程坐标（vsi_vglite.c） */
+            qdev_prop_set_bit(gpu, "unnormalized", true);
+        }
         sysbus_realize_and_unref(SYS_BUS_DEVICE(gpu), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(gpu), 0, BEST1503_GPU_BASE);
         sysbus_connect_irq(SYS_BUS_DEVICE(gpu), 0,

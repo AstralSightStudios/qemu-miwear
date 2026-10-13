@@ -48,13 +48,36 @@ class Image:
             end = min(self.d.find(c, i) for c in (b"\n", b"\0"))
             cfg[key] = int(self.d[i + len(key) + 1:end], 0)
         ota = cfg[b"OTA_CODE_OFFSET"]
-        self.aliases = (self.xip, cfg[b"FLASH_BASE"] + ota,
-                        cfg[b"FLASH_NC_BASE"] + ota)
+        cached = cfg[b"FLASH_BASE"] + ota
+        self.aliases = (self.xip, cached, cfg[b"FLASH_NC_BASE"] + ota)
+        # Sections the startup copies to PSRAM (literal pool: LMA start,
+        # 0x3C000000, LMA end): the image layout is kept there, code runs
+        # through PSRAMX (PSRAM - 0x20000000). best1502p (p65) runs most of
+        # its kernel and its .rodata from that copy.
+        self.copies = []
+        for o in range(0, min(0x4000, len(self.d) - 12), 4):
+            lma, vma, end = struct.unpack_from("<III", self.d, o)
+            if vma == 0x3C000000 and cached <= lma < end <= \
+                    cached + len(self.d):
+                self.copies.append((lma - cached, end - cached, vma))
+        for start, _, vma in self.copies:
+            self.aliases += (vma - start, vma - 0x20000000 - start)
+
+    def run(self, off):
+        """Run-time address of the code at image offset off."""
+        for start, end, vma in self.copies:
+            if start <= off < end:
+                return vma - 0x20000000 + off - start
+        return self.xip + off
 
     def u32_off(self, off):
         return struct.unpack_from("<I", self.d, off)[0]
 
     def off(self, addr):
+        for start, end, vma in self.copies:
+            for base in (vma, vma - 0x20000000):
+                if base <= addr < base + end - start:
+                    return addr - base + start
         for base in self.aliases:
             if base <= addr < base + len(self.d):
                 return addr - base
@@ -100,8 +123,11 @@ def rodata_alias(img, names):
 def builtin(img, name):
     """main and name pointer of builtin `name` (NuttX g_builtins table:
     {name, priority, stack size, main} per entry)."""
+    tops = {img.xip >> 24} | {(vma - 0x20000000) >> 24
+                              for _, _, vma in img.copies}
     ent = (rb"[\s\S]{4}[\s\S]\x00\x00\x00[\s\S]{2}[\x00-\x0f]\x00"
-           rb"[\s\S]{3}" + re.escape(bytes([img.xip >> 24])))
+           rb"[\s\S]{3}[" + b"".join(re.escape(bytes([t])) for t in tops) +
+           rb"]")
     for m in re.finditer(rb"(?:%s){8,}" % ent, img.d):
         off = m.start() + (-m.start() % 4)
         ents = []
@@ -147,12 +173,14 @@ def bringup_spawn(img):
             j = img.d.find(lit)
             while j >= 0:
                 if j % 4 == 0:
-                    sites.add(img.xip + j)
+                    sites.add(img.run(j))
                 j = img.d.find(lit, j + 1)
         i = img.d.find(b"nsh_main\0", i + 1)
     found = set()
     for lit in sites:
-        for pc in range(max(img.xip, lit - 1020) & ~1, lit, 2):
+        for pc in range((lit - 1020) & ~1, lit, 2):
+            if img.off(pc) is None:
+                continue
             h = img.u16(pc)
             # LDR r0, [pc, #imm8 * 4]
             if (h & 0xFF00) != 0x4800 or \
