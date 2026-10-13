@@ -46,6 +46,7 @@
 #include "hw/arm/boot.h"
 #include "hw/arm/bes_board.h"
 #include "hw/misc/cw2215.h"
+#include "hw/misc/sgm41551.h"
 #include "hw/misc/bes_image.h"
 #include "hw/misc/bes_flash.h"
 #include "hw/misc/best1700_cmu.h"
@@ -971,6 +972,7 @@ static void best1700_init(MachineState *machine, BesImage *img,
     Clock *sysclk;
     DeviceState *armv7m;
     I2CSlave *gauge = NULL;
+    DeviceState *charger = NULL;
 
     /* firmware layout: parsed by the machine (single source of truth) */
     g_img = img;
@@ -1299,6 +1301,13 @@ static void best1700_init(MachineState *machine, BesImage *img,
                                             board->gauge.type,
                                             board->gauge.addr);
         }
+        if (board->charger.type) {
+            I2CBus *bus = ap_i2c_bus[board->charger.bus];
+
+            charger = DEVICE(i2c_slave_create_simple(bus,
+                                                     board->charger.type,
+                                                     board->charger.addr));
+        }
     }
 
     /* ---- GPIO + PSC GPIO 中断块（见宏注释） ---- */
@@ -1625,6 +1634,13 @@ static void best1700_init(MachineState *machine, BesImage *img,
             .gauge = gauge ? CW2215(gauge) : NULL,
             .ac_on = qdev_get_gpio_in_named(ispi, "ac-on", 0),
         };
+
+        if (charger) {
+            links.charger_vbus = qdev_get_gpio_in_named(charger,
+                                                        "vbus", 0);
+            links.charger_full = qdev_get_gpio_in_named(charger,
+                                                        "full", 0);
+        }
 
         if (pin >= BEST1700_PMU_GPIO_FIRST) {
             links.plug = qdev_get_gpio_in_named(ispi, "pmu-gpio",

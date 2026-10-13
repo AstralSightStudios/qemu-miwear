@@ -524,6 +524,10 @@ sc7061_write(uint8_t reg, uint8_t val) "reg 0x%02x = 0x%02x"
 hp4560x_read(uint8_t reg, uint8_t val) "reg 0x%02x -> 0x%02x"
 hp4560x_write(uint8_t reg, uint8_t val) "reg 0x%02x = 0x%02x"
 
+# sgm41551.c
+sgm41551_read(uint8_t reg, uint8_t val) "reg 0x%02x -> 0x%02x"
+sgm41551_write(uint8_t reg, uint8_t val) "reg 0x%02x = 0x%02x"
+
 # best1700_bthrom.c
 best1700_bth_log(const char *line) "%s"
 

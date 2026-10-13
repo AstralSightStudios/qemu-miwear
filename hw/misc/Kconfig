@@ -240,6 +240,10 @@ config HP4560X
     bool
     depends on I2C
 
+config SGM41551
+    bool
+    depends on I2C
+
 config BES_I2C
     bool
     select I2C

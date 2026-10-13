@@ -27,6 +27,7 @@
 #include "hw/misc/nci_nfcc.h"
 #include "hw/misc/sc7061.h"
 #include "hw/misc/hp4560x.h"
+#include "hw/misc/sgm41551.h"
 #include "hw/misc/bes_pmu.h"
 #include "hw/core/irq.h"
 #include "qapi/visitor.h"
@@ -431,10 +432,10 @@ static const BesBoard bes_boards[] = {
         /* CW2215：AP 电池驱动 board_cw2215_initialize 在 I2C 3
          * （0x40076000）地址 0x64 读芯片 ID（实测 I2C 访问） */
         .gauge = { TYPE_CW2215, 3, 0x64, -1 },
-        /* the board's charger plug detect (plug_in_handle) reads hal_gpio
-         * 163, the PMU's AC_ON (bes_ispi.c). Charger online and charge
-         * state come from the SGM41551 at I2C3 0x6B, not modelled: the
-         * firmware reports a charger connected whatever this says. */
+        /* SGM41551 charger: board_charger_ic_initialize on I2C3 0x6B
+         * (probed chip id 0 at 0x38); plug detect driven through the PMU's
+         * AC_ON (hal_gpio 163) */
+        .charger = { TYPE_SGM41551, 3, 0x6B, -1 },
         .battery = { .pmu_ac_on = true },
         /* sensor bes_switch_setup (0x0c09af0c): bus 2, address 0x18.
          * Its bus number matches the BTH hal_i2c controller ID. */
