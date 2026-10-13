@@ -311,7 +311,7 @@ static bool ppm_save(int fd, pixman_image_t *image, Error **errp)
         qemu_pixman_linebuf_fill(linebuf, image, width, 0, y);
         if (qio_channel_write_all(QIO_CHANNEL(ioc),
                                   (char *)pixman_image_get_data(linebuf),
-                                  pixman_image_get_stride(linebuf), errp) < 0) {
+                                  width * 3, errp) < 0) {
             return false;
         }
     }
