@@ -27,13 +27,13 @@ else
 fi
 
 # Pick the console UART: best1700 (q63) uses UART0; best1503 (p67) uses
-# UART2; n67 and best1502p (p65) use UART1.
+# UART2; n67 and best1502p (p65, q65) use UART1.
 CONSOLE_UART=uart2
 case "$PROFILE-$FW" in
     *q63*|*best1700*)
         CONSOLE_UART=uart0
         ;;
-    *n67*|*p65*)
+    *n67*|*p65*|*q65*)
         CONSOLE_UART=uart1
         ;;
 esac

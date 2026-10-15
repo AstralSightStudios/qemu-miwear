@@ -100,6 +100,26 @@ static const uint32_t bes_ocv_p65[101] = {
     4322000, 4331000, 4342000, 4352000, 4362000, 4371000,
     4381000, 4391000, 4402000, 4415000, 4432000,
 };
+/* q65: the 10 C and up table of sub_C4FA4DC (file offset 0x1A26CC) */
+static const uint32_t bes_ocv_q65[101] = {
+    3500000, 3573000, 3623000, 3643000, 3653000, 3657000,
+    3662000, 3665000, 3669000, 3677000, 3686000, 3693000,
+    3700000, 3706000, 3712000, 3717000, 3722000, 3726000,
+    3729000, 3734000, 3738000, 3742000, 3746000, 3750000,
+    3753000, 3756000, 3761000, 3764000, 3768000, 3772000,
+    3775000, 3779000, 3783000, 3788000, 3791000, 3796000,
+    3801000, 3806000, 3810000, 3816000, 3821000, 3826000,
+    3831000, 3837000, 3843000, 3849000, 3855000, 3862000,
+    3868000, 3876000, 3882000, 3891000, 3900000, 3908000,
+    3917000, 3928000, 3938000, 3949000, 3960000, 3970000,
+    3981000, 3992000, 4002000, 4012000, 4023000, 4034000,
+    4044000, 4056000, 4066000, 4077000, 4089000, 4101000,
+    4112000, 4124000, 4136000, 4148000, 4160000, 4172000,
+    4184000, 4196000, 4208000, 4220000, 4232000, 4244000,
+    4255000, 4267000, 4279000, 4289000, 4301000, 4311000,
+    4322000, 4416000, 4426000, 4437000, 4447000, 4458000,
+    4468000, 4479000, 4489000, 4500000, 4510000,
+};
 /* n66 and o66: 0x2C72F0F8 (sub_C4E3A38, battery id 0 at 25 C) */
 static const uint32_t bes_ocv_n66[101] = {
     3478000, 3540000, 3590000, 3631000, 3665000, 3686000,
@@ -404,6 +424,43 @@ static const BesBoard bes_boards[] = {
         .keys = {
             { "home", Q_KEY_CODE_HOME, 59, true },
             { "down", Q_KEY_CODE_PGDN, 82, false },
+        },
+    },
+    {
+        .name = "q65",
+        .desc = "REDMI Watch 7",
+        .chip = "best1502p",
+        .product = "q65",
+        .panel_width = 432,
+        .panel_height = 514,
+        .panel_x_offset = 24,
+        /* rm690c0_tm panel ID (DA=0x45, DB=0x02, DC=0x20) */
+        .dsi_panel_id = 0x200245,
+        /* charger probe: SC7061 on I2C0 at 0x07 (fallback HP4570) */
+        .charger = { TYPE_SC7061, 0, 0x07, -1 },
+        /* W1150 on I2C5 at 0x48 */
+        .light = { "w1150.als", 5, 0x48, -1 },
+        /* touch: Hynitron CST9317 on I2C5 at 0x5A, interrupt GPIO 76 (0x4C) */
+        .touch = { TYPE_HYNITRON_TS, 5, 0x5A, 76, true, 0x9317 },
+        /* GPADC: ch2 skin NTC, ch3 shell NTC (600 mV = 25 C), ch6 VBAT / 5 (800 mV = 4.0 V) */
+        .gpadc_mv = { [2] = 600, [3] = 600, [6] = 800 },
+        .battery = {
+            .ocv_uv = bes_ocv_q65, .lookup = BES_OCV_UP_TO,
+            .vbat_ch = 6, .vbat_ratio = 5000,
+            .vbus_ch = 4, .vbus_ratio = 6000,
+            .pmu_ac_on = true,
+        },
+        /* NAND: 512MB, resource first 0 nblocks 120320 */
+        .nand_id = 0xC8F4C8,
+        .nand_page_size = 2048,
+        .nand_oob_size = 64,
+        .nand_pages_per_block = 64,
+        .nand_blocks = 4096,
+        .lcd_te_gpio = 65,
+        /* board_button: button 0 GPIO 59 (active low), button 1 pin 83 = PMU power key */
+        .keys = {
+            { "home", Q_KEY_CODE_HOME, 59, true },
+            { "down", Q_KEY_CODE_PGDN, 83, false },
         },
     },
     {

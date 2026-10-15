@@ -32,20 +32,20 @@ itself writes:
       `-o ro /dev/facmode /misc` (its "nv" at 0xFE0000 is /nv, which
       the firmware formats itself)
 
-p65 (REDMI Watch 6) has no /misc: its AP builds the ro.factory.*
-properties at boot (sub_C630050) from a 256-byte record at NOR 0xCC0000
-(read through 0x28CC0000) that the factory line programs:
+p65 (REDMI Watch 6) and q65 (REDMI Watch 7) have no /misc: AP builds the
+ro.factory.* properties at boot (sub_C630050) from a 256-byte record at NOR
+0xCC0000 (read through 0x28CC0000) that the factory line programs:
    8..13  Bluetooth address, most significant byte first ("xt_test_log
           mac", sub_C963724; also the controller address)
   14..21  DID, big-endian 64-bit (ro.factory.did in decimal, did_cqr in hex)
   22..37  key (16 characters)          39..58  PSN (NUL padded)
   63..76  FSN                          77..85  SKU
   168..   sensor / motor / audio calibration (left 0)
---prop has no place there and is refused for p65.
+--prop has no place there and is refused for p65/q65.
 
 Requires littlefs-python (pip install littlefs-python) for p67 / q66.
 
-usage: emu/mknor.py [--profile p67|q66|p65] [--out FILE] [--did N]
+usage: emu/mknor.py [--profile p67|q66|p65|q65] [--out FILE] [--did N]
                     [--psn S] [--mac-bt ADDR] [--prop KEY=VALUE ...]
 """
 
@@ -96,7 +96,7 @@ def p65_factory_record(args):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--profile", choices=sorted(MISC_OFFSET) + ["p65"],
+    ap.add_argument("--profile", choices=sorted(MISC_OFFSET) + ["p65", "q65"],
                     default="p67", help="board the image is for")
     ap.add_argument("--out", default="emu/nor.img")
     ap.add_argument("--did", default="1503000001",
@@ -106,14 +106,17 @@ def main():
     ap.add_argument("--mac-bt", default="C0:FF:EE:15:03:01",
                     help="ro.factory.mac_bt (match the bes.btss bdaddr)")
     ap.add_argument("--key", default="0123456789ABCDEF",
-                    help="ro.factory.key (p65, 16 characters)")
+                    help="ro.factory.key (p65/q65, 16 characters)")
     ap.add_argument("--fsn", default="QEMU1502P00001",
-                    help="ro.factory.fsn (p65)")
-    ap.add_argument("--sku", default="M2509W1",
-                    help="ro.factory.sku (p65)")
+                    help="ro.factory.fsn (p65/q65)")
+    ap.add_argument("--sku", default=None,
+                    help="ro.factory.sku (p65: M2509W1, q65: M2611W1)")
     ap.add_argument("--prop", action="append", default=[],
                     metavar="KEY=VALUE", help="additional factory property")
     args = ap.parse_args()
+
+    if not args.sku:
+        args.sku = "M2611W1" if args.profile == "q65" else "M2509W1"
 
     if not args.did.isdigit():
         sys.exit("--did must be decimal")
@@ -130,9 +133,9 @@ def main():
         props.append((key, value))
 
     image = bytearray(b"\xff" * FLASH_SIZE)
-    if args.profile == "p65":
+    if args.profile in ("p65", "q65"):
         if args.prop:
-            sys.exit("--prop: p65's factory record has fixed fields only")
+            sys.exit(f"--prop: {args.profile}'s factory record has fixed fields only")
         offset = P65_FACTORY_OFFSET
         image[offset:offset + 256] = p65_factory_record(args)
     else:
@@ -145,7 +148,7 @@ def main():
     os.replace(tmp, args.out)
     print("%s: %d MiB NOR, %s at 0x%x: %s" %
           (args.out, FLASH_SIZE >> 20,
-           "factory record" if args.profile == "p65" else
+           "factory record" if args.profile in ("p65", "q65") else
            "/misc/factory.prop", offset, ", ".join(k for k, _ in props)))
 
 

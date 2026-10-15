@@ -118,10 +118,11 @@
 #define BEST1502P_SENS_FLASHX_NC_BASE  0x02000000
 #define BEST1502P_SENS_FLASH_SIZE      0x400000
 
-/* best1502p 电源键：hal_gpio 把引脚 82 当作 PMU 电源键（p65 sub_C96EB14），
+/* best1502p 电源键：hal_gpio 把引脚 82 (p65) 或 83 (q65) 当作 PMU 电源键，
  * 电平读 AON IOMUX +0x40 bit 31（sub_36A2F8，1 = 按下），按下/松开经
  * PMU 中断上报（bes_pmu.c）。PMU_IRQn = 42（best1502p.h / best1503.h） */
 #define BEST1502P_PWRKEY_PIN       82
+#define BEST1502P_PWRKEY_PIN_Q65   83
 #define BEST1502P_PWRKEY_LEVEL_REG 0x40086040
 #define BEST1503_PMU_IRQ           42
 /* PMU 充电器插拔中断未合并进 PMU_IRQn 时走 CHARGER_IRQn = 74（best1503.h；
@@ -766,7 +767,8 @@ static void best1503_init(MachineState *machine, BesImage *img,
             qemu_irq in;
 
             if (g_str_equal(board->chip, "best1502p") &&
-                board->keys[n].gpio == BEST1502P_PWRKEY_PIN) {
+                (board->keys[n].gpio == BEST1502P_PWRKEY_PIN ||
+                 board->keys[n].gpio == BEST1502P_PWRKEY_PIN_Q65)) {
                 in = qdev_get_gpio_in_named(pmu, "pwrkey", 0);
             } else {
                 in = qdev_get_gpio_in(gpio, board->keys[n].gpio);
@@ -875,6 +877,16 @@ static void best1503_init(MachineState *machine, BesImage *img,
         qdev_prop_set_uint32(btss, "shared-table", BEST1503_BT_MBOX_TABLE);
         qdev_prop_set_uint32(btss, "exch-base", BEST1503_BT_EXCH_BASE);
         qdev_prop_set_uint32(btss, "exch-size", BEST1503_BT_EXCH_SIZE);
+        if (g_str_equal(board->chip, "best1502p")) {
+            /* best1502p (p65, q65) hal_intersys: word [8 * ch] holds descriptor directly */
+            qdev_prop_set_bit(btss, "rx-head-direct", true);
+            /* channel 0 carries HCI; channel 1 carries 8-byte control messages */
+            qdev_prop_set_int32(btss, "hci-channel", 0);
+            /* 回复时序（见 bes_btss.c 头注释）：btdrv 发完配置命令即关邮箱，
+             * 回复须远早于此；HCI_Reset 则像真控制器一样要一段时间 */
+            qdev_prop_set_uint32(btss, "latency-us", 0);
+            qdev_prop_set_uint32(btss, "reset-latency-us", 100000);
+        }
         sysbus_realize_and_unref(SYS_BUS_DEVICE(btss), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(btss), 0, BEST1503_BT_CMU_BASE);
         for (i = 0; i < 2; i++) {

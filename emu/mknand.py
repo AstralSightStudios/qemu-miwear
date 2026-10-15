@@ -12,6 +12,8 @@ tables, 512MB part, page units):
       by OTA with `dd of=/dev/resource`); nand_data/coredump/nand_nv after
   p65 (REDMI Watch 6, best1502p, partition table record "resource"):
       "resource" first=0 nblocks=112640, nand_data first=112640;
+  q65 (REDMI Watch 7, best1502p, partition table record "resource"):
+      "resource" first=0 nblocks=120320, nand_data after;
   q66 (Band 11, boot log): "resource" first=0 nblocks=65536, romfs as p67;
       nand_data first=65536 nblocks=196608
   n66 (Band 9) / o66 (Band 10), boot log: "nand_system" first=0
@@ -54,6 +56,7 @@ PARTITIONS = {
     "n66": ("system", 0, 65536),
     "o66": ("system", 0, 65536),
     "p65": ("resource", 0, 112640),
+    "q65": ("resource", 0, 120320),
 }
 
 YAFFS_TAGS = 16

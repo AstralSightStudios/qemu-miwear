@@ -132,6 +132,20 @@ static void best1700_dsi_dcs_read(Best1700DsiState *s)
         data[0] = s->panel_id;
         data[1] = s->panel_id >> 8;
         data[2] = s->panel_id >> 16;
+    } else if (cmd == 0xDA) {
+        data[0] = s->panel_id;
+    } else if (cmd == 0xDB) {
+        data[0] = s->panel_id >> 8;
+    } else if (cmd == 0xDC) {
+        data[0] = s->panel_id >> 16;
+    } else if (cmd == 0x0A) {
+        /*
+         * MIPI DCS Get Power Mode (0x0A): bit 7 booster on, bit 5 partial,
+         * bit 4 sleep out (0 = out), bit 2 display on.
+         * RM690C0 / RM690F0 panel_simple and ESD check on best1502p (q65)
+         * expect 0xB4.
+         */
+        data[0] = 0xB4;
     }
     s->rx_len = 0;
     s->rx[s->rx_len++] = 0;
