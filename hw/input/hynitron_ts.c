@@ -105,6 +105,8 @@
 
 #define HYN_QUEUE               16
 #define HYN_BUF                 16
+#define HYN_SCAN_MS             8       /* gap between reports */
+#define HYN_RETRIGGER_MS        100     /* re-signal an unserviced report */
 
 typedef struct {
     uint8_t state;
@@ -154,11 +156,46 @@ struct HynitronTsState {
     int abs_x, abs_y;
     bool btn, btn_reported;
     int last_x, last_y;
+
+    QEMUTimer *irq_timer;
+    bool int_low;
 };
 
-static void hyn_update_irq(HynitronTsState *s)
+static void hyn_int_arm(HynitronTsState *s, int ms)
 {
-    qemu_set_irq(s->irq, !s->q_count && !s->gesture);   /* active low */
+    timer_mod(s->irq_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + ms);
+}
+
+/* signal the queue head: a falling edge on INT */
+static void hyn_int_assert(HynitronTsState *s)
+{
+    if (s->asleep && !s->gesture) {
+        return;
+    }
+    if (s->int_low) {
+        qemu_set_irq(s->irq, 1);
+    }
+    s->int_low = true;
+    qemu_set_irq(s->irq, 0);
+    hyn_int_arm(s, HYN_RETRIGGER_MS);
+}
+
+static void hyn_int_release(HynitronTsState *s)
+{
+    s->int_low = false;
+    qemu_set_irq(s->irq, 1);
+    timer_del(s->irq_timer);
+}
+
+static void hyn_irq_timer(void *opaque)
+{
+    HynitronTsState *s = opaque;
+
+    if (!s->asleep && s->q_count) {
+        hyn_int_assert(s);
+    } else if (s->gesture) {
+        hyn_int_assert(s);
+    }
 }
 
 static void hyn_push(HynitronTsState *s, uint8_t state, int x, int y)
@@ -182,7 +219,9 @@ static void hyn_push(HynitronTsState *s, uint8_t state, int x, int y)
             tail->x = x;
             tail->y = y;
             trace_hynitron_ts_event(state, x, y);
-            hyn_update_irq(s);
+            if (!s->int_low && !timer_pending(s->irq_timer)) {
+                hyn_int_assert(s);
+            }
         }
         return;
     }
@@ -192,7 +231,9 @@ static void hyn_push(HynitronTsState *s, uint8_t state, int x, int y)
     tail->y = y;
     s->q_count++;
     trace_hynitron_ts_event(state, x, y);
-    hyn_update_irq(s);
+    if (!s->int_low && !timer_pending(s->irq_timer)) {
+        hyn_int_assert(s);
+    }
 }
 
 static void hyn_sleep(HynitronTsState *s, bool asleep, bool deep)
@@ -203,7 +244,7 @@ static void hyn_sleep(HynitronTsState *s, bool asleep, bool deep)
     s->q_head = s->q_count = 0;
     s->last_tap_ms = INT64_MIN;
     s->btn_reported = s->btn;
-    hyn_update_irq(s);
+    hyn_int_release(s);
 }
 
 /* the report or wake gesture was fetched */
@@ -215,14 +256,15 @@ static void hyn_ack(HynitronTsState *s)
             hyn_sleep(s, false, false);
             s->mode = HYN_MODE_NORMAL;
         }
-        qemu_irq_raise(s->irq);
+        hyn_int_release(s);
     } else if (s->q_count) {
         s->q_head = (s->q_head + 1) % HYN_QUEUE;
         s->q_count--;
-        /* release the line so the next report is a fresh edge */
-        qemu_irq_raise(s->irq);
+        hyn_int_release(s);
+        if (s->q_count) {
+            hyn_int_arm(s, HYN_SCAN_MS);
+        }
     }
-    hyn_update_irq(s);
 }
 
 static void hyn_mode(HynitronTsState *s, uint8_t mode)
@@ -508,7 +550,7 @@ static void hyn_gesture_sync(HynitronTsState *s, int x, int y)
     }
     if (s->gesture) {
         trace_hynitron_ts_gesture(s->gesture);
-        hyn_update_irq(s);
+        hyn_int_assert(s);
     }
 }
 
@@ -589,6 +631,7 @@ static void hyn_init(Object *obj)
 
     qdev_init_gpio_out_named(DEVICE(obj), &s->irq, "irq", 1);
     qdev_init_gpio_in_named(DEVICE(obj), hyn_reset_gpio, "reset", 1);
+    s->irq_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, hyn_irq_timer, s);
 }
 
 static const Property hyn_props[] = {

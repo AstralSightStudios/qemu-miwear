@@ -102,6 +102,8 @@
 #define ZT_SUB_UP               (1u << 3)
 
 #define ZT_QUEUE                16
+#define ZT_SCAN_MS             8           /* gap between reports */
+#define ZT_RETRIGGER_MS        100         /* re-signal an unserviced report */
 
 typedef struct {
     uint16_t status;
@@ -142,11 +144,46 @@ struct ZinitixTsState {
     int abs_x, abs_y;
     bool btn, btn_reported;
     int last_x, last_y;
+
+    QEMUTimer *int_timer;
+    bool int_low;
 };
 
-static void zt_update_irq(ZinitixTsState *s)
+static void zt_int_arm(ZinitixTsState *s, int ms)
 {
-    qemu_set_irq(s->irq, !s->q_count && !s->gesture);   /* active low */
+    timer_mod(s->int_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + ms);
+}
+
+/* signal the queue head: a falling edge on INT */
+static void zt_int_assert(ZinitixTsState *s)
+{
+    if (s->asleep && !s->gesture) {
+        return;
+    }
+    if (s->int_low) {
+        qemu_set_irq(s->irq, 1);
+    }
+    s->int_low = true;
+    qemu_set_irq(s->irq, 0);
+    zt_int_arm(s, ZT_RETRIGGER_MS);
+}
+
+static void zt_int_release(ZinitixTsState *s)
+{
+    s->int_low = false;
+    qemu_set_irq(s->irq, 1);
+    timer_del(s->int_timer);
+}
+
+static void zt_irq_timer(void *opaque)
+{
+    ZinitixTsState *s = opaque;
+
+    if (!s->asleep && s->q_count) {
+        zt_int_assert(s);
+    } else if (s->gesture) {
+        zt_int_assert(s);
+    }
 }
 
 static void zt_push(ZinitixTsState *s, uint16_t status, uint8_t sub,
@@ -174,7 +211,9 @@ static void zt_push(ZinitixTsState *s, uint16_t status, uint8_t sub,
     tail->y = y;
     s->q_count++;
     trace_zinitix_ts_event(status, sub, x, y);
-    zt_update_irq(s);
+    if (!s->int_low && !timer_pending(s->int_timer)) {
+        zt_int_assert(s);
+    }
 }
 
 static uint16_t zt_reg_read(ZinitixTsState *s, uint16_t reg)
@@ -209,7 +248,7 @@ static void zt_set_asleep(ZinitixTsState *s, bool asleep)
     s->q_head = s->q_count = 0;
     s->last_tap_ms = INT64_MIN;
     s->btn_reported = s->btn;
-    zt_update_irq(s);
+    zt_int_release(s);
 }
 
 static void zt_command(ZinitixTsState *s, uint16_t cmd)
@@ -219,15 +258,16 @@ static void zt_command(ZinitixTsState *s, uint16_t cmd)
     case ZT_CMD_CLEAR_INT:
         if (s->gesture) {
             s->gesture = 0;
-            qemu_irq_raise(s->irq);
+            zt_int_release(s);
         }
         if (s->q_count) {
             s->q_head = (s->q_head + 1) % ZT_QUEUE;
             s->q_count--;
-            /* release the line so the next report is a fresh edge */
-            qemu_irq_raise(s->irq);
+            zt_int_release(s);
+            if (s->q_count) {
+                zt_int_arm(s, ZT_SCAN_MS);
+            }
         }
-        zt_update_irq(s);
         break;
     case ZT_CMD_SWRESET:
     case ZT_CMD_WAKEUP:
@@ -365,7 +405,7 @@ static void zt_gesture_sync(ZinitixTsState *s, int x, int y)
     }
     if (s->gesture) {
         trace_zinitix_ts_gesture(s->gesture);
-        zt_update_irq(s);
+        zt_int_assert(s);
     }
 }
 
@@ -452,6 +492,7 @@ static void zt_init(Object *obj)
 
     qdev_init_gpio_out_named(DEVICE(obj), &s->irq, "irq", 1);
     qdev_init_gpio_in_named(DEVICE(obj), zt_reset_gpio, "reset", 1);
+    s->int_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, zt_irq_timer, s);
 }
 
 static const Property zt_props[] = {
