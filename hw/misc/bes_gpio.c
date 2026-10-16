@@ -48,7 +48,7 @@ static uint32_t bes_gpio_level_raw(BesGpioBank *b)
     uint32_t lvl = bes_gpio_levels(b);
     uint32_t active = (lvl & b->polarity) | (~lvl & ~b->polarity);
 
-    return active & b->inten & ~b->inttype_level;
+    return active & ~b->inttype_level;
 }
 
 static uint32_t bes_gpio_status(BesGpioState *s, int n)
@@ -81,7 +81,7 @@ static void bes_gpio_levels_changed(BesGpioState *s, int n, uint32_t old)
     uint32_t changed_out = (now ^ old) & b->ddr;
     int i;
 
-    b->raw |= edge & b->inten & b->inttype_level;
+    b->raw |= edge & b->inttype_level;
     for (i = 0; i < 32; i++) {
         if (changed_out & (1u << i)) {
             qemu_set_irq(s->out[n * 32 + i], (now >> i) & 1);
@@ -131,7 +131,7 @@ static uint64_t bes_gpio_bank_read(void *opaque, hwaddr offset,
     case 0x40:                          /* masked status */
         return bes_gpio_status(s, n);
     case 0x44:                          /* raw status */
-        return (b->raw | bes_gpio_level_raw(b)) & b->inten;
+        return b->raw | bes_gpio_level_raw(b);
     case 0x50:
         return bes_gpio_levels(b);
     default:
@@ -167,7 +167,6 @@ static void bes_gpio_bank_write(void *opaque, hwaddr offset, uint64_t value,
         break;
     case 0x18:
         b->inten &= ~v;
-        b->raw &= ~v;
         break;
     case 0x34:
         b->intmask |= v;

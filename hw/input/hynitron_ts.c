@@ -349,7 +349,7 @@ static uint8_t hyn_read_byte(HynitronTsState *s, unsigned off)
         return off == 1 ? hyn_echo_mode(s) : 0;
     case HYN_CMD_ESD:
         if (off == 0) {
-            return s->asleep && s->hyn92xx ? HYN_ESD_GESTURE : HYN_ESD_ALIVE;
+            return s->asleep ? HYN_ESD_GESTURE : HYN_ESD_ALIVE;
         }
         return off == 1 ? (s->wrist ? 2 : 0) | (s->wear ? 1 : 0) : 0;
     case HYN_CMD_POINT:
@@ -362,8 +362,14 @@ static uint8_t hyn_read_byte(HynitronTsState *s, unsigned off)
             return e ? e->y >> 4 : 0;
         case 3:
             return e ? (e->x & 15) << 4 | (e->y & 15) : 0;
-        case 4:
-            return hyn_gesture_code(s) << 4;
+        case 4: {
+            uint8_t sum = 0;
+            if (e) {
+                sum = (e->state + (e->x >> 4) + (e->y >> 4) +
+                       (((e->x & 15) << 4) | (e->y & 15))) & 0x0F;
+            }
+            return (hyn_gesture_code(s) << 4) | sum;
+        }
         case 5:
             return e || s->gesture ? 1 : 0;
         case 6:
@@ -560,6 +566,15 @@ static void hyn_reset(DeviceState *dev)
     hyn_sleep(s, false, false);
 }
 
+static void hyn_reset_gpio(void *opaque, int n, int level)
+{
+    HynitronTsState *s = HYNITRON_TS(opaque);
+
+    if (!level) {
+        hyn_reset(DEVICE(s));
+    }
+}
+
 static void hyn_realize(DeviceState *dev, Error **errp)
 {
     HynitronTsState *s = HYNITRON_TS(dev);
@@ -573,6 +588,7 @@ static void hyn_init(Object *obj)
     HynitronTsState *s = HYNITRON_TS(obj);
 
     qdev_init_gpio_out_named(DEVICE(obj), &s->irq, "irq", 1);
+    qdev_init_gpio_in_named(DEVICE(obj), hyn_reset_gpio, "reset", 1);
 }
 
 static const Property hyn_props[] = {

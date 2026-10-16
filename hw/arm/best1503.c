@@ -555,6 +555,8 @@ static void best1503_init(MachineState *machine, BesImage *img,
             qdev_prop_set_uint32(tmr, "freq1", timers[i].freq);
             /* BES 硬件两子定时器分接两路 NVIC，不做 OR 合并 */
             qdev_prop_set_bit(tmr, "split-irq", true);
+            /* 计数含 0 态：Load + 1 个周期才中断（避免 hwtimer 提早 1 tick 报 irq early 不再重装导致睡眠死锁） */
+            qdev_prop_set_bit(tmr, "count-zero", true);
             sysbus_realize_and_unref(SYS_BUS_DEVICE(tmr), &error_fatal);
             sysbus_mmio_map(SYS_BUS_DEVICE(tmr), 0, timers[i].base);
             sysbus_connect_irq(SYS_BUS_DEVICE(tmr), 0,
@@ -733,6 +735,10 @@ static void best1503_init(MachineState *machine, BesImage *img,
             qdev_connect_gpio_out_named(DEVICE(tp), "irq", 0,
                                         qdev_get_gpio_in(gpio,
                                                     board->touch.irq_gpio));
+            if (board->touch.reset_gpio >= 0) {
+                qdev_connect_gpio_out(gpio, board->touch.reset_gpio,
+                                      qdev_get_gpio_in_named(DEVICE(tp), "reset", 0));
+            }
         }
 
         if (board->charger.type) {

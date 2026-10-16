@@ -62,6 +62,7 @@
 
 #define ZT_CMD_SWRESET          0x0000
 #define ZT_CMD_WAKEUP           0x0001
+#define ZT_CMD_WAKEUP_ALT       0x0FF8  /* p65 (ztw662) resume command */
 #define ZT_CMD_CLEAR_INT        0x0003
 #define ZT_CMD_SLEEP            0x0005
 #define ZT_REG_FW_VERSION       0x0012
@@ -230,6 +231,7 @@ static void zt_command(ZinitixTsState *s, uint16_t cmd)
         break;
     case ZT_CMD_SWRESET:
     case ZT_CMD_WAKEUP:
+    case ZT_CMD_WAKEUP_ALT:
         zt_set_asleep(s, false);
         break;
     case ZT_CMD_SLEEP:
@@ -427,6 +429,15 @@ static void zt_reset(DeviceState *dev)
     zt_set_asleep(s, false);
 }
 
+static void zt_reset_gpio(void *opaque, int n, int level)
+{
+    ZinitixTsState *s = ZINITIX_TS(opaque);
+
+    if (!level) {
+        zt_reset(DEVICE(s));
+    }
+}
+
 static void zt_realize(DeviceState *dev, Error **errp)
 {
     ZinitixTsState *s = ZINITIX_TS(dev);
@@ -440,6 +451,7 @@ static void zt_init(Object *obj)
     ZinitixTsState *s = ZINITIX_TS(obj);
 
     qdev_init_gpio_out_named(DEVICE(obj), &s->irq, "irq", 1);
+    qdev_init_gpio_in_named(DEVICE(obj), zt_reset_gpio, "reset", 1);
 }
 
 static const Property zt_props[] = {

@@ -176,7 +176,7 @@ static const BesBoard bes_boards[] = {
         /* Zinitix ZTW662（真机日志 chip id 0xE623）。bes_ts_zinitix_setup
          * (sub_C3F84CC) 打开 I2C 总线 5；板级配置 0x2CD0605C = {I2C 地址
          * 0x20, 400kHz, INT pinset 0x1004C (GPIO 76), RESET 0x1404E}。 */
-        .touch = { TYPE_ZINITIX_TS, 5, 0x20, 76 },
+        .touch = { .type = TYPE_ZINITIX_TS, .bus = 5, .addr = 0x20, .irq_gpio = 76, .reset_gpio = 78 },
         /* bes sn110 驱动 nfc_driver_p67_initialize（sub_C713784）：I2C
          * 总线 6、地址 0x28、400kHz，VEN=69、中断(数据就绪)=77。 */
         .nfc = { TYPE_NCI_NFCC, 6, 0x28, 77 },
@@ -224,7 +224,7 @@ static const BesBoard bes_boards[] = {
          * sub_C35CBC0），400kHz；引脚表 0x200812A0：reset 28、
          * interrupt 27、vcc_en 74。board_hynitron_setup 先试 cst92xx，
          * 只有 I2C 不应答时才转 zinitix，故装 CST92xx。 */
-        .touch = { TYPE_HYNITRON_TS, 3, 0x5A, 27, false, 0x9217 },
+        .touch = { .type = TYPE_HYNITRON_TS, .bus = 3, .addr = 0x5A, .irq_gpio = 27, .reset_gpio = 28, .hyn92xx = false, .part_no = 0x9217 },
         /* 板号 0（board.binfos "bt"）：board_bsp_product_init 记
          * "not support nfc"，NFC 栈不启动，不装 */
         /* NAND：固件按 512MB 表分区（实测日志 resource first 0
@@ -274,7 +274,7 @@ static const BesBoard bes_boards[] = {
          * 先探测 Zinitix @0x20（devid 须为 0xE623），再探测 CST92xx
          * @0x5A；引脚 INT 0x1041B（GPIO 27）、RESET 0x1401C（28）、
          * 供电 0x1404A / 0x1404D。 */
-        .touch = { TYPE_HYNITRON_TS, 3, 0x5A, 27, true, 0x9220 },
+        .touch = { .type = TYPE_HYNITRON_TS, .bus = 3, .addr = 0x5A, .irq_gpio = 27, .reset_gpio = 28, .hyn92xx = true, .part_no = 0x9220 },
         /* NAND：固件分区 nand_system first 0 nblocks 65536、nand_data
          * first 65536 nblocks 65536（实测日志），/system 是 YAFFS2
          * （emu/mknand.py --profile n66 --system <固件目录>）；固件 ID 表
@@ -317,7 +317,7 @@ static const BesBoard bes_boards[] = {
         .panel_x_offset = 24,
         .lcd_te_gpio = 65,
         /* CST9217M @0x5A on I2C3，INT GPIO 27 */
-        .touch = { TYPE_HYNITRON_TS, 3, 0x5A, 27, true, 0x9220 },
+        .touch = { .type = TYPE_HYNITRON_TS, .bus = 3, .addr = 0x5A, .irq_gpio = 27, .reset_gpio = 28, .hyn92xx = true, .part_no = 0x9220 },
         /* NAND：固件 512MB 表 nand_system first 0 nblocks 65536、nand_data
          * first 65536 nblocks 196608；/system 是 YAFFS2 */
         .nand_id = 0xC8F4C8,
@@ -347,7 +347,7 @@ static const BesBoard bes_boards[] = {
         .lcd_te_gpio = 47,
         /* CST9217 @0x5A on I2C3，INT GPIO 27 */
         /* 触摸在 I2C5（0x40063000）：固件对 0x5A 的访问全部落在该总线上，INT GPIO 76 (0x4C) */
-        .touch = { TYPE_HYNITRON_TS, 5, 0x5A, 76, true, 0x9217 },
+        .touch = { .type = TYPE_HYNITRON_TS, .bus = 5, .addr = 0x5A, .irq_gpio = 76, .reset_gpio = 77, .hyn92xx = true, .part_no = 0x9217 },
         /* W1150 light device on I2C5 at 0x48 (sub_C3913A0 w11xx init) */
         .light = { "w1150.als", 5, 0x48, -1 },
         /* NAND：固件表 nand_system first 0 nblocks 57600、nand_data
@@ -394,7 +394,7 @@ static const BesBoard bes_boards[] = {
          * Hardware id and register version as in the driver's bundled
          * image (0x3C16DD64: 0x4502, fw 9.0, reg 0xD2), else it reflashes
          * the controller for 25 s on every boot */
-        .touch = { TYPE_ZINITIX_TS, 5, 0x20, 76, false, 0x4502, 0xD2 },
+        .touch = { .type = TYPE_ZINITIX_TS, .bus = 5, .addr = 0x20, .irq_gpio = 76, .reset_gpio = 77, .hyn92xx = false, .part_no = 0x4502, .fw_version = 0xD2 },
         /* GPADC, read through /dev/adc by the battery driver: ch2 skin
          * NTC (sub_C4F6F90), ch3 shell NTC (sub_C4F6D98), both 100k
          * against a 200k pull-up to 1.8 V (table 0x3C17F730), so 600 mV =
@@ -440,8 +440,8 @@ static const BesBoard bes_boards[] = {
         .charger = { TYPE_SC7061, 0, 0x07, -1 },
         /* W1150 on I2C5 at 0x48 */
         .light = { "w1150.als", 5, 0x48, -1 },
-        /* touch: Hynitron CST9317 on I2C5 at 0x5A, interrupt GPIO 76 (0x4C) */
-        .touch = { TYPE_HYNITRON_TS, 5, 0x5A, 76, true, 0x9317 },
+        /* touch: Hynitron CST9317 on I2C5 at 0x5A, interrupt GPIO 76 (0x4C), reset GPIO 77 */
+        .touch = { .type = TYPE_HYNITRON_TS, .bus = 5, .addr = 0x5A, .irq_gpio = 76, .reset_gpio = 77, .hyn92xx = false, .part_no = 0x9317 },
         /* GPADC: ch2 skin NTC, ch3 shell NTC (600 mV = 25 C), ch6 VBAT / 5 (800 mV = 4.0 V) */
         .gpadc_mv = { [2] = 600, [3] = 600, [6] = 800 },
         .battery = {
@@ -478,7 +478,7 @@ static const BesBoard bes_boards[] = {
         .lcd_te_gpio = -1,
         /* Raydium RM6D03x：挂载在 AP I2C0 (0x40006000)，从机地址 0x39，
          * 中断 GPIO 73（实测 AP 日志与驱动反汇编） */
-        .touch = { TYPE_RAYDIUM_TS, 0, 0x39, 73 },
+        .touch = { .type = TYPE_RAYDIUM_TS, .bus = 0, .addr = 0x39, .irq_gpio = 73, .reset_gpio = -1 },
         /* NXP SN110，同 p67 的 bes sn110 驱动与固件文件
          * NXP_01_10_6E.bin：board_sn110_initialize（0x1088DA68，由
          * 0x10878E20 以总线 4 调用）配 I2C 4（0x40077000）地址 0x28、
