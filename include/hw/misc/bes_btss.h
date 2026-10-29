@@ -60,11 +60,44 @@ typedef struct BesBtssAdvSet {
     uint16_t props;                     /* Advertising_Event_Properties */
     uint8_t own_addr_type;              /* 0 public, else random */
     uint8_t random[6];                  /* LE Set Adv Set Random Address */
+    uint8_t direct_addr_type;
+    uint8_t direct_addr[6];
+    uint8_t filter_policy;
+    bool random_set;
     uint8_t data_len;
     uint8_t rsp_len;
     uint8_t data[BTSS_ADV_DATA_MAX];
     uint8_t rsp[BTSS_ADV_DATA_MAX];
 } BesBtssAdvSet;
+
+/* LE connection procedures remain separate from BR/EDR authentication. */
+typedef struct BesBtssLeInitiator {
+    bool pending;
+    uint8_t filter_policy;
+    uint8_t own_type;
+    uint8_t peer_type;
+    uint8_t peer[6];
+    uint16_t interval;
+    uint16_t latency;
+    uint16_t timeout;
+} BesBtssLeInitiator;
+
+typedef struct BesBtssLeLink {
+    bool up;
+    int central;
+    uint16_t handle;
+    uint8_t addr_type[BTSS_SIDES];
+    uint8_t addr[BTSS_SIDES][6];
+    uint16_t interval;
+    uint16_t latency;
+    uint16_t timeout;
+} BesBtssLeLink;
+
+typedef struct BesBtssLeAccept {
+    bool used;
+    uint8_t type;
+    uint8_t addr[6];
+} BesBtssLeAccept;
 
 /* per-controller state written by its host */
 typedef struct BesBtssHost {
@@ -91,6 +124,11 @@ typedef struct BesBtssHost {
     QEMUTimer *inq_timer;               /* Inquiry_Length expiry */
     /* LE broadcast */
     uint8_t le_random[6];               /* LE Set Random Address */
+    bool le_random_set;
+    uint64_t event_mask;
+    uint64_t le_event_mask;
+    BesBtssLeAccept accept[8];
+    BesBtssLeInitiator initiating;
     BesBtssAdvSet adv[BTSS_ADV_SETS];
     bool le_scan;                       /* scanning enabled */
     bool le_scan_ext;                   /* ... with the extended commands */
@@ -157,6 +195,8 @@ struct BesBtssState {
     char *bdaddr_str[BTSS_SIDES];       /* "bdaddr", "peer-bdaddr" */
     BesBtssHost host[BTSS_SIDES];
     BesBtssLink link;
+    BesBtssLeLink le_link;
+    QEMUTimer *le_timer;
 
     CharFrontend radio;                 /* the peer's H4 transport */
     bool radio_open;

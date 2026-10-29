@@ -31,6 +31,15 @@ unsigned btss_band_queue_free(BesBtssState *s);
 void btss_lmp_features(BesBtssState *s, int side, unsigned page,
                        uint8_t *out);
 
+/* LE procedures; opaque ACL payloads are still routed by the link layer. */
+bool btss_le_command(BesBtssState *s, int side, uint16_t opcode,
+                     const uint8_t *p, unsigned plen);
+bool btss_le_handle(BesBtssState *s, uint16_t handle);
+void btss_le_changed(BesBtssState *s);
+void btss_le_host_reset(BesBtssState *s, int side);
+void btss_le_realize(BesBtssState *s);
+void btss_le_event(BesBtssState *s, int side, const uint8_t *p, unsigned len);
+
 /* link layer (bes_btss_link.c) */
 bool btss_link_command(BesBtssState *s, int side, uint16_t opcode,
                        const uint8_t *p, unsigned plen);

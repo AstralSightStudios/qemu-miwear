@@ -320,7 +320,7 @@ static void link_remote_name(BesBtssState *s, int side, const uint8_t *p,
  * or when the set is enabled or its data changes while the other scans,
  * as with duplicate filtering. A scanner using the legacy commands sees
  * only legacy PDUs; an active scanner also gets the scan response of a
- * scannable set. Directed advertising and LE connections are not modelled.
+ * scannable set. LE initiating and connections are handled by bes_btss_le.c.
  */
 
 static BesBtssAdvSet *adv_set(BesBtssHost *h, uint8_t handle, bool create)
@@ -381,7 +381,7 @@ static void le_report(BesBtssState *s, int side, BesBtssAdvSet *a, bool rsp)
         p[15] = (uint8_t)-40;       /* RSSI */
         p[25] = len;                /* p[16..24]: no periodic, no direct */
         memcpy(p + 26, data, len);
-        btss_event(s, side, EVT_LE_META, p, 26 + len);
+        btss_le_event(s, side, p, 26 + len);
     } else {
         /* LE Advertising Report (7.7.65.2) of a legacy PDU */
         len = MIN(len, 31u);
@@ -396,7 +396,7 @@ static void le_report(BesBtssState *s, int side, BesBtssAdvSet *a, bool rsp)
         p[10] = len;
         memcpy(p + 11, data, len);
         p[11 + len] = (uint8_t)-40;
-        btss_event(s, side, EVT_LE_META, p, 12 + len);
+        btss_le_event(s, side, p, 12 + len);
     }
 }
 
@@ -468,6 +468,7 @@ static void adv_enable(BesBtssState *s, int side, BesBtssAdvSet *a, bool on)
     bool start = on && !a->enabled;
 
     a->enabled = on;
+    btss_le_changed(s);
     if (start) {
         le_see(s, other(side), a);
     }
@@ -493,6 +494,7 @@ static void le_record(BesBtssState *s, int side, uint16_t opcode,
     case 0x2005:                    /* LE Set Random Address */
         if (plen >= 6) {
             memcpy(h->le_random, p, 6);
+            h->le_random_set = true;
         }
         break;
     case 0x2006:                    /* LE Set Advertising Parameters */
@@ -500,6 +502,11 @@ static void le_record(BesBtssState *s, int side, uint16_t opcode,
         if (a && plen >= 6 && p[4] < ARRAY_SIZE(legacy_props)) {
             a->props = legacy_props[p[4]];
             a->own_addr_type = p[5];
+            if (plen >= 15) {
+                a->direct_addr_type = p[6];
+                memcpy(a->direct_addr, p + 7, 6);
+                a->filter_policy = p[14];
+            }
         }
         break;
     case 0x2008:                    /* LE Set Advertising Data */
@@ -525,6 +532,7 @@ static void le_record(BesBtssState *s, int side, uint16_t opcode,
         a = plen >= 7 ? adv_set(h, p[0], true) : NULL;
         if (a) {
             memcpy(a->random, p + 1, 6);
+            a->random_set = true;
         }
         break;
     case 0x2036:                    /* LE Set Extended Advertising Params */
@@ -532,6 +540,11 @@ static void le_record(BesBtssState *s, int side, uint16_t opcode,
         if (a) {
             a->props = lduw_le_p(p + 1);
             a->own_addr_type = p[10];
+            if (plen >= 19) {
+                a->direct_addr_type = p[11];
+                memcpy(a->direct_addr, p + 12, 6);
+                a->filter_policy = p[18];
+            }
         }
         break;
     case 0x2037:                    /* LE Set Extended Advertising Data */
@@ -1094,6 +1107,7 @@ void btss_link_host_reset(BesBtssState *s, int side)
 {
     BesBtssHost *h = &s->host[side];
 
+    btss_le_host_reset(s, side);
     if (h->inq_timer) {
         timer_del(h->inq_timer);
     }
@@ -1191,6 +1205,9 @@ static void link_record(BesBtssState *s, int side, uint16_t opcode,
 bool btss_link_command(BesBtssState *s, int side, uint16_t opcode,
                        const uint8_t *p, unsigned plen)
 {
+    if (btss_le_command(s, side, opcode, p, plen)) {
+        return true;
+    }
     switch (opcode) {
     case 0x0401:
         link_inquiry(s, side, p, plen);
@@ -1280,11 +1297,11 @@ static void air_occupy(BesBtssState *s, unsigned len)
     s->air_free_ns = MAX(now, s->air_free_ns) + air_time_ns(len);
 }
 
-static void num_completed(BesBtssState *s, int side)
+static void num_completed(BesBtssState *s, int side, uint16_t handle)
 {
     uint8_t p[5] = { 1 };
 
-    stw_le_p(p + 1, s->link.handle);
+    stw_le_p(p + 1, handle);
     stw_le_p(p + 3, 1);
     btss_event(s, side, EVT_NUM_COMPLETED, p, sizeof(p));
 }
@@ -1303,7 +1320,8 @@ void btss_link_acl(BesBtssState *s, int side, const uint8_t *pkt,
     hf = lduw_le_p(pkt + 1);
     dlen = lduw_le_p(pkt + 3);
     trace_bes_btss_acl(side, hf, dlen);
-    if (dlen != len - 5 || !link_handle_is(s, pkt + 1)) {
+    if (dlen != len - 5 || (!link_handle_is(s, pkt + 1) &&
+                            !btss_le_handle(s, hf))) {
         qemu_log_mask(LOG_GUEST_ERROR, "bes.btss: side %d: ACL for handle "
                       "0x%03x (%u bytes) dropped\n", side, hf & 0x0FFF, dlen);
         return;
@@ -1329,7 +1347,7 @@ void btss_link_acl(BesBtssState *s, int side, const uint8_t *pkt,
             off += n;
         } while (off < dlen);
     }
-    num_completed(s, side);
+    num_completed(s, side, hf & 0x0fff);
 }
 
 /* ---- the peer's H4 transport ---- */
@@ -1478,6 +1496,7 @@ void btss_link_realize(BesBtssState *s, Error **errp)
                                                 inquiry_band_expired, s);
     s->host[BTSS_PEER].inq_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                                 inquiry_peer_expired, s);
+    btss_le_realize(s);
     s->air_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, air_free, s);
     s->page_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, page_timer_cb, s);
     qemu_chr_fe_set_handlers(&s->radio, radio_can_receive, radio_receive,

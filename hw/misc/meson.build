@@ -18,7 +18,7 @@ system_ss.add(when: 'CONFIG_BEST1700_BTHROM', if_true: files('best1700_bthrom.c'
 system_ss.add(when: 'CONFIG_BES_I2C', if_true: files('bes_i2c.c'))
 system_ss.add(when: 'CONFIG_BES_LCDC', if_true: files('bes_lcdc.c'))
 system_ss.add(when: 'CONFIG_BES_DMA', if_true: files('bes_dma.c'))
-system_ss.add(when: 'CONFIG_BES_BTSS', if_true: files('bes_btss.c', 'bes_btss_link.c'))
+system_ss.add(when: 'CONFIG_BES_BTSS', if_true: files('bes_btss.c', 'bes_btss_link.c', 'bes_btss_le.c'))
 system_ss.add(when: 'CONFIG_BES_GPIO', if_true: files('bes_gpio.c'))
 system_ss.add(when: 'CONFIG_BES_PSC', if_true: files('bes_psc.c'))
 system_ss.add(when: 'CONFIG_NCI_NFCC', if_true: files('nci_nfcc.c'))
