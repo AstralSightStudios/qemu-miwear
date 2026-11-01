@@ -90,13 +90,24 @@
  * Pixels are composed in premultiplied space and stored premultiplied
  * (LVGL marks GPU-drawn layers as premultiplied).
  *
+ * Host side: the common cases (host-mapped memory, formats of 8-bit or
+ * smaller channels, point and (bi)linear images, the usual blend modes)
+ * take fast paths that compute exactly what the generic per-pixel code
+ * does; property "render-threads" (0: automatic) shades the rows of large
+ * operations on several host threads; trace event vsi_vglite_stats
+ * reports each submit's work and host time; MIRAGE_VGL_DUMP captures
+ * submits for offline replay (see vgl_dump_touch()).
+ *
  * This code is licensed under the GPL version 2 or later.
  */
 
 #include "qemu/osdep.h"
 #include <math.h>
 #include "qapi/error.h"
+#include "qemu/cutils.h"
 #include "qemu/log.h"
+#include "qemu/thread.h"
+#include "qemu/timer.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "system/memory.h"
@@ -401,7 +412,7 @@ static uint32_t vgl_pack(const VglFormat *f, const int c[4])
     return raw;
 }
 
-static void vgl_premultiply(int c[4])
+static inline QEMU_ALWAYS_INLINE void vgl_premultiply(int c[4])
 {
     c[CH_R] = (c[CH_R] * c[CH_A] + 127) / 255;
     c[CH_G] = (c[CH_G] * c[CH_A] + 127) / 255;
@@ -416,6 +427,240 @@ static void vgl_abgr(uint32_t v, int c[4])
     c[CH_A] = v >> 24;
 }
 
+/*
+ * Fast pixel access for the formats made of channels of at most 8 bits
+ * (everything but A4 / A8 / L8 and CLUT indices): the position and width
+ * of each channel, and tables holding exactly what vgl_expand() and the
+ * rounding in vgl_pack() compute, so both paths produce the same values.
+ */
+typedef struct {
+    uint8_t shift[4];           /* R G B A */
+    uint8_t bits[4];            /* 0: not stored, reads as 255 (alpha) */
+    uint32_t fixed;             /* padding alpha bits, stored as ones */
+} VglLayout;
+
+static uint8_t vgl_expand_lut[9][256];  /* [bits][v] = vgl_expand(v, bits) */
+static uint8_t vgl_reduce_lut[9][256];  /* [bits][c]: c * max / 255, rounded */
+
+static void vgl_init_luts(void)
+{
+    unsigned bits, v;
+
+    for (bits = 1; bits <= 8; bits++) {
+        for (v = 0; v < 256; v++) {
+            vgl_expand_lut[bits][v] = vgl_expand(v, bits);
+            vgl_reduce_lut[bits][v] = (v * ((1u << bits) - 1) + 127) / 255;
+        }
+    }
+}
+
+static bool vgl_layout(const VglFormat *f, VglLayout *l)
+{
+    unsigned i, shift = 0;
+
+    memset(l, 0, sizeof(*l));
+    if (!f->valid || !f->bytes || f->alpha_only || f->lum || f->index) {
+        return false;
+    }
+    for (i = 0; i < 4; i++) {
+        unsigned ch = f->order[i], w = f->width[ch];
+
+        if (!w) {
+            continue;
+        }
+        if (ch != CH_A || f->alpha) {
+            l->shift[ch] = shift;
+            l->bits[ch] = w;
+        } else {
+            l->fixed |= ((1u << w) - 1) << shift;
+        }
+        shift += w;
+    }
+    return true;
+}
+
+/* vgl_unpack() for a format with a layout */
+static inline QEMU_ALWAYS_INLINE void vgl_unpack_fast(const VglLayout *l,
+                                                   uint32_t raw, int c[4])
+{
+    int k;
+
+    for (k = 0; k < 4; k++) {
+        unsigned b = l->bits[k];
+
+        c[k] = b ? vgl_expand_lut[b][(raw >> l->shift[k]) & ((1u << b) - 1)]
+                 : 255;
+    }
+}
+
+/* vgl_pack() for a format with a layout; c[] must be 0..255 */
+static inline QEMU_ALWAYS_INLINE uint32_t vgl_pack_fast(const VglLayout *l,
+                                                     const int c[4])
+{
+    uint32_t raw = l->fixed;
+    int k;
+
+    for (k = 0; k < 4; k++) {
+        if (l->bits[k]) {
+            raw |= (uint32_t)vgl_reduce_lut[l->bits[k]][c[k]] << l->shift[k];
+        }
+    }
+    return raw;
+}
+
+static inline QEMU_ALWAYS_INLINE uint32_t vgl_ld_px(const uint8_t *p,
+                                                 unsigned bytes)
+{
+    switch (bytes) {
+    case 1:
+        return p[0];
+    case 2:
+        return lduw_le_p(p);
+    case 3:
+        return p[0] | p[1] << 8 | p[2] << 16;
+    default:
+        return ldl_le_p(p);
+    }
+}
+
+static inline QEMU_ALWAYS_INLINE void vgl_st_px(uint8_t *p, unsigned bytes,
+                                             uint32_t v)
+{
+    switch (bytes) {
+    case 1:
+        p[0] = v;
+        break;
+    case 2:
+        stw_le_p(p, v);
+        break;
+    case 3:
+        p[0] = v;
+        p[1] = v >> 8;
+        p[2] = v >> 16;
+        break;
+    default:
+        stl_le_p(p, v);
+        break;
+    }
+}
+
+/*
+ * A pixel as four 16-bit lanes, R | G << 16 | B << 32 | A << 48: the hot
+ * paths work on all four channels at once where no lane can overflow.
+ */
+#define LANES_1     0x0001000100010001ull
+#define LANES_FF    0x00FF00FF00FF00FFull
+
+static inline QEMU_ALWAYS_INLINE uint64_t vgl_lanes(const int c[4])
+{
+    return (uint64_t)c[CH_R] | (uint64_t)c[CH_G] << 16 |
+           (uint64_t)c[CH_B] << 32 | (uint64_t)c[CH_A] << 48;
+}
+
+static inline QEMU_ALWAYS_INLINE void vgl_unlanes(uint64_t v, int c[4])
+{
+    c[CH_R] = v & 0xFFFF;
+    c[CH_G] = (v >> 16) & 0xFFFF;
+    c[CH_B] = (v >> 32) & 0xFFFF;
+    c[CH_A] = v >> 48;
+}
+
+/*
+ * x / 255 in every lane, for lanes up to 65534 (checked for each value:
+ * (x + 1 + (x >> 8)) >> 8 == x / 255 for 0 <= x <= 65534); intermediate
+ * lanes stay below 65536. vgl_mul() of 0..255 values is
+ * vgl_lanes_div255(a * b + 127), at most 65152.
+ */
+static inline QEMU_ALWAYS_INLINE uint64_t vgl_lanes_div255(uint64_t x)
+{
+    return ((x + LANES_1 + ((x >> 8) & LANES_FF)) >> 8) & LANES_FF;
+}
+
+/* MIN(v, 255) in every lane, for lanes up to 1023 */
+static inline QEMU_ALWAYS_INLINE uint64_t vgl_lanes_sat(uint64_t v)
+{
+    uint64_t over = (v >> 8) & (3 * LANES_1);
+
+    return (v | ((over | over >> 1) & LANES_1) * 0xFF) & LANES_FF;
+}
+
+/* a * b in every lane, for lanes up to 255 */
+static inline QEMU_ALWAYS_INLINE uint64_t vgl_lanes_mul(uint64_t a, uint64_t b)
+{
+    return (a & 0xFFFF) * (b & 0xFFFF) |
+           ((a >> 16) & 0xFFFF) * ((b >> 16) & 0xFFFF) << 16 |
+           ((a >> 32) & 0xFFFF) * ((b >> 32) & 0xFFFF) << 32 |
+           (a >> 48) * (b >> 48) << 48;
+}
+
+static inline QEMU_ALWAYS_INLINE uint32_t vgl_pack_lanes(const VglLayout *l,
+                                                      uint64_t v)
+{
+    uint32_t raw = l->fixed;
+    int k;
+
+    for (k = 0; k < 4; k++) {
+        if (l->bits[k]) {
+            raw |= (uint32_t)vgl_reduce_lut[l->bits[k]][(v >> 16 * k) & 0xFF]
+                   << l->shift[k];
+        }
+    }
+    return raw;
+}
+
+/*
+ * Every 16-bit pixel of a layout decoded to lanes (and premultiplied, for
+ * images the sampler premultiplies), kept for the last few layouts: a
+ * 16-bit texel or render target pixel read is then one table lookup.
+ * Building a table costs about as much as decoding a few ten thousand
+ * pixels: for a smaller operation (area pixels) only a kept table is
+ * used, else NULL. An operation uses up to three tables (pattern, image,
+ * target), all valid until its end: a table it got is never replaced
+ * (s->lut_op counts operations, see vgl_pe_open()).
+ */
+#define VGL_LUT16_AREA      16384
+
+static const uint64_t *vgl_lut16(VsiVgliteState *s, const VglLayout *l,
+                                 bool premul, uint64_t area)
+{
+    uint64_t key = premul;
+    uint64_t *lut;
+    uint32_t raw;
+    unsigned i;
+
+    for (i = 0; i < 4; i++) {
+        key = key << 9 | l->shift[i] << 4 | l->bits[i];
+    }
+    for (i = 0; i < VGL_TEXEL_LUTS; i++) {
+        if (s->texel_lut[i] && s->texel_lut_key[i] == key) {
+            s->texel_lut_op[i] = s->lut_op;
+            return s->texel_lut[i];
+        }
+    }
+    if (area < VGL_LUT16_AREA) {
+        return NULL;
+    }
+    do {
+        i = s->texel_lut_next++ % VGL_TEXEL_LUTS;
+    } while (s->texel_lut[i] && s->texel_lut_op[i] == s->lut_op);
+    s->texel_lut_op[i] = s->lut_op;
+    if (!s->texel_lut[i]) {
+        s->texel_lut[i] = g_new(uint64_t, 0x10000);
+    }
+    lut = s->texel_lut[i];
+    s->texel_lut_key[i] = key;
+    for (raw = 0; raw < 0x10000; raw++) {
+        int c[4];
+
+        vgl_unpack_fast(l, raw, c);
+        if (premul) {
+            vgl_premultiply(c);
+        }
+        lut[raw] = vgl_lanes(c);
+    }
+    return lut;
+}
+
 /* ---- guest memory windows ---- */
 
 typedef struct {
@@ -426,11 +671,15 @@ typedef struct {
     bool write;
 } VglMem;
 
-static void vgl_mem_open(VglMem *m, AddressSpace *as, hwaddr addr,
+static void vgl_dump_touch(VsiVgliteState *s, hwaddr addr, uint64_t len);
+
+static void vgl_mem_open(VsiVgliteState *s, VglMem *m, hwaddr addr,
                          uint64_t len, bool write)
 {
+    AddressSpace *as = &s->as;
     hwaddr plen = len;
 
+    vgl_dump_touch(s, addr, len);
     m->as = as;
     m->addr = addr;
     m->len = len;
@@ -487,6 +736,16 @@ static uint32_t vgl_mem_pixel(VglMem *m, uint64_t off, unsigned bytes)
 
 /* ---- image sampler ---- */
 
+/* how vgl_texel() reads texels inside a host-mapped image */
+enum {
+    TEX_SLOW,                   /* vgl_mem_read() and vgl_unpack() */
+    TEX_RGBA,                   /* VglLayout */
+    TEX_LUT16,                  /* 16-bit texel -> decoded texel table */
+    TEX_INDEX8,
+    TEX_A8,
+    TEX_L8,
+};
+
 typedef struct {
     VglFormat fmt;
     VglMem mem;
@@ -498,9 +757,38 @@ typedef struct {
     int border[4];
     float c[3], dx[3], dy[3];
     const uint32_t *clut;
+    unsigned kind;              /* TEX_* */
+    unsigned tbytes;            /* bytes per texel of the fast kinds */
+    VglLayout layout;
+    const uint64_t *lut;        /* TEX_LUT16: texel -> lanes */
+    const uint64_t *clut_lanes; /* TEX_INDEX8 image: index -> lanes */
 } VglSampler;
 
-static bool vgl_sampler_open(VsiVgliteState *s, VglSampler *sm, bool paint)
+/* pick the fast texel reader for a host-mapped image (area: of the op) */
+static void vgl_sampler_fast(VsiVgliteState *s, VglSampler *sm, uint64_t area)
+{
+    const VglFormat *f = &sm->fmt;
+
+    if (vgl_layout(f, &sm->layout)) {
+        sm->tbytes = f->bytes;
+        if (f->bytes == 2) {
+            sm->lut = vgl_lut16(s, &sm->layout, sm->premul, area);
+        }
+        sm->kind = sm->lut ? TEX_LUT16 : TEX_RGBA;
+    } else if (f->index && f->bits == 8) {
+        sm->tbytes = 1;
+        sm->kind = TEX_INDEX8;
+    } else if (f->alpha_only && f->bytes == 1) {
+        sm->tbytes = 1;
+        sm->kind = TEX_A8;
+    } else if (f->lum) {
+        sm->tbytes = 1;
+        sm->kind = TEX_L8;
+    }
+}
+
+static bool vgl_sampler_open(VsiVgliteState *s, VglSampler *sm, bool paint,
+                             uint64_t area)
 {
     uint32_t cfg = vgl_st(s, paint ? ST_PAINT_CONFIG : ST_IMAGE_CONFIG);
     uint32_t size = vgl_st(s, paint ? ST_PAINT_SIZE : ST_IMAGE_SIZE);
@@ -561,11 +849,38 @@ static bool vgl_sampler_open(VsiVgliteState *s, VglSampler *sm, bool paint)
      * The last row needs only its pixels: a gradient's colour ramp is a
      * single row and the driver leaves its stride at 0 (q63 firmware).
      */
-    vgl_mem_open(&sm->mem, &s->as, addr,
+    vgl_mem_open(s, &sm->mem, addr,
                  (uint64_t)sm->stride * (sm->h - 1) +
                  (sm->fmt.bytes ? (uint64_t)sm->w * sm->fmt.bytes
                                 : ((uint64_t)sm->w * sm->fmt.bits + 7) / 8),
                  false);
+    if (sm->mem.host) {
+        vgl_sampler_fast(s, sm, area);
+    }
+    if (sm->kind == TEX_INDEX8 && !paint &&
+        (!s->clut_lanes_valid || s->clut_lanes_premul != sm->premul ||
+         memcmp(s->clut_lanes_src, sm->clut, sizeof(s->clut_lanes_src)))) {
+        /* the CLUT entries as vgl_texel_kind() reads them, for the lanes */
+        memcpy(s->clut_lanes_src, sm->clut, sizeof(s->clut_lanes_src));
+        s->clut_lanes_premul = sm->premul;
+        s->clut_lanes_valid = true;
+        for (i = 0; i < 256; i++) {
+            uint32_t e = sm->clut[i];   /* ARGB8888 */
+            int c[4];
+
+            c[CH_B] = e & 0xFF;
+            c[CH_G] = (e >> 8) & 0xFF;
+            c[CH_R] = (e >> 16) & 0xFF;
+            c[CH_A] = e >> 24;
+            if (sm->premul) {
+                vgl_premultiply(c);
+            }
+            s->clut_lanes[i] = vgl_lanes(c);
+        }
+    }
+    if (sm->kind == TEX_INDEX8 && !paint) {
+        sm->clut_lanes = s->clut_lanes;
+    }
     return true;
 }
 
@@ -593,16 +908,72 @@ static int vgl_wrap(int i, int n, unsigned tile)
     }
 }
 
+/*
+ * vgl_texel() for a texel at p inside a host-mapped image of the given
+ * kind (sm->kind, or that value as a constant for the compiler to fold):
+ * the window covers every texel of the image, see vgl_sampler_open().
+ */
+static inline QEMU_ALWAYS_INLINE void vgl_texel_kind(const VglSampler *sm,
+                                                  unsigned kind,
+                                                  const uint8_t *p, int c[4])
+{
+    uint32_t e;
+
+    switch (kind) {
+    case TEX_LUT16:
+        vgl_unlanes(sm->lut[lduw_le_p(p)], c);
+        return;
+    case TEX_RGBA:
+        vgl_unpack_fast(&sm->layout, vgl_ld_px(p, sm->tbytes), c);
+        break;
+    case TEX_INDEX8:
+        e = sm->clut[p[0]];             /* ARGB8888 */
+        c[CH_B] = e & 0xFF;
+        c[CH_G] = (e >> 8) & 0xFF;
+        c[CH_R] = (e >> 16) & 0xFF;
+        c[CH_A] = e >> 24;
+        break;
+    case TEX_A8:
+        c[CH_R] = c[CH_G] = c[CH_B] = c[CH_A] = p[0];
+        return;
+    default:                            /* TEX_L8 */
+        c[CH_R] = c[CH_G] = c[CH_B] = p[0];
+        c[CH_A] = 255;
+        break;
+    }
+    if (sm->premul) {
+        vgl_premultiply(c);
+    }
+}
+
+static inline QEMU_ALWAYS_INLINE void vgl_texel_fast(const VglSampler *sm,
+                                                  const uint8_t *p, int c[4])
+{
+    vgl_texel_kind(sm, sm->kind, p, c);
+}
+
 /* premultiplied texel at integer coordinates */
 static void vgl_texel(VglSampler *sm, int i, int j, int c[4])
 {
     const VglFormat *f = &sm->fmt;
     uint32_t raw;
 
+    if (sm->kind != TEX_SLOW && (unsigned)i < sm->w && (unsigned)j < sm->h) {
+        /* inside the image: no tiling mode moves the texel */
+        vgl_texel_fast(sm, sm->mem.host + (uint64_t)j * sm->stride +
+                           (uint64_t)i * sm->tbytes, c);
+        return;
+    }
     i = vgl_wrap(i, sm->w, sm->tile);
     j = vgl_wrap(j, sm->h, sm->tile);
     if (i < 0 || j < 0) {
         memcpy(c, sm->border, sizeof(sm->border));
+        return;
+    }
+    if (sm->kind != TEX_SLOW) {
+        /* tiling leaves i, j inside the image */
+        vgl_texel_fast(sm, sm->mem.host + (uint64_t)j * sm->stride +
+                           (uint64_t)i * sm->tbytes, c);
         return;
     }
     if (f->bits) {
@@ -634,7 +1005,16 @@ static void vgl_texel(VglSampler *sm, int i, int j, int c[4])
     }
 }
 
-static void vgl_sample(VglSampler *sm, int x, int y, int c[4])
+/*
+ * Image sample at pixel (x, y). sm may be a copy of the sampler that the
+ * caller keeps in registers, kind is sm->kind (possibly as a constant);
+ * texels vgl_texel() has to fetch (outside the image, or not host-mapped)
+ * are read through orig, the sampler itself.
+ */
+static inline QEMU_ALWAYS_INLINE void vgl_sample_in(const VglSampler *sm,
+                                                   unsigned kind,
+                                                   VglSampler *orig,
+                                                   int x, int y, int c[4])
 {
     float u = sm->c[0] + sm->dx[0] * x + sm->dy[0] * y;
     float v = sm->c[1] + sm->dx[1] * x + sm->dy[1] * y;
@@ -654,7 +1034,14 @@ static void vgl_sample(VglSampler *sm, int x, int y, int c[4])
     s = sm->unnormalized ? u : u * sm->w;
     t = sm->unnormalized ? v : v * sm->h;
     if (sm->filter == 0) {
-        vgl_texel(sm, (int)floorf(s), (int)floorf(t), c);
+        int i = (int)floorf(s), j = (int)floorf(t);
+
+        if (kind != TEX_SLOW && (unsigned)i < sm->w && (unsigned)j < sm->h) {
+            vgl_texel_kind(sm, kind, sm->mem.host + (uint64_t)j * sm->stride +
+                                     (uint64_t)i * sm->tbytes, c);
+            return;
+        }
+        vgl_texel(orig, i, j, c);
         return;
     }
     if (sm->filter == 3) {
@@ -664,7 +1051,7 @@ static void vgl_sample(VglSampler *sm, int x, int y, int c[4])
 
         for (j = -1; j <= 1; j++) {
             for (i = -1; i <= 1; i++) {
-                vgl_texel(sm, i0 + i, j0 + j, tx);
+                vgl_texel(orig, i0 + i, j0 + j, tx);
                 for (k = 0; k < 4; k++) {
                     acc[k] += tx[k] * g[i + 1] * g[j + 1];
                 }
@@ -680,10 +1067,21 @@ static void vgl_sample(VglSampler *sm, int x, int y, int c[4])
         int wx = (int)((s - i0) * 256.0f), wy = (int)((t - j0) * 256.0f);
         int t00[4], t10[4], t01[4], t11[4];
 
-        vgl_texel(sm, i0, j0, t00);
-        vgl_texel(sm, i0 + 1, j0, t10);
-        vgl_texel(sm, i0, j0 + 1, t01);
-        vgl_texel(sm, i0 + 1, j0 + 1, t11);
+        if (kind != TEX_SLOW && (unsigned)i0 < sm->w - 1 &&
+            (unsigned)j0 < sm->h - 1) {
+            const uint8_t *p = sm->mem.host + (uint64_t)j0 * sm->stride +
+                               (uint64_t)i0 * sm->tbytes;
+
+            vgl_texel_kind(sm, kind, p, t00);
+            vgl_texel_kind(sm, kind, p + sm->tbytes, t10);
+            vgl_texel_kind(sm, kind, p + sm->stride, t01);
+            vgl_texel_kind(sm, kind, p + sm->stride + sm->tbytes, t11);
+        } else {
+            vgl_texel(orig, i0, j0, t00);
+            vgl_texel(orig, i0 + 1, j0, t10);
+            vgl_texel(orig, i0, j0 + 1, t01);
+            vgl_texel(orig, i0 + 1, j0 + 1, t11);
+        }
         for (k = 0; k < 4; k++) {
             int top = t00[k] * (256 - wx) + t10[k] * wx;
             int bot = t01[k] * (256 - wx) + t11[k] * wx;
@@ -691,6 +1089,120 @@ static void vgl_sample(VglSampler *sm, int x, int y, int c[4])
             c[k] = (top * (256 - wy) + bot * wy + 32768) >> 16;
         }
     }
+}
+
+static void vgl_sample(VglSampler *sm, int x, int y, int c[4])
+{
+    vgl_sample_in(sm, sm->kind, sm, x, y, c);
+}
+
+/*
+ * The bilinear footprint (i0, j0) and weights (wx, wy) vgl_sample_in()
+ * computes for pixels x..x+n-1 of row y of an affine sampler, in a loop
+ * simple enough to be vectorized: the same operations on each lane.
+ */
+static inline QEMU_ALWAYS_INLINE void vgl_coords(const VglSampler *sm,
+                                                int x, int y, int n,
+                                                int *i0, int *j0,
+                                                int *wx, int *wy)
+{
+    const float c0 = sm->c[0], c1 = sm->c[1];
+    const float dx0 = sm->dx[0], dx1 = sm->dx[1];
+    const float dy0 = sm->dy[0], dy1 = sm->dy[1];
+    const uint32_t w = sm->w, h = sm->h;
+    const bool unnormalized = sm->unnormalized;
+    int i;
+
+    for (i = 0; i < n; i++) {
+        float u = c0 + dx0 * (x + i) + dy0 * y;
+        float v = c1 + dx1 * (x + i) + dy1 * y;
+        float s = unnormalized ? u : u * w;
+        float t = unnormalized ? v : v * h;
+
+        i0[i] = (int)floorf(s);
+        j0[i] = (int)floorf(t);
+        wx[i] = (int)((s - i0[i]) * 256.0f);
+        wy[i] = (int)((t - j0[i]) * 256.0f);
+    }
+}
+
+/* the texel at p of a fast kind as lanes, as vgl_texel_kind() reads it */
+static inline QEMU_ALWAYS_INLINE uint64_t vgl_texel_lanes(const VglSampler *sm,
+                                                       unsigned kind,
+                                                       const uint8_t *p)
+{
+    int c[4];
+
+    switch (kind) {
+    case TEX_LUT16:
+        return sm->lut[lduw_le_p(p)];
+    case TEX_INDEX8:
+        return sm->clut_lanes[p[0]];
+    default:
+        vgl_texel_kind(sm, kind, p, c);
+        return vgl_lanes(c);
+    }
+}
+
+/*
+ * The point or (bi)linear sample of an affine sampler of a fast kind at
+ * footprint (i0, j0) with weights (wx, wy) from vgl_coords(), when the
+ * footprint lies inside the image; returns false, having computed
+ * nothing, otherwise. Inside the image the weights are 0..255: the texel
+ * coordinate s is small, so s - i0 is exact and below 1, or NaN, which
+ * converts to 0 for both. The texels are then blended in lanes, two and
+ * four channels at a time: no lane overflows (t * (256 - w) + t' * w <=
+ * 255 * 256 in 16 bits, then below 2^25 in 32 bits), so each channel
+ * gets the per-channel result.
+ */
+static inline QEMU_ALWAYS_INLINE bool vgl_fetch_lanes(const VglSampler *sm,
+                                                     unsigned kind, bool point,
+                                                     int i0, int j0,
+                                                     int wx, int wy,
+                                                     uint64_t *out)
+{
+    const uint64_t lo = 0x0000FFFF0000FFFFull, half = 0x0000800000008000ull;
+    const unsigned tb = kind == TEX_LUT16 ? 2 : sm->tbytes;
+    const uint8_t *p;
+    uint64_t top, bot, rb, ga;
+
+    if (point) {
+        if ((unsigned)i0 >= sm->w || (unsigned)j0 >= sm->h) {
+            return false;
+        }
+        *out = vgl_texel_lanes(sm, kind, sm->mem.host +
+                                         (uint64_t)j0 * sm->stride +
+                                         (uint64_t)i0 * tb);
+        return true;
+    }
+    if ((unsigned)i0 >= sm->w - 1 || (unsigned)j0 >= sm->h - 1) {
+        return false;
+    }
+    p = sm->mem.host + (uint64_t)j0 * sm->stride + (uint64_t)i0 * tb;
+    top = vgl_texel_lanes(sm, kind, p) * (256 - wx) +
+          vgl_texel_lanes(sm, kind, p + tb) * wx;
+    p += sm->stride;
+    bot = vgl_texel_lanes(sm, kind, p) * (256 - wx) +
+          vgl_texel_lanes(sm, kind, p + tb) * wx;
+    /* R and B, G and A in 32-bit lanes */
+    rb = (top & lo) * (256 - wy) + (bot & lo) * wy + half;
+    ga = ((top >> 16) & lo) * (256 - wy) + ((bot >> 16) & lo) * wy + half;
+    *out = ((rb >> 16) & lo) | ((ga >> 16) & lo) << 16;
+    return true;
+}
+
+/*
+ * vgl_sample_in() for an affine, (bi)linear TEX_LUT16 sampler whose 2x2
+ * footprint at (x, y) lies inside the image (else false, see above)
+ */
+static inline QEMU_ALWAYS_INLINE bool vgl_bilinear16(const VglSampler *sm,
+                                                    int x, int y,
+                                                    uint64_t *out)
+{
+    int i0, j0, wx, wy;
+
+    vgl_coords(sm, x, y, 1, &i0, &j0, &wx, &wy);
+    return vgl_fetch_lanes(sm, TEX_LUT16, false, i0, j0, wx, wy, out);
 }
 
 /* gradient colour ramp: image row 0, texel i holding position i / (w - 1) */
@@ -730,12 +1242,16 @@ typedef struct {
     uint32_t stride;
     int clip_w, clip_h;
     int win_y0;                 /* first row mapped in mem */
+    bool fast;                  /* mem is host-mapped and fmt has a layout */
+    VglLayout layout;
+    const uint64_t *dlut;       /* fast 16-bit target: pixel -> lanes */
+    bool exact;                 /* fast, every bit a channel: round trips */
     bool use_image, use_paint;
     VglSampler image, pattern;
     double grad[9];             /* c X Y rc rX rY rXX rYY rXY */
 } VglPE;
 
-static int vgl_mul(int a, int b)
+static inline QEMU_ALWAYS_INLINE int vgl_mul(int a, int b)
 {
     return (a * b + 127) / 255;
 }
@@ -790,7 +1306,8 @@ static void vgl_paint(VglPE *pe, int x, int y, int p[4])
 }
 
 /* blend premultiplied source s (already scaled by coverage) onto d */
-static void vgl_blend(unsigned mode, const int s[4], int d[4], int cov)
+static inline QEMU_ALWAYS_INLINE void vgl_blend(unsigned mode, const int s[4],
+                                             int d[4], int cov)
 {
     int sa = s[CH_A], da = d[CH_A], r[4], k;
 
@@ -841,7 +1358,9 @@ static void vgl_blend(unsigned mode, const int s[4], int d[4], int cov)
     memcpy(d, r, sizeof(r));
 }
 
-static bool vgl_pe_open(VsiVgliteState *s, VglPE *pe, int y0, int y1)
+/* area: pixels the operation may cover, to weigh setup costs */
+static bool vgl_pe_open(VsiVgliteState *s, VglPE *pe, int y0, int y1,
+                        uint64_t area)
 {
     uint32_t tcfg = vgl_st(s, ST_TARGET_CONFIG);
     uint32_t size = vgl_st(s, ST_TARGET_SIZE);
@@ -849,6 +1368,7 @@ static bool vgl_pe_open(VsiVgliteState *s, VglPE *pe, int y0, int y1)
 
     memset(pe, 0, sizeof(*pe));
     pe->s = s;
+    s->lut_op++;                /* a new user of the vgl_lut16() tables */
     pe->ctrl = vgl_st(s, ST_CONTROL);
     pe->image_mode = CTRL_IMAGE_MODE(pe->ctrl);
     pe->blend = CTRL_BLEND(pe->ctrl);
@@ -879,7 +1399,7 @@ static bool vgl_pe_open(VsiVgliteState *s, VglPE *pe, int y0, int y1)
     pe->clip_w = size & 0xFFFF;
     pe->clip_h = size >> 16;
     if (pe->paint != PAINT_COLOR) {
-        pe->use_paint = vgl_sampler_open(s, &pe->pattern, true);
+        pe->use_paint = vgl_sampler_open(s, &pe->pattern, true, area);
         if (!pe->use_paint) {
             return false;
         }
@@ -908,7 +1428,7 @@ static bool vgl_pe_open(VsiVgliteState *s, VglPE *pe, int y0, int y1)
         }
     }
     if (pe->image_mode != IM_NONE && !pe->use_paint) {
-        pe->use_image = vgl_sampler_open(s, &pe->image, false);
+        pe->use_image = vgl_sampler_open(s, &pe->image, false, area);
         if (!pe->use_image) {
             if (pe->use_paint) {
                 vgl_sampler_close(&pe->pattern);
@@ -917,9 +1437,20 @@ static bool vgl_pe_open(VsiVgliteState *s, VglPE *pe, int y0, int y1)
         }
     }
     pe->win_y0 = y0;
-    vgl_mem_open(&pe->mem, &s->as,
+    vgl_mem_open(s, &pe->mem,
                  vgl_st(s, ST_TARGET_ADDR) + (hwaddr)y0 * pe->stride,
                  (uint64_t)pe->stride * (y1 - y0), true);
+    pe->fast = pe->mem.host && vgl_layout(&pe->fmt, &pe->layout);
+    if (pe->fast) {
+        const VglLayout *l = &pe->layout;
+
+        if (pe->fmt.bytes == 2) {
+            pe->dlut = vgl_lut16(s, l, false, area);
+        }
+        /* reduce(expand(v)) == v for every channel width (checked) */
+        pe->exact = !l->fixed && l->bits[0] + l->bits[1] + l->bits[2] +
+                                 l->bits[3] == 8 * pe->fmt.bytes;
+    }
     return true;
 }
 
@@ -934,13 +1465,325 @@ static void vgl_pe_close(VglPE *pe)
     }
 }
 
-/* shade pixels x0..x1-1 of row y; cov[] = coverage 0..256, or NULL */
-static void vgl_pe_span(VglPE *pe, int y, int x0, int x1, const int *cov)
+/*
+ * What the fast span loops read, copied to locals first: every pixel
+ * store might alias the device state otherwise, and the compiler would
+ * reload it all for each pixel.
+ */
+typedef struct {
+    VglSampler im;
+    VglLayout lay;
+    unsigned bpp, mode;
+    bool use_image;
+    bool bilinear16;            /* vgl_bilinear16() applies to im */
+    bool white;                 /* opaque white colour */
+    int color[4], color_pm[4];
+} VglSpan;
+
+static inline QEMU_ALWAYS_INLINE void vgl_span_init(VglPE *pe, VglSpan *sp,
+                                                   unsigned kind)
+{
+    sp->im = pe->image;
+    sp->lay = pe->layout;
+    sp->bpp = pe->fmt.bytes;
+    sp->mode = pe->image_mode;
+    sp->use_image = pe->use_image;
+    sp->bilinear16 = kind == TEX_LUT16 && !sp->im.perspective &&
+                     (sp->im.filter == 1 || sp->im.filter == 2);
+    sp->white = vgl_st(pe->s, ST_COLOR) == 0xFFFFFFFF;
+    memcpy(sp->color, pe->color, sizeof(sp->color));
+    memcpy(sp->color_pm, pe->color_pm, sizeof(sp->color_pm));
+}
+
+/*
+ * One pixel of vgl_pe_span() for a host-mapped target with a layout and
+ * the fill colour or image paint (not a gradient or pattern paint): the
+ * operations of the generic loop, with the image texel kind and the blend
+ * mode possibly constants for the compiler to fold.
+ */
+static inline QEMU_ALWAYS_INLINE void vgl_pixel_fast(VglPE *pe,
+                                                    const VglSpan *sp,
+                                                    uint8_t *px, int x, int y,
+                                                    int c, unsigned blend,
+                                                    unsigned kind)
+{
+    int p[4], d[4], t[4], k;
+
+    if (!sp->use_image) {
+        memcpy(p, sp->color_pm, sizeof(p));
+    } else {
+        bool in_range = false;          /* 0 <= t[k] <= 255 for sure */
+        uint64_t l;
+
+        if (sp->bilinear16 && vgl_bilinear16(&sp->im, x, y, &l)) {
+            vgl_unlanes(l, t);
+            in_range = true;
+        } else {
+            vgl_sample_in(&sp->im, kind, &pe->image, x, y, t);
+        }
+        switch (sp->mode) {
+        case IM_MULTIPLY:
+            /* vgl_mul(t, 255) == t for t >= 0 */
+            if (sp->white && in_range) {
+                memcpy(p, t, sizeof(t));
+                break;
+            }
+            for (k = 0; k < 4; k++) {
+                p[k] = vgl_mul(t[k], sp->color[k]);
+            }
+            break;
+        case IM_STENCIL:
+        case IM_RECOLOR:
+            for (k = 0; k < 4; k++) {
+                p[k] = vgl_mul(sp->color_pm[k], t[CH_A]);
+            }
+            break;
+        default:
+            memcpy(p, t, sizeof(t));
+            break;
+        }
+    }
+    if (c < 256) {
+        for (k = 0; k < 4; k++) {
+            p[k] = (p[k] * c + 128) >> 8;
+        }
+    }
+    vgl_unpack_fast(&sp->lay, vgl_ld_px(px, sp->bpp), d);
+    vgl_blend(blend, p, d, c);
+    vgl_st_px(px, sp->bpp, vgl_pack_fast(&sp->lay, d));
+}
+
+/* vgl_pe_span() through vgl_pixel_fast(); dst is row y */
+static inline QEMU_ALWAYS_INLINE uint64_t vgl_span_fast(VglPE *pe,
+                                                       uint8_t *dst,
+                                                       int y, int x0, int x1,
+                                                       const int *cov,
+                                                       unsigned blend,
+                                                       unsigned kind)
+{
+    VglSpan sp;
+    uint64_t shaded = 0;
+    int x;
+
+    vgl_span_init(pe, &sp, kind);
+    for (x = x0; x < x1; x++) {
+        int c = cov ? cov[x - x0] : 256;
+
+        if (c > 0) {
+            vgl_pixel_fast(pe, &sp, dst + (uint64_t)x * sp.bpp, x, y, c,
+                           blend, kind);
+            shaded++;
+        }
+    }
+    return shaded;
+}
+
+/* pixels sampled ahead of shading in vgl_span_lanes() */
+#define VGL_BATCH   32
+
+/*
+ * vgl_pe_span() on four channels at once, for a target with a layout of
+ * bpp bytes and the fill colour or an affine image of a fast kind read
+ * with a point or (bi)linear filter, blend none / src-over / multiply /
+ * screen / additive (kind, point, bpp and blend may be constants for the
+ * compiler to fold; kind TEX_SLOW stands for the fill colour). These are
+ * the steps of vgl_pixel_fast(), and every value is 0..255 here, so each
+ * lane operation gives the per-channel result: tint and stencil products
+ * and coverage scaling stay below 65536 per lane, vgl_mul() is
+ * vgl_lanes_div255(), and the blend results (0 to 3 * 255) are clamped by
+ * vgl_lanes_sat(). Pixels whose footprint leaves the image go through
+ * vgl_pixel_fast().
+ */
+static inline QEMU_ALWAYS_INLINE uint64_t vgl_span_lanes(VglPE *pe,
+                                                        uint8_t *dst,
+                                                        int y, int x0, int x1,
+                                                        const int *cov,
+                                                        unsigned blend,
+                                                        unsigned kind,
+                                                        bool point,
+                                                        unsigned bpp)
+{
+    const bool image = kind != TEX_SLOW;
+    const uint64_t *dlut = pe->dlut;
+    const bool exact = pe->exact;
+    /*
+     * When the image and the target do not share memory (host pointers:
+     * aliased guest addresses map to the same host memory), sampling a
+     * batch of pixels before shading any of them reads the same texels as
+     * going pixel by pixel, and the samples no longer wait on the stores.
+     */
+    const bool batch = image &&
+        (pe->image.mem.host + pe->image.mem.len <= pe->mem.host ||
+         pe->mem.host + pe->mem.len <= pe->image.mem.host);
+    uint64_t shaded = 0, cpm, color, lb[VGL_BATCH];
+    int i0[VGL_BATCH], j0[VGL_BATCH], wx[VGL_BATCH], wy[VGL_BATCH];
+    bool ok[VGL_BATCH];
+    VglSpan sp;
+    int x, i, n, grey = -1;
+
+    vgl_span_init(pe, &sp, kind);
+    cpm = vgl_lanes(sp.color_pm);
+    color = vgl_lanes(sp.color);
+    if (!sp.white && sp.color[0] == sp.color[1] && sp.color[0] == sp.color[2] &&
+        sp.color[0] == sp.color[3]) {
+        grey = sp.color[0];
+    }
+    for (x = x0; x < x1; x += n) {
+        n = batch ? MIN(x1 - x, VGL_BATCH) : 1;
+        if (image) {
+            vgl_coords(&sp.im, x, y, n, i0, j0, wx, wy);
+            for (i = 0; i < n; i++) {
+                ok[i] = (!cov || cov[x + i - x0] > 0) &&
+                        vgl_fetch_lanes(&sp.im, kind, point, i0[i], j0[i],
+                                        wx[i], wy[i], &lb[i]);
+            }
+        }
+        for (i = 0; i < n; i++) {
+            int c = cov ? cov[x + i - x0] : 256;
+            uint8_t *px = dst + (uint64_t)(x + i) * bpp;
+            uint64_t l = cpm, d, v;
+            unsigned sa;
+
+            if (c <= 0) {
+                continue;
+            }
+            shaded++;
+            if (image) {
+                if (!ok[i]) {
+                    vgl_pixel_fast(pe, &sp, px, x + i, y, c, blend, kind);
+                    continue;
+                }
+                l = lb[i];
+                switch (sp.mode) {
+                case IM_MULTIPLY:
+                    if (grey >= 0) {
+                        /* a grey tint (a faded white): one product */
+                        l = vgl_lanes_div255(l * grey + 127 * LANES_1);
+                    } else if (!sp.white) {
+                        l = vgl_lanes_div255(vgl_lanes_mul(l, color) +
+                                             127 * LANES_1);
+                    }
+                    break;
+                case IM_STENCIL:
+                case IM_RECOLOR:
+                    l = vgl_lanes_div255(cpm * (l >> 48) + 127 * LANES_1);
+                    break;
+                }
+            }
+            if (c < 256) {
+                l = ((l * c + 128 * LANES_1) >> 8) & LANES_FF;
+            }
+            /*
+             * Nothing to add: src-over, additive and screen give the target
+             * pixel back (vgl_mul(d, 255) == d), and it packs to what it was.
+             */
+            if (!l && exact && (blend == 0x1 || blend == 0x6 || blend == 0x9)) {
+                continue;
+            }
+            sa = l >> 48;
+            if (blend == 0x1 && sa == 255) {
+                /* vgl_mul(d, 0) == 0 */
+                vgl_st_px(px, bpp, vgl_pack_lanes(&sp.lay, l));
+                continue;
+            }
+            if (bpp == 2 && dlut) {
+                d = dlut[lduw_le_p(px)];
+            } else {
+                int dc[4];
+
+                vgl_unpack_fast(&sp.lay, vgl_ld_px(px, bpp), dc);
+                d = vgl_lanes(dc);
+            }
+            switch (blend) {
+            case 0x1:                   /* src over */
+                v = l + vgl_lanes_div255(d * (255 - sa) + 127 * LANES_1);
+                break;
+            case 0x5:                   /* multiply: at most 3 * 255 */
+                v = vgl_lanes_div255(l * (255 - (d >> 48)) + 127 * LANES_1) +
+                    vgl_lanes_div255(d * (255 - sa) + 127 * LANES_1) +
+                    vgl_lanes_div255(vgl_lanes_mul(l, d) + 127 * LANES_1);
+                break;
+            case 0x6:                   /* screen: vgl_mul(s, d) <= s */
+                v = l + d -
+                    vgl_lanes_div255(vgl_lanes_mul(l, d) + 127 * LANES_1);
+                break;
+            case 0x9:                   /* additive */
+                v = l + d;
+                break;
+            default:                    /* none: replace (by coverage) */
+                v = l + ((d * (256 - c) >> 8) & LANES_FF);
+                break;
+            }
+            vgl_st_px(px, bpp, vgl_pack_lanes(&sp.lay, vgl_lanes_sat(v)));
+        }
+    }
+    return shaded;
+}
+
+/*
+ * Shade pixels x0..x1-1 of row y; cov[] = coverage 0..256, or NULL.
+ * Returns the number of pixels shaded.
+ */
+static uint64_t vgl_pe_span(VglPE *pe, int y, int x0, int x1, const int *cov)
 {
     unsigned bpp = pe->fmt.bytes;
     uint64_t row = (uint64_t)(y - pe->win_y0) * pe->stride;
+    uint8_t *dst = NULL;
+    uint64_t shaded = 0;
     int x, k;
 
+    /* the whole span inside the host mapping: no per-pixel checks */
+    if (pe->fast && row + (uint64_t)x1 * bpp <= pe->mem.len) {
+        dst = pe->mem.host + row;
+    }
+    if (dst && !pe->use_paint) {
+        const VglSampler *im = &pe->image;
+        unsigned kind = pe->use_image ? im->kind : TEX_SLOW;
+        bool point = im->filter == 0, lanes;
+
+        /*
+         * Four channels at once for the fill colour and affine point or
+         * (bi)linear images of a fast kind, with the common blend modes;
+         * inlined for BAL2D's 16-bit images onto a 16-bit target.
+         */
+        lanes = (!pe->use_image ||
+                 (kind != TEX_SLOW && !im->perspective && im->filter != 3)) &&
+                (pe->blend == 0x0 || pe->blend == 0x1 || pe->blend == 0x5 ||
+                 pe->blend == 0x6 || pe->blend == 0x9);
+        if (lanes && kind == TEX_LUT16 && !point && bpp == 2) {
+            switch (pe->blend) {
+            case 0x0:
+                shaded = vgl_span_lanes(pe, dst, y, x0, x1, cov, 0x0,
+                                        TEX_LUT16, false, 2);
+                break;
+            case 0x1:
+                shaded = vgl_span_lanes(pe, dst, y, x0, x1, cov, 0x1,
+                                        TEX_LUT16, false, 2);
+                break;
+            case 0x5:
+                shaded = vgl_span_lanes(pe, dst, y, x0, x1, cov, 0x5,
+                                        TEX_LUT16, false, 2);
+                break;
+            case 0x6:
+                shaded = vgl_span_lanes(pe, dst, y, x0, x1, cov, 0x6,
+                                        TEX_LUT16, false, 2);
+                break;
+            default:
+                shaded = vgl_span_lanes(pe, dst, y, x0, x1, cov, 0x9,
+                                        TEX_LUT16, false, 2);
+                break;
+            }
+        } else if (lanes && pe->blend == 0x1) {
+            shaded = vgl_span_lanes(pe, dst, y, x0, x1, cov, 0x1, kind,
+                                    point, bpp);
+        } else if (lanes) {
+            shaded = vgl_span_lanes(pe, dst, y, x0, x1, cov, pe->blend, kind,
+                                    point, bpp);
+        } else {
+            shaded = vgl_span_fast(pe, dst, y, x0, x1, cov, pe->blend, kind);
+        }
+        return shaded;
+    }
     for (x = x0; x < x1; x++) {
         int c = cov ? cov[x - x0] : 256;
         int p[4], d[4];
@@ -950,11 +1793,20 @@ static void vgl_pe_span(VglPE *pe, int y, int x0, int x1, const int *cov)
         if (c <= 0) {
             continue;
         }
+        shaded++;
         vgl_paint(pe, x, y, p);
         if (c < 256) {
             for (k = 0; k < 4; k++) {
                 p[k] = (p[k] * c + 128) >> 8;
             }
+        }
+        if (dst) {
+            uint8_t *px = dst + (uint64_t)x * bpp;
+
+            vgl_unpack_fast(&pe->layout, vgl_ld_px(px, bpp), d);
+            vgl_blend(pe->blend, p, d, c);
+            vgl_st_px(px, bpp, vgl_pack_fast(&pe->layout, d));
+            continue;
         }
         raw = vgl_mem_pixel(&pe->mem, row + (uint64_t)x * bpp, bpp);
         vgl_unpack(&pe->fmt, raw, d);
@@ -966,7 +1818,24 @@ static void vgl_pe_span(VglPE *pe, int y, int x0, int x1, const int *cov)
         stl_le_p(b, raw);
         vgl_mem_write(&pe->mem, row + (uint64_t)x * bpp, b, bpp);
     }
+    return shaded;
 }
+
+/*
+ * Rows y0..y1-1 of a draw operation, to be shaded in bands of rows (see
+ * vgl_par_rows()): a path operation's rows (raster), or columns x0..x1-1
+ * of each row of a rectangle.
+ */
+typedef struct VglJob {
+    VglPE *pe;
+    const struct VglRaster *raster;
+    int x0, x1;
+    int y0, y1;
+    int band, nbands;           /* rows per band, bands */
+    int next;                   /* next band to take (atomic) */
+} VglJob;
+
+static uint64_t vgl_par_rows(VsiVgliteState *s, VglJob *job);
 
 /* ---- rectangle operation (clear / blit) ---- */
 
@@ -979,22 +1848,22 @@ static void vgl_rect_op(VsiVgliteState *s, const uint8_t *d)
     int x1 = MIN(x + w, (int)(size & 0xFFFF));
     int y1 = MIN(y + h, (int)(size >> 16));
     unsigned op = CTRL_OP(vgl_st(s, ST_CONTROL));
+    VglJob job;
     VglPE pe;
-    int row;
 
     s->ops++;
+    s->stat_rects++;
     trace_vsi_vglite_rect(vgl_st(s, ST_CONTROL), vgl_st(s, ST_TARGET_CONFIG),
                           vgl_st(s, ST_TARGET_ADDR), vgl_st(s, ST_IMAGE_CONFIG),
                           vgl_st(s, ST_IMAGE_ADDR), x, y, w, h);
     if ((op != OP_RECT && op != OP_CLEAR) || x1 <= x0 || y1 <= y0) {
         return;
     }
-    if (!vgl_pe_open(s, &pe, y0, y1)) {
+    if (!vgl_pe_open(s, &pe, y0, y1, (uint64_t)(x1 - x0) * (y1 - y0))) {
         return;
     }
-    for (row = y0; row < y1; row++) {
-        vgl_pe_span(&pe, row, x0, x1, NULL);
-    }
+    job = (VglJob) { .pe = &pe, .x0 = x0, .x1 = x1, .y0 = y0, .y1 = y1 };
+    s->stat_pixels += vgl_par_rows(s, &job);
     vgl_pe_close(&pe);
 }
 
@@ -1202,84 +2071,170 @@ static void vgl_flatten(VsiVgliteState *s, VglFlat *fl, const uint8_t *d,
     }
 }
 
-static gint vgl_edge_cmp(gconstpointer a, gconstpointer b)
-{
-    const VglEdge *ea = a, *eb = b;
-
-    return ea->y0 < eb->y0 ? -1 : ea->y0 > eb->y0;
-}
-
+/*
+ * An edge crossing the current sub-scanline. Sub-scanlines only move
+ * down, so an edge joins the active list once (y0 <= sy) and leaves it
+ * for good (y1 <= sy): the list holds exactly the edges with
+ * y0 <= sy < y1, the set a scan of all edges would find.
+ */
 typedef struct {
     float x;
     int dir;
-} VglCross;
+    const VglEdge *e;
+} VglActive;
 
-static gint vgl_cross_cmp(gconstpointer a, gconstpointer b)
+/* where edge e crosses sub-scanline sy */
+static inline float vgl_cross(const VglEdge *e, float sy)
 {
-    const VglCross *ca = a, *cb = b;
+    return e->x0 + (sy - e->y0) * (e->x1 - e->x0) / (e->y1 - e->y0);
+}
 
-    return ca->x < cb->x ? -1 : ca->x > cb->x;
+static void *vgl_grow(void **buf, size_t *have, size_t need)
+{
+    if (need > *have) {
+        g_free(*buf);
+        *have = MAX(need, *have * 2);
+        *buf = g_malloc(*have);
+    }
+    return *buf;
+}
+
+/* a path operation's edges, shared by the bands of its rows */
+typedef struct VglRaster {
+    VglPE *pe;
+    const VglEdge *e;
+    unsigned ne;
+    int rx0, ry0, rx1, ry1;
+    bool even_odd;
+    unsigned quality;
+    const uint32_t *order;      /* edge indices by the row of their top end */
+    const uint32_t *end;        /* end[r]: end of row r's edges in order[] */
+} VglRaster;
+
+/* scratch vgl_raster_rows() needs */
+static size_t vgl_raster_scratch(const VglRaster *r)
+{
+    return (sizeof(VglActive) + sizeof(uint32_t)) * r->ne +
+           (sizeof(float) + sizeof(int)) * (r->rx1 - r->rx0);
 }
 
 /*
- * Scanline coverage: quality 0 samples each pixel centre; higher
- * qualities use four sub-scanlines with exact horizontal coverage.
+ * Scanline coverage of rows ya..yb-1: quality 0 samples each pixel
+ * centre; higher qualities use four sub-scanlines with exact horizontal
+ * coverage. Returns the number of pixels shaded.
+ *
+ * Crossings are sorted by x; the order of equal crossings does not
+ * matter: the span between them is empty and skipped, and the winding
+ * number after them is the same in any order. So a band of rows may start
+ * with its active edges in any order.
  */
-static void vgl_raster(VglPE *pe, GArray *ea, int rx0, int ry0, int rx1,
-                       int ry1, bool even_odd, unsigned quality)
+static uint64_t vgl_raster_rows(const VglRaster *r, int ya, int yb,
+                                void *scratch)
 {
-    VglEdge *e = (VglEdge *)ea->data;
-    unsigned ne = ea->len, nsub = quality ? 4 : 1;
-    int w = rx1 - rx0, y, x;
-    float *acc = g_new(float, w);
-    int *cov = g_new(int, w);
-    VglCross *xs = g_new(VglCross, ne + 1);
+    const VglEdge *e = r->e;
+    const bool even_odd = r->even_odd;
+    const unsigned quality = r->quality, nsub = quality ? 4 : 1;
+    const int rx0 = r->rx0, rx1 = r->rx1, w = rx1 - rx0;
+    VglActive *act = scratch;
+    float *acc = (float *)(act + r->ne);
+    int *cov = (int *)(acc + w);
+    uint32_t *pend = (uint32_t *)(cov + w);
+    unsigned i, j, nact = 0, npend = 0;
+    unsigned next = ya > r->ry0 ? r->end[ya - r->ry0 - 1] : 0;
+    uint64_t shaded = 0;
+    int y, x;
 
-    g_array_sort(ea, vgl_edge_cmp);
-    e = (VglEdge *)ea->data;
-    for (y = ry0; y < ry1; y++) {
+    /*
+     * Edges starting above the band wait as well: its first sub-scanline
+     * takes the ones still crossing it and drops the others.
+     */
+    for (i = 0; i < next; i++) {
+        pend[npend++] = r->order[i];
+    }
+    memset(acc, 0, sizeof(float) * w);
+    for (y = ya; y < yb; y++) {
         unsigned k;
-        int lo = w, hi = -1;
+        /* quality 0: run0..run1-1 waits to be shaded (none if run1 <= run0) */
+        int lo = w, hi = -1, run0 = 0, run1 = 0;
 
-        memset(acc, 0, sizeof(float) * w);
+        /* edges whose top end lies in this row wait in pend[] */
+        while (next < r->end[y - r->ry0]) {
+            pend[npend++] = r->order[next++];
+        }
+        if (!nact && !npend) {
+            continue;
+        }
         for (k = 0; k < nsub; k++) {
             float sy = y + (k + 0.5f) / nsub, wt = 1.0f / nsub;
-            unsigned i, nc = 0;
+            unsigned n = 0;
             int wind = 0;
 
-            for (i = 0; i < ne && e[i].y0 <= sy; i++) {
-                if (sy < e[i].y1) {
-                    xs[nc].x = e[i].x0 + (sy - e[i].y0) *
-                               (e[i].x1 - e[i].x0) / (e[i].y1 - e[i].y0);
-                    xs[nc].dir = e[i].dir;
-                    nc++;
+            for (i = 0; i < nact; i++) {
+                if (sy < act[i].e->y1) {
+                    act[n].e = act[i].e;
+                    act[n].dir = act[i].dir;
+                    act[n].x = vgl_cross(act[i].e, sy);
+                    n++;
                 }
             }
-            if (nc < 2) {
+            for (i = 0, j = 0; i < npend; i++) {
+                const VglEdge *pe0 = &e[pend[i]];
+
+                if (pe0->y0 > sy) {
+                    pend[j++] = pend[i];
+                } else if (sy < pe0->y1) {
+                    act[n].e = pe0;
+                    act[n].dir = pe0->dir;
+                    act[n].x = vgl_cross(pe0, sy);
+                    n++;
+                }
+            }
+            npend = j;
+            nact = n;
+            /* insertion sort: the order rarely changes between rows */
+            for (i = 1; i < nact; i++) {
+                VglActive a = act[i];
+
+                for (j = i; j > 0 && act[j - 1].x > a.x; j--) {
+                    act[j] = act[j - 1];
+                }
+                act[j] = a;
+            }
+            if (nact < 2) {
                 continue;
             }
-            qsort(xs, nc, sizeof(*xs), vgl_cross_cmp);
-            for (i = 0; i + 1 < nc; i++) {
+            for (i = 0; i + 1 < nact; i++) {
                 float xa, xb;
                 int ia, ib;
 
-                wind += xs[i].dir;
+                wind += act[i].dir;
                 if (!(even_odd ? (wind & 1) : wind)) {
                     continue;
                 }
-                xa = MAX(xs[i].x, (float)rx0);
-                xb = MIN(xs[i + 1].x, (float)rx1);
+                xa = MAX(act[i].x, (float)rx0);
+                xb = MIN(act[i + 1].x, (float)rx1);
                 if (xb <= xa) {
                     continue;
                 }
                 if (!quality) {
-                    ia = (int)ceilf(xa - 0.5f);
-                    ib = (int)ceilf(xb - 0.5f);
-                    for (x = MAX(ia, rx0); x < MIN(ib, rx1); x++) {
-                        acc[x - rx0] = 1.0f;
+                    /*
+                     * Pixel centres in [xa, xb) are covered. Spans come
+                     * left to right and do not overlap: shade them as
+                     * runs at full coverage.
+                     */
+                    ia = MAX((int)ceilf(xa - 0.5f), rx0);
+                    ib = MIN((int)ceilf(xb - 0.5f), rx1);
+                    if (ia >= ib) {
+                        continue;
                     }
-                    lo = MIN(lo, ia - rx0);
-                    hi = MAX(hi, ib - rx0);
+                    if (run1 <= run0 || ia > run1) {
+                        /* not adjacent to the waiting run: shade that */
+                        if (run1 > run0) {
+                            shaded += vgl_pe_span(r->pe, y, run0, run1, NULL);
+                        }
+                        run0 = ia;
+                    }
+                    run1 = ib;
                     continue;
                 }
                 ia = (int)floorf(xa);
@@ -1299,6 +2254,10 @@ static void vgl_raster(VglPE *pe, GArray *ea, int rx0, int ry0, int rx1,
                 hi = MAX(hi, ib - rx0 + 1);
             }
         }
+        if (run1 > run0) {
+            shaded += vgl_pe_span(r->pe, y, run0, run1, NULL);
+        }
+        /* every acc[] write above lies in [lo, hi) once clipped */
         lo = MAX(lo, 0);
         hi = MIN(hi, w);
         if (hi <= lo) {
@@ -1309,11 +2268,237 @@ static void vgl_raster(VglPE *pe, GArray *ea, int rx0, int ry0, int rx1,
 
             cov[x] = c > 256 ? 256 : c;
         }
-        vgl_pe_span(pe, y, rx0 + lo, rx0 + hi, cov + lo);
+        shaded += vgl_pe_span(r->pe, y, rx0 + lo, rx0 + hi, cov + lo);
+        memset(acc + lo, 0, sizeof(float) * (hi - lo));
     }
-    g_free(xs);
-    g_free(cov);
-    g_free(acc);
+    return shaded;
+}
+
+/* ---- parallel rendering ---- */
+
+/*
+ * The rows of a draw operation can be shaded on several host threads
+ * (property "render-threads"). Every pixel the operation writes belongs
+ * to one row, so shading bands of rows in any order leaves the same
+ * memory as going row by row, provided that the rows do not overlap in
+ * memory (the stride covers the columns written) and that no image the
+ * operation reads shares memory with the target. Worker threads only
+ * touch host-mapped windows, never the memory API. Operations still run
+ * one after the other and the vCPU waits for each: the GPU stays
+ * synchronous.
+ */
+#define VGL_PAR_AREA        8192    /* pixels: smaller operations stay serial */
+#define VGL_PAR_ROWS        8       /* rows of the smallest band */
+
+typedef struct VglWorker {
+    QemuThread thread;
+    QemuSemaphore go;
+    VsiVgliteState *s;
+    void *scratch;
+    size_t scratch_size;
+    uint64_t shaded;
+    bool exit;
+} VglWorker;
+
+static uint64_t vgl_job_band(VglJob *job, int ya, int yb, void **scratch,
+                             size_t *scratch_size)
+{
+    uint64_t shaded = 0;
+    int y;
+
+    if (job->raster) {
+        return vgl_raster_rows(job->raster, ya, yb,
+                               vgl_grow(scratch, scratch_size,
+                                        vgl_raster_scratch(job->raster)));
+    }
+    for (y = ya; y < yb; y++) {
+        shaded += vgl_pe_span(job->pe, y, job->x0, job->x1, NULL);
+    }
+    return shaded;
+}
+
+/* take bands until none is left */
+static uint64_t vgl_job_work(VglJob *job, void **scratch, size_t *scratch_size)
+{
+    uint64_t shaded = 0;
+    int b;
+
+    while ((b = qatomic_fetch_inc(&job->next)) < job->nbands) {
+        int ya = job->y0 + b * job->band;
+
+        shaded += vgl_job_band(job, ya, MIN(ya + job->band, job->y1),
+                               scratch, scratch_size);
+    }
+    return shaded;
+}
+
+static void *vgl_worker(void *opaque)
+{
+    VglWorker *w = opaque;
+    VsiVgliteState *s = w->s;
+
+    for (;;) {
+        qemu_sem_wait(&w->go);
+        if (w->exit) {
+            return NULL;
+        }
+        w->shaded = vgl_job_work(s->job, &w->scratch, &w->scratch_size);
+        qemu_sem_post(&s->job_done);
+    }
+}
+
+static void vgl_workers_start(VsiVgliteState *s)
+{
+    unsigned i;
+
+    s->workers = g_new0(VglWorker, s->nthreads - 1);
+    qemu_sem_init(&s->job_done, 0);
+    for (i = 0; i < s->nthreads - 1; i++) {
+        VglWorker *w = &s->workers[i];
+
+        w->s = s;
+        qemu_sem_init(&w->go, 0);
+        qemu_thread_create(&w->thread, "vglite-render", vgl_worker, w,
+                           QEMU_THREAD_JOINABLE);
+    }
+}
+
+static void vgl_workers_stop(VsiVgliteState *s)
+{
+    unsigned i;
+
+    if (!s->workers) {
+        return;
+    }
+    for (i = 0; i < s->nthreads - 1; i++) {
+        VglWorker *w = &s->workers[i];
+
+        w->exit = true;
+        qemu_sem_post(&w->go);
+        qemu_thread_join(&w->thread);
+        qemu_sem_destroy(&w->go);
+        g_free(w->scratch);
+    }
+    qemu_sem_destroy(&s->job_done);
+    g_free(s->workers);
+    s->workers = NULL;
+}
+
+/* host memory a and b overlap */
+static bool vgl_mem_overlap(const VglMem *a, const VglMem *b)
+{
+    return a->host < b->host + b->len && b->host < a->host + a->len;
+}
+
+/* bands of the job may be shaded concurrently (see above) */
+static bool vgl_par_safe(const VglPE *pe, int x1)
+{
+    const VglSampler *sm[2] = {
+        pe->use_image ? &pe->image : NULL,
+        pe->use_paint ? &pe->pattern : NULL,
+    };
+    int i;
+
+    if (!pe->mem.host || (uint64_t)x1 * pe->fmt.bytes > pe->stride) {
+        return false;
+    }
+    for (i = 0; i < 2; i++) {
+        if (sm[i] && (!sm[i]->mem.host || vgl_mem_overlap(&sm[i]->mem,
+                                                          &pe->mem))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* shade the rows of a job; returns the number of pixels shaded */
+static uint64_t vgl_par_rows(VsiVgliteState *s, VglJob *job)
+{
+    int rows = job->y1 - job->y0;
+    int x0 = job->raster ? job->raster->rx0 : job->x0;
+    int x1 = job->raster ? job->raster->rx1 : job->x1;
+    unsigned i, n = 0;
+    uint64_t shaded;
+
+    job->band = rows;
+    job->nbands = 1;
+    job->next = 0;
+    if (s->nthreads > 1 && rows >= 2 * VGL_PAR_ROWS &&
+        (uint64_t)(x1 - x0) * rows >= VGL_PAR_AREA &&
+        vgl_par_safe(job->pe, x1)) {
+        /* a few bands per thread, taken in turn, even out uneven rows */
+        job->band = MAX(VGL_PAR_ROWS, DIV_ROUND_UP(rows, 4 * s->nthreads));
+        job->nbands = DIV_ROUND_UP(rows, job->band);
+        n = MIN(s->nthreads - 1, job->nbands - 1);
+    }
+    if (n) {
+        if (!s->workers) {
+            vgl_workers_start(s);
+        }
+        s->job = job;
+        for (i = 0; i < n; i++) {
+            qemu_sem_post(&s->workers[i].go);
+        }
+    }
+    shaded = vgl_job_work(job, &s->band_scratch, &s->band_scratch_size);
+    for (i = 0; i < n; i++) {
+        qemu_sem_wait(&s->job_done);
+    }
+    for (i = 0; i < n; i++) {
+        shaded += s->workers[i].shaded;
+    }
+    return shaded;
+}
+
+/*
+ * Fill a path: its edges are bucketed by row once, then the rows are
+ * rasterized in bands. Returns the number of pixels shaded.
+ */
+static uint64_t vgl_raster(VsiVgliteState *s, VglPE *pe, GArray *ea,
+                           int rx0, int ry0, int rx1, int ry1, bool even_odd,
+                           unsigned quality)
+{
+    const VglEdge *e = (const VglEdge *)ea->data;
+    unsigned i, ne = ea->len, rows = ry1 - ry0;
+    uint32_t *order, *row, *end;
+    VglRaster r;
+    VglJob job;
+
+    order = vgl_grow(&s->scratch, &s->scratch_size,
+                     sizeof(uint32_t) * (2 * ne + rows + 1));
+    row = order + ne;
+    end = row + ne;
+    /*
+     * Counting sort of the edges by the row holding their top end (the
+     * first row for edges starting above the window). Edges below the
+     * window or above its first sub-scanline never cross a sub-scanline.
+     */
+    memset(end, 0, sizeof(uint32_t) * (rows + 1));
+    for (i = 0; i < ne; i++) {
+        if (e[i].y0 >= ry1 || e[i].y1 <= ry0) {
+            row[i] = UINT32_MAX;
+            continue;
+        }
+        row[i] = e[i].y0 < ry0 ? 0 : (int)floorf(e[i].y0) - ry0;
+        end[row[i] + 1]++;
+    }
+    for (i = 0; i < rows; i++) {
+        end[i + 1] += end[i];
+    }
+    for (i = 0; i < ne; i++) {
+        if (row[i] != UINT32_MAX) {
+            order[end[row[i]]++] = i;
+        }
+    }
+    /* now end[r] is the end of row r's edges in order[] */
+    r = (VglRaster) {
+        .pe = pe, .e = e, .ne = ne,
+        .rx0 = rx0, .ry0 = ry0, .rx1 = rx1, .ry1 = ry1,
+        .even_odd = even_odd, .quality = quality,
+        .order = order, .end = end,
+    };
+    job = (VglJob) { .pe = pe, .raster = &r, .y0 = ry0, .y1 = ry1 };
+    return vgl_par_rows(s, &job);
 }
 
 static void vgl_path_op(VsiVgliteState *s, hwaddr data, uint32_t bytes)
@@ -1325,35 +2510,168 @@ static void vgl_path_op(VsiVgliteState *s, hwaddr data, uint32_t bytes)
     int rx1 = MIN(rx0 + (int)(sz & 0xFFFF), (int)(tsize & 0xFFFF));
     int ry1 = MIN(ry0 + (int)(sz >> 16), (int)(tsize >> 16));
     VglFlat fl;
-    uint8_t *buf;
     VglPE pe;
     int i;
 
     s->ops++;
+    s->stat_paths++;
     trace_vsi_vglite_path(vgl_st(s, ST_CONTROL), pctrl,
                           vgl_st(s, ST_TARGET_ADDR), data, bytes);
     if (rx1 <= rx0 || ry1 <= ry0 || !bytes || bytes > VGL_MAX_PATH_BYTES) {
         return;
     }
-    buf = g_malloc(bytes);
-    address_space_read(&s->as, data, MEMTXATTRS_UNSPECIFIED, buf, bytes);
-    fl.edges = g_array_new(false, false, sizeof(VglEdge));
+    if (bytes > s->path_buf_size) {
+        g_free(s->path_buf);
+        s->path_buf = g_malloc(bytes);
+        s->path_buf_size = bytes;
+    }
+    vgl_dump_touch(s, data, bytes);
+    address_space_read(&s->as, data, MEMTXATTRS_UNSPECIFIED, s->path_buf,
+                       bytes);
+    fl.edges = s->edges;
+    g_array_set_size(fl.edges, 0);
     for (i = 0; i < 6; i++) {
         fl.m[i] = vgl_stf(s, ST_PATH_MATRIX + i);
     }
     fl.scale = vgl_stf(s, ST_PATH_SCALE);
     fl.bias = vgl_stf(s, ST_PATH_BIAS);
-    vgl_flatten(s, &fl, buf, bytes, (pctrl >> 20) & 3);
-    if (fl.edges->len && vgl_pe_open(s, &pe, ry0, ry1)) {
-        vgl_raster(&pe, fl.edges, rx0, ry0, rx1, ry1,
-                   pctrl & PATH_EVEN_ODD, pctrl & 3);
+    vgl_flatten(s, &fl, s->path_buf, bytes, (pctrl >> 20) & 3);
+    s->stat_edges += fl.edges->len;
+    if (fl.edges->len &&
+        vgl_pe_open(s, &pe, ry0, ry1, (uint64_t)(rx1 - rx0) * (ry1 - ry0))) {
+        s->stat_pixels += vgl_raster(s, &pe, fl.edges, rx0, ry0, rx1, ry1,
+                                     pctrl & PATH_EVEN_ODD, pctrl & 3);
         vgl_pe_close(&pe);
     }
-    g_array_free(fl.edges, true);
-    g_free(buf);
+}
+
+/* ---- submit capture (MIRAGE_VGL_DUMP) ---- */
+
+/*
+ * MIRAGE_VGL_DUMP=dir writes each submit to dir/NNNNNN.vgl while the
+ * directory exists (create and remove it to start and stop capturing; at
+ * most MIRAGE_VGL_DUMP_MAX files, default 1000) so that a host tool can
+ * replay it against another version of this model. Every 4 KiB page the
+ * submit reads or writes is captured the first time it is touched; writes
+ * only go to pages captured before (the render target window is touched
+ * when it is opened), so the first copy is the page before the submit.
+ * File, little endian: "VGLD", version 1, sequence, command buffer
+ * address and size (8-byte units), flags (bit 0 unnormalized), state
+ * count, page count, the state registers before the submit, then per
+ * page its address | 1 when the submit changed it, the page before and,
+ * when changed, after.
+ */
+#define VGL_DUMP_PAGE       4096
+#define VGL_DUMP_MAX_SPAN   (64 * 1024 * 1024)
+
+static void vgl_dump_touch(VsiVgliteState *s, hwaddr addr, uint64_t len)
+{
+    hwaddr page;
+
+    if (!s->dump_pages || !len || len > VGL_DUMP_MAX_SPAN) {
+        return;
+    }
+    for (page = addr & ~(hwaddr)(VGL_DUMP_PAGE - 1); page < addr + len;
+         page += VGL_DUMP_PAGE) {
+        uint8_t *copy;
+
+        if (g_hash_table_contains(s->dump_pages, GSIZE_TO_POINTER(page))) {
+            continue;
+        }
+        copy = g_malloc(VGL_DUMP_PAGE);
+        address_space_read(&s->as, page, MEMTXATTRS_UNSPECIFIED, copy,
+                           VGL_DUMP_PAGE);
+        g_hash_table_insert(s->dump_pages, GSIZE_TO_POINTER(page), copy);
+    }
+}
+
+static int vgl_dump_page_cmp(const void *a, const void *b)
+{
+    gsize pa = GPOINTER_TO_SIZE(*(gpointer const *)a);
+    gsize pb = GPOINTER_TO_SIZE(*(gpointer const *)b);
+
+    return pa < pb ? -1 : pa > pb;
+}
+
+static void vgl_dump_put32(FILE *f, uint32_t v)
+{
+    uint8_t b[4];
+
+    stl_le_p(b, v);
+    fwrite(b, 1, 4, f);
+}
+
+static void vgl_dump_begin(VsiVgliteState *s, uint32_t *state)
+{
+    if (!s->dump_dir || s->dump_seq >= s->dump_max ||
+        !g_file_test(s->dump_dir, G_FILE_TEST_IS_DIR)) {
+        return;
+    }
+    memcpy(state, s->state, sizeof(s->state));
+    s->dump_pages = g_hash_table_new_full(g_direct_hash, g_direct_equal,
+                                          NULL, g_free);
+}
+
+static void vgl_dump_end(VsiVgliteState *s, const uint32_t *state)
+{
+    g_autofree char *path = NULL;
+    g_autofree gpointer *pages = NULL;
+    uint8_t *after;
+    guint i, n;
+    FILE *f;
+
+    if (!s->dump_pages) {
+        return;
+    }
+    path = g_strdup_printf("%s/%06u.vgl", s->dump_dir, s->dump_seq++);
+    f = fopen(path, "wb");
+    if (!f) {
+        qemu_log_mask(LOG_UNIMP, "vsi.vglite: cannot write %s\n", path);
+        g_hash_table_destroy(s->dump_pages);
+        s->dump_pages = NULL;
+        return;
+    }
+    pages = g_hash_table_get_keys_as_array(s->dump_pages, &n);
+    qsort(pages, n, sizeof(*pages), vgl_dump_page_cmp);
+    fwrite("VGLD", 1, 4, f);
+    vgl_dump_put32(f, 1);
+    vgl_dump_put32(f, s->dump_seq - 1);
+    vgl_dump_put32(f, s->cmdbuf_addr);
+    vgl_dump_put32(f, s->cmdbuf_size);
+    vgl_dump_put32(f, s->unnormalized);
+    vgl_dump_put32(f, VGL_STATE_COUNT);
+    vgl_dump_put32(f, n);
+    for (i = 0; i < VGL_STATE_COUNT; i++) {
+        vgl_dump_put32(f, state[i]);
+    }
+    after = g_malloc(VGL_DUMP_PAGE);
+    for (i = 0; i < n; i++) {
+        gsize page = GPOINTER_TO_SIZE(pages[i]);
+        const uint8_t *before = g_hash_table_lookup(s->dump_pages, pages[i]);
+        bool changed;
+
+        address_space_read(&s->as, page, MEMTXATTRS_UNSPECIFIED, after,
+                           VGL_DUMP_PAGE);
+        changed = memcmp(before, after, VGL_DUMP_PAGE) != 0;
+        vgl_dump_put32(f, page | changed);
+        fwrite(before, 1, VGL_DUMP_PAGE, f);
+        if (changed) {
+            fwrite(after, 1, VGL_DUMP_PAGE, f);
+        }
+    }
+    g_free(after);
+    fclose(f);
+    g_hash_table_destroy(s->dump_pages);
+    s->dump_pages = NULL;
 }
 
 /* ---- command processor ---- */
+
+static uint32_t vgl_ldl(VsiVgliteState *s, hwaddr addr)
+{
+    vgl_dump_touch(s, addr, 4);
+    return address_space_ldl_le(&s->as, addr, MEMTXATTRS_UNSPECIFIED, NULL);
+}
 
 static void vgl_state_write(VsiVgliteState *s, uint32_t addr, uint32_t v)
 {
@@ -1373,10 +2691,8 @@ static bool vgl_exec(VsiVgliteState *s, hwaddr addr, uint64_t bytes,
     hwaddr end = addr + bytes;
 
     while (addr + 8 <= end) {
-        uint32_t w0 = address_space_ldl_le(&s->as, addr,
-                                           MEMTXATTRS_UNSPECIFIED, NULL);
-        uint32_t w1 = address_space_ldl_le(&s->as, addr + 4,
-                                           MEMTXATTRS_UNSPECIFIED, NULL);
+        uint32_t w0 = vgl_ldl(s, addr);
+        uint32_t w1 = vgl_ldl(s, addr + 4);
 
         switch (w0 >> 28) {
         case 0x0:                               /* END */
@@ -1393,9 +2709,7 @@ static bool vgl_exec(VsiVgliteState *s, hwaddr addr, uint64_t bytes,
             uint32_t i;
 
             for (i = 0; i < count; i++) {
-                uint32_t v = i == 0 ? w1 :
-                    address_space_ldl_le(&s->as, addr + 4 + 4 * i,
-                                         MEMTXATTRS_UNSPECIFIED, NULL);
+                uint32_t v = i == 0 ? w1 : vgl_ldl(s, addr + 4 + 4 * i);
                 vgl_state_write(s, reg + i, v);
             }
             addr += ROUND_UP(4 * (count + 1), 8);
@@ -1409,6 +2723,7 @@ static bool vgl_exec(VsiVgliteState *s, hwaddr addr, uint64_t bytes,
             } else if (n >= 1) {
                 uint8_t rect[8];
 
+                vgl_dump_touch(s, addr + 8, sizeof(rect));
                 address_space_read(&s->as, addr + 8, MEMTXATTRS_UNSPECIFIED,
                                    rect, sizeof(rect));
                 vgl_rect_op(s, rect);
@@ -1439,8 +2754,23 @@ static bool vgl_exec(VsiVgliteState *s, hwaddr addr, uint64_t bytes,
 
 static void vgl_submit(VsiVgliteState *s)
 {
+    bool stats = trace_event_get_state_backends(TRACE_VSI_VGLITE_STATS);
+    int64_t t0 = stats ? get_clock() : 0;
+    g_autofree uint32_t *state = NULL;
+
     trace_vsi_vglite_submit(s->cmdbuf_addr, s->cmdbuf_size);
+    s->stat_paths = s->stat_rects = 0;
+    s->stat_edges = s->stat_pixels = 0;
+    if (s->dump_dir) {
+        state = g_new(uint32_t, VGL_STATE_COUNT);
+        vgl_dump_begin(s, state);
+    }
     vgl_exec(s, s->cmdbuf_addr, (uint64_t)s->cmdbuf_size * 8, 0);
+    vgl_dump_end(s, state);
+    if (stats) {
+        trace_vsi_vglite_stats(s->stat_paths, s->stat_rects, s->stat_edges,
+                               s->stat_pixels, (get_clock() - t0) / 1000);
+    }
     vgl_update_irq(s);
 }
 
@@ -1546,12 +2876,24 @@ static void vgl_reset(DeviceState *dev)
 static void vgl_realize(DeviceState *dev, Error **errp)
 {
     VsiVgliteState *s = VSI_VGLITE(dev);
+    const char *dir;
 
     if (!s->downstream) {
         error_setg(errp, "vsi.vglite: 'downstream' link not set");
         return;
     }
     address_space_init(&s->as, s->downstream, "vsi.vglite-as");
+    /* 0: half the host CPUs, up to four */
+    s->nthreads = s->render_threads ? s->render_threads :
+                  MIN(4, MAX(1, g_get_num_processors() / 2));
+    dir = g_getenv("MIRAGE_VGL_DUMP");
+    if (dir && *dir) {
+        const char *max = g_getenv("MIRAGE_VGL_DUMP_MAX");
+        unsigned long n;
+
+        s->dump_dir = g_strdup(dir);
+        s->dump_max = max && !qemu_strtoul(max, NULL, 0, &n) ? n : 1000;
+    }
 }
 
 static void vgl_init(Object *obj)
@@ -1561,6 +2903,23 @@ static void vgl_init(Object *obj)
     memory_region_init_io(&s->iomem, obj, &vgl_ops, s, "vsi.vglite", 0x1000);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
+    s->edges = g_array_new(false, false, sizeof(VglEdge));
+}
+
+static void vgl_finalize(Object *obj)
+{
+    VsiVgliteState *s = VSI_VGLITE(obj);
+    unsigned i;
+
+    vgl_workers_stop(s);
+    g_array_free(s->edges, true);
+    g_free(s->scratch);
+    g_free(s->band_scratch);
+    g_free(s->path_buf);
+    for (i = 0; i < VGL_TEXEL_LUTS; i++) {
+        g_free(s->texel_lut[i]);
+    }
+    g_free(s->dump_dir);
 }
 
 static const Property vgl_props[] = {
@@ -1572,12 +2931,14 @@ static const Property vgl_props[] = {
     DEFINE_PROP_UINT32("chip-date", VsiVgliteState, chip_date, 0),
     DEFINE_PROP_UINT32("eco-id", VsiVgliteState, eco_id, 0),
     DEFINE_PROP_BOOL("unnormalized", VsiVgliteState, unnormalized, false),
+    DEFINE_PROP_UINT32("render-threads", VsiVgliteState, render_threads, 0),
 };
 
 static void vgl_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
+    vgl_init_luts();
     dc->realize = vgl_realize;
     device_class_set_props(dc, vgl_props);
     device_class_set_legacy_reset(dc, vgl_reset);
@@ -1588,6 +2949,7 @@ static const TypeInfo vgl_info = {
     .parent = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(VsiVgliteState),
     .instance_init = vgl_init,
+    .instance_finalize = vgl_finalize,
     .class_init = vgl_class_init,
 };
 
