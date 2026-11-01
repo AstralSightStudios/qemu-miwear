@@ -1011,7 +1011,8 @@ uint8_t *bes_flash_data(BesFlashState *s)
 /* write the NOR storage back to the backing image on exit */
 static void bes_flash_shutdown(Notifier *n, void *opaque)
 {
-    BesFlashState *s = BES_FLASH(opaque);
+    /* opaque is the ShutdownCause, not the device owning this notifier. */
+    BesFlashState *s = container_of(n, BesFlashState, shutdown_notifier);
     FILE *fp;
 
     if (!s->image) {
