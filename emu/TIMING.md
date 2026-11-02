@@ -9,7 +9,7 @@ inside the vCPU thread. Timing mode makes guest time follow a model of the hardw
 
 Per device, through Mirage's `extraArguments` (device.json, device stopped):
 
-    "-icount", "ips=130000000,align=on,sleep=on",
+    "-icount", "ips=130000000,align=on,sleep=on,exact-io=off",
     "-global", "driver=vsi.vglite,property=timing,value=on"
 
 * `-icount ips=N` (added here): every guest instruction advances virtual time by 1/N s. Stock
@@ -17,6 +17,11 @@ Per device, through Mirage's `extraArguments` (device.json, device stopped):
   running ahead of real time when the host is faster; when the host is slower, guest time
   simply runs slower than the wall clock (screens, timeouts and recordings all stretch) while
   every measurement inside the guest stays in modelled time.
+* `exact-io=off` (added here): memory-mapped I/O in the middle of a translation block happens
+  right away and sees the virtual clock as of the end of the block (a few dozen instructions
+  ahead at most), instead of QEMU re-translating the block so that the access ends it. The
+  firmware polls timer and status registers in tight loops; with exact I/O the guest ran at
+  about a tenth of real time, without it at about half (BAL2D rendering a lobby).
 * `vsi.vglite.timing=on`: a command buffer completes (END interrupt, idle bits) after the time
   a GC355 would take for it, on the virtual clock, instead of at once.
 

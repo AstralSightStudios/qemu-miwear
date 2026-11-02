@@ -448,6 +448,9 @@ static QemuOptsList qemu_icount_opts = {
             .name = "ips",
             .type = QEMU_OPT_STRING,
         }, {
+            .name = "exact-io",
+            .type = QEMU_OPT_BOOL,
+        }, {
             .name = "align",
             .type = QEMU_OPT_BOOL,
         }, {

@@ -51,6 +51,9 @@ static bool icount_sleep = true;
  * per instruction is rarely a power of two). 0: the shift decides.
  */
 static uint64_t icount_ips;
+/* 32.32 fixed point: ns per instruction and instructions per ns (ips= only) */
+static uint64_t icount_ns_q32, icount_insn_q32;
+bool icount_exact_io = true;
 /* Arbitrarily pick 1MIPS as the minimum allowable speed.  */
 #define MAX_ICOUNT_SHIFT 10
 
@@ -162,9 +165,7 @@ int64_t icount_get(void)
 int64_t icount_to_ns(int64_t icount)
 {
     if (icount_ips) {
-        __int128 ns = (__int128)icount * NANOSECONDS_PER_SECOND;
-
-        return ns / (__int128)icount_ips;
+        return ((__int128)icount * icount_ns_q32) >> 32;
     }
     return icount << qatomic_read(&timers_state.icount_time_shift);
 }
@@ -238,11 +239,9 @@ int64_t icount_round(int64_t count)
     int shift = qatomic_read(&timers_state.icount_time_shift);
 
     if (icount_ips) {
-        /* instructions that take at least count ns */
-        __int128 n = (__int128)count * (__int128)icount_ips
-                     + NANOSECONDS_PER_SECOND - 1;
-
-        return count <= 0 ? 0 : (int64_t)(n / NANOSECONDS_PER_SECOND);
+        /* instructions that take at least count ns (rounded up) */
+        return count <= 0 ? 0 :
+               (int64_t)((((__int128)count * icount_insn_q32) >> 32) + 1);
     }
     return (count + (1 << shift) - 1) >> shift;
 }
@@ -442,6 +441,8 @@ bool icount_configure(QemuOpts *opts, Error **errp)
     bool align = qemu_opt_get_bool(opts, "align", false);
     long time_shift = -1;
 
+    icount_exact_io = qemu_opt_get_bool(opts, "exact-io", true);
+
     if (ips) {
         uint64_t rate;
 
@@ -455,6 +456,9 @@ bool icount_configure(QemuOpts *opts, Error **errp)
             return false;
         }
         icount_ips = rate;
+        icount_ns_q32 = ((uint64_t)NANOSECONDS_PER_SECOND << 32) / rate;
+        icount_insn_q32 = (uint64_t)(((__int128)rate << 32)
+                                     / NANOSECONDS_PER_SECOND);
         option = "0";           /* precise mode; the rate replaces the shift */
     }
 

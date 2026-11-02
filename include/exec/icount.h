@@ -24,6 +24,14 @@ typedef enum {
 
 #ifdef CONFIG_TCG
 extern ICountMode use_icount;
+/*
+ * false (-icount exact-io=off): memory-mapped I/O in the middle of a
+ * translation block is done right away, seeing the virtual clock as of the
+ * end of the block, instead of re-translating the block so the access ends
+ * it. Timing stays within a block's instructions; firmware that polls
+ * device registers in tight loops runs many times faster.
+ */
+extern bool icount_exact_io;
 #define icount_enabled() (use_icount)
 #else
 #define icount_enabled() ICOUNT_DISABLED

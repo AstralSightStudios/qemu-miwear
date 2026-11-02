@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "exec/icount.h"
 #include "qemu/main-loop.h"
 #include "qemu/target-info.h"
 #include "accel/tcg/cpu-loop.h"
@@ -1281,7 +1282,12 @@ io_prepare(hwaddr *out_offset, CPUState *cpu, CPUTLBEntryFull *full,
     mr_offset = full->xlat_offset + addr;
     cpu->mem_io_pc = retaddr;
     if (!cpu->neg.can_do_io) {
-        cpu_io_recompile(cpu, retaddr);
+        if (icount_exact_io) {
+            cpu_io_recompile(cpu, retaddr);
+        } else {
+            /* the rest of this block may do I/O (see icount_exact_io) */
+            cpu->neg.can_do_io = true;
+        }
     }
 
     *out_offset = mr_offset;
