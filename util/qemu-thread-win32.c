@@ -71,6 +71,11 @@ void qemu_mutex_init(QemuMutex *mutex)
     qemu_mutex_post_init(mutex);
 }
 
+void qemu_mutex_init_fair(QemuMutex *mutex)
+{
+    qemu_mutex_init(mutex);
+}
+
 void qemu_mutex_destroy(QemuMutex *mutex)
 {
     assert(mutex->initialized);

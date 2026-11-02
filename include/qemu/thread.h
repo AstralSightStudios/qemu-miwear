@@ -42,6 +42,8 @@ typedef struct QemuEvent {
 #define QEMU_THREAD_DETACHED 1
 
 void qemu_mutex_init(QemuMutex *mutex);
+/* like qemu_mutex_init, handing the lock to waiters in turn (macOS) */
+void qemu_mutex_init_fair(QemuMutex *mutex);
 void qemu_mutex_destroy(QemuMutex *mutex);
 int TSA_NO_TSA qemu_mutex_trylock_impl(QemuMutex *mutex, const char *file,
                                        const int line);

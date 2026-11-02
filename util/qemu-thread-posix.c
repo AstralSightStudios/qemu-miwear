@@ -89,6 +89,33 @@ void qemu_mutex_init(QemuMutex *mutex)
     qemu_mutex_post_init(mutex);
 }
 
+/*
+ * A mutex that hands itself to waiting threads in turn. macOS mutexes are
+ * "first fit" by default: a thread that releases and at once takes the lock
+ * again keeps winning against one that sleeps on it. For the BQL that lets a
+ * vCPU spinning on device registers (firmware polling a timer, a GPU model
+ * rendering under the lock) starve the main loop, and with it chardevs:
+ * on Mirage a guest's Bluetooth link stopped answering pages.
+ */
+void qemu_mutex_init_fair(QemuMutex *mutex)
+{
+#ifdef __APPLE__
+    pthread_mutexattr_t attr;
+    int err;
+
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_setpolicy_np(&attr, PTHREAD_MUTEX_POLICY_FAIRSHARE_NP);
+    err = pthread_mutex_init(&mutex->lock, &attr);
+    pthread_mutexattr_destroy(&attr);
+    if (err) {
+        error_exit(err, __func__);
+    }
+    qemu_mutex_post_init(mutex);
+#else
+    qemu_mutex_init(mutex);
+#endif
+}
+
 void qemu_mutex_destroy(QemuMutex *mutex)
 {
     int err;

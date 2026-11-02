@@ -431,7 +431,7 @@ void qemu_init_cpu_loop(void)
     qemu_init_sigbus();
     qemu_cond_init(&qemu_cpu_cond);
     qemu_cond_init(&qemu_pause_cond);
-    qemu_mutex_init(&bql);
+    qemu_mutex_init_fair(&bql);
 
     qemu_thread_get_self(&io_thread);
 }
