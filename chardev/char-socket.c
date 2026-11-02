@@ -914,10 +914,9 @@ static int tcp_chr_new_client(Chardev *chr, QIOChannelSocket *sioc)
     if (s->do_nodelay) {
         qio_channel_set_delay(s->ioc, false);
     }
-    if (s->listener) {
-        qio_net_listener_set_client_func_full(s->listener, NULL, NULL,
-                                              NULL, chr->gcontext);
-    }
+    /* Keep the listener armed while a client is attached: a stale client
+     * (e.g. a tool that exited without the EOF being processed) would
+     * otherwise hold the chardev for the rest of the run. */
 
     if (s->tls_creds) {
         tcp_chr_tls_init(chr);
@@ -961,6 +960,11 @@ static void tcp_chr_accept(QIONetListener *listener,
     Chardev *chr = CHARDEV(opaque);
     SocketChardev *s = SOCKET_CHARDEV(chr);
 
+    /* A new client displaces the current one: whichever tool attached last owns
+     * the console. */
+    if (s->state == TCP_CHARDEV_STATE_CONNECTED) {
+        tcp_chr_disconnect(chr);
+    }
     tcp_chr_change_state(s, TCP_CHARDEV_STATE_CONNECTING);
     tcp_chr_set_client_ioc_name(chr, cioc);
     tcp_chr_new_client(chr, cioc);

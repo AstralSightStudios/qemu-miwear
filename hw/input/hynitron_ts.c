@@ -560,12 +560,35 @@ static void hyn_input_sync(DeviceState *dev)
     int x = CLAMP(s->abs_x, 0, (int)s->width - 1);
     int y = CLAMP(s->abs_y, 0, (int)s->height - 1);
 
-    if (s->boot || s->deep) {
+    if (s->boot) {
         s->btn_reported = s->btn;
         return;
     }
-    if (s->asleep) {
+    if (s->deep) {
+        /* The real controller leaves idle/deep sleep when the panel is
+         * touched and asserts INT from the wake gesture, so a press must not
+         * be dropped here: without it a sleeping guest can never be woken by
+         * touch and every interaction is lost. */
+        if (!s->btn) {
+            s->btn_reported = s->btn;
+            return;
+        }
+        hyn_sleep(s, true, false);
+        s->btn_reported = !s->btn;
+        s->mode = HYN_MODE_GESTURE_SLEEP;
         hyn_gesture_sync(s, x, y);
+        return;
+    }
+    if (s->asleep) {
+        /* Gesture sleep: the press/release pair is the wake gesture the guest
+         * listens for. Once that gesture is out, the controller reports normal
+         * touch points again, so the next tap reaches the UI instead of being
+         * swallowed by a controller that never leaves sleep. */
+        hyn_gesture_sync(s, x, y);
+        if (!s->btn && s->gesture == 0) {
+            hyn_sleep(s, false, false);
+            s->mode = HYN_MODE_NORMAL;
+        }
         return;
     }
     if (s->btn != s->btn_reported) {
