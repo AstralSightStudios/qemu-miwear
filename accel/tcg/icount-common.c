@@ -45,6 +45,12 @@
  * is TCG-specific, and does not need to be built for other accels.
  */
 static bool icount_sleep = true;
+/*
+ * -icount ips=N: a fixed rate of N instructions per second instead of one
+ * instruction per 2^shift ns (a guest CPU's clock over its average cycles
+ * per instruction is rarely a power of two). 0: the shift decides.
+ */
+static uint64_t icount_ips;
 /* Arbitrarily pick 1MIPS as the minimum allowable speed.  */
 #define MAX_ICOUNT_SHIFT 10
 
@@ -155,6 +161,11 @@ int64_t icount_get(void)
 
 int64_t icount_to_ns(int64_t icount)
 {
+    if (icount_ips) {
+        __int128 ns = (__int128)icount * NANOSECONDS_PER_SECOND;
+
+        return ns / (__int128)icount_ips;
+    }
     return icount << qatomic_read(&timers_state.icount_time_shift);
 }
 
@@ -225,6 +236,14 @@ static void icount_adjust_vm(void *opaque)
 int64_t icount_round(int64_t count)
 {
     int shift = qatomic_read(&timers_state.icount_time_shift);
+
+    if (icount_ips) {
+        /* instructions that take at least count ns */
+        __int128 n = (__int128)count * (__int128)icount_ips
+                     + NANOSECONDS_PER_SECOND - 1;
+
+        return count <= 0 ? 0 : (int64_t)(n / NANOSECONDS_PER_SECOND);
+    }
     return (count + (1 << shift) - 1) >> shift;
 }
 
@@ -418,9 +437,26 @@ void icount_account_warp_timer(void)
 bool icount_configure(QemuOpts *opts, Error **errp)
 {
     const char *option = qemu_opt_get(opts, "shift");
+    const char *ips = qemu_opt_get(opts, "ips");
     bool sleep = qemu_opt_get_bool(opts, "sleep", true);
     bool align = qemu_opt_get_bool(opts, "align", false);
     long time_shift = -1;
+
+    if (ips) {
+        uint64_t rate;
+
+        if (option) {
+            error_setg(errp, "icount: shift and ips are exclusive");
+            return false;
+        }
+        if (qemu_strtou64(ips, NULL, 0, &rate) < 0 || rate < 1000
+            || rate > 100000000000ULL) {
+            error_setg(errp, "icount: invalid ips value");
+            return false;
+        }
+        icount_ips = rate;
+        option = "0";           /* precise mode; the rate replaces the shift */
+    }
 
     if (!option) {
         if (qemu_opt_get(opts, "align") != NULL) {
