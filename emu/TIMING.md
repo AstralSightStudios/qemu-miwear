@@ -76,3 +76,11 @@ What it found on BAL2D, as examples of what plain TCG hides: libm's `sinf`/`cosf
 double precision, which the M33's single-precision FPU runs as software calls (a fifth of all CPU
 time on a heavy lobby, invisible on the host); and the Canopus build's `opt-level = "z"` left
 slice indexing out of line in the skinning loop.
+
+## Not timing, but found on the way: a fair BQL (macOS)
+
+With macOS's default first-fit mutexes, a vCPU that polls a device register in a tight loop
+(BES firmware busy-waits on its AON timer before it sleeps) or a device model working under the
+BQL kept re-taking the lock, and the main loop, which serves every chardev, waited for it a third
+of the time: a band drawing a heavy layer stopped answering Bluetooth pages in plain mode. The BQL
+now hands itself to waiters in turn (`qemu_mutex_init_fair`), in every mode.
