@@ -56,8 +56,12 @@
  *          [30:29] 24-bit group), [13:12] tiling outside the image
  *          (0 border colour 0x0A27, 1 pad, 2 repeat, 3 reflect), [17:16]
  *          filter (0 point, 1 linear, 2 bilinear, 3 3x3 Gaussian), bit 24
- *          premultiply texels; 0x0A29 address, 0x0A2B stride, 0x0A2F
- *          width | height << 16. Texel coordinates are not centred: point
+ *          premultiply texels; 0x0A29 address, 0x0A2B stride, 0x0A2D
+ *          origin x | y << 16 and 0x0A2F width | height << 16 of the
+ *          rectangle used as the image (vg_lite_blit_rect programs its
+ *          source rectangle there; the coordinate generator and the tiling
+ *          are relative to it). Texel coordinates
+ *          are not centred: point
  *          and Gaussian sampling take texel floor(s), (bi)linear blends
  *          floor(s) and floor(s) + 1 by frac(s). The q63 firmware's blur
  *          (466 -> 93 Gaussian, 2x bilinear steps down to 23, a 3x3
@@ -154,6 +158,7 @@
 #define ST_IMAGE_ADDR       0x29
 #define ST_PAINT_STRIDE     0x2A
 #define ST_IMAGE_STRIDE     0x2B
+#define ST_IMAGE_ORIGIN     0x2D    /* x | y << 16 */
 #define ST_PAINT_SIZE       0x2E
 #define ST_IMAGE_SIZE       0x2F
 #define ST_PATH_CONTROL     0x34
@@ -844,6 +849,20 @@ static bool vgl_sampler_open(VsiVgliteState *s, VglSampler *sm, bool paint,
     }
     if (!sm->w || !sm->h) {
         return false;
+    }
+    if (!paint) {
+        uint32_t origin = vgl_st(s, ST_IMAGE_ORIGIN);
+        uint32_t ox = origin & 0xFFFF, oy = origin >> 16;
+
+        if (sm->fmt.bytes) {
+            addr += (uint64_t)oy * sm->stride + (uint64_t)ox * sm->fmt.bytes;
+        } else if (origin) {
+            addr += (uint64_t)oy * sm->stride + (uint64_t)ox * sm->fmt.bits / 8;
+            if ((ox * sm->fmt.bits) % 8) {
+                qemu_log_mask(LOG_UNIMP, "vsi.vglite: sub-byte image origin "
+                              "x %u\n", ox);
+            }
+        }
     }
     /*
      * The last row needs only its pixels: a gradient's colour ramp is a
