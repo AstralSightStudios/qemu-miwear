@@ -38,6 +38,10 @@
 #include "qemu/madvise.h"
 #include "qemu/sockets.h"
 #include "qemu/thread.h"
+
+#ifdef __APPLE__
+__thread int qemu_jit_protect_state = -1;
+#endif
 #include <libgen.h>
 #include "qemu/cutils.h"
 #include "qemu/units.h"

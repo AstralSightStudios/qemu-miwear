@@ -845,14 +845,28 @@ size_t qemu_get_host_physmem(void);
  * for the current thread.
  */
 #ifdef __APPLE__
+/*
+ * The protection is per thread and only changed here, so the thread's last
+ * setting is remembered: entering translated code (every return to the
+ * execution loop) no longer pays for a pthread_jit_write_protect_np() that
+ * changes nothing. -1: not set by this thread yet.
+ */
+extern __thread int qemu_jit_protect_state;
+
 static inline void qemu_thread_jit_execute(void)
 {
-    pthread_jit_write_protect_np(true);
+    if (qemu_jit_protect_state != 1) {
+        pthread_jit_write_protect_np(true);
+        qemu_jit_protect_state = 1;
+    }
 }
 
 static inline void qemu_thread_jit_write(void)
 {
-    pthread_jit_write_protect_np(false);
+    if (qemu_jit_protect_state != 0) {
+        pthread_jit_write_protect_np(false);
+        qemu_jit_protect_state = 0;
+    }
 }
 #else
 static inline void qemu_thread_jit_write(void) {}
