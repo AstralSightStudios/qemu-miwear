@@ -9,6 +9,7 @@
 
 #include "hw/core/sysbus.h"
 #include "qemu/thread.h"
+#include "qemu/timer.h"
 
 #define TYPE_VSI_VGLITE "vsi.vglite"
 OBJECT_DECLARE_SIMPLE_TYPE(VsiVgliteState, VSI_VGLITE)
@@ -72,6 +73,26 @@ struct VsiVgliteState {
     QemuSemaphore job_done;
     void *band_scratch;                 /* the vCPU thread's band scratch */
     size_t band_scratch_size;
+
+    /*
+     * "timing": a submit completes (END interrupt, idle bits) after the
+     * time a GC355 would take for it, on the virtual clock; meant for
+     * -icount, where the host time spent rendering costs the guest nothing.
+     */
+    bool timing;
+    uint32_t gpu_mhz;                   /* GPU clock */
+    uint32_t mem_mbps;                  /* memory bandwidth it gets, MB/s */
+    uint32_t op_cycles;                 /* setup of one draw operation */
+    double cost_ns;                     /* modelled time of this submit */
+    uint32_t pending_bits;              /* END bits of this submit */
+    int64_t busy_until;                 /* virtual ns the queue drains at */
+    QEMUTimer *done_timer;
+    struct {
+        int64_t at;
+        uint32_t bits;
+    } done_q[8];                        /* submits in flight, in order */
+    unsigned done_n;
+    uint64_t busy_ns;                   /* modelled busy time in total */
 
     /* MIRAGE_VGL_DUMP: submits written out for offline replay */
     char *dump_dir;

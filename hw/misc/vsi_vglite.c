@@ -1837,6 +1837,44 @@ typedef struct VglJob {
 
 static uint64_t vgl_par_rows(VsiVgliteState *s, VglJob *job);
 
+/* ---- timing model ("timing") ---- */
+
+/*
+ * What a GC355 spends on one operation, added to the submit's modelled time:
+ * the setup, tessellating the path's window (coverage is computed over the
+ * whole window, plus work per edge), then filling the covered pixels at one
+ * per clock, or slower when memory cannot keep up: the target is read (when
+ * blending) and written, and about one texel is fetched per pixel (the
+ * texture cache serves the rest of a bilinear footprint). The figures are
+ * properties; emu/TIMING.md gives their sources.
+ */
+static void vgl_cost(VsiVgliteState *s, const VglPE *pe, bool clear,
+                     uint64_t pixels, uint64_t window, uint64_t edges)
+{
+    const VglSampler *sm = pe->use_paint ? &pe->pattern :
+                           pe->use_image ? &pe->image : NULL;
+    double mhz = s->gpu_mhz ? s->gpu_mhz : 208;
+    double mbps = s->mem_mbps ? s->mem_mbps : 400;
+    double setup, fill, bytes, dst;
+
+    if (!s->timing) {
+        return;
+    }
+    dst = pe->fmt.bytes ? pe->fmt.bytes : 1;
+    bytes = dst * (clear || pe->blend == 0 ? 1 : 2);
+    fill = 1;
+    if (sm && !clear) {
+        bytes += sm->fmt.bytes ? sm->fmt.bytes : 1;
+        if (sm->filter == 3) {
+            fill = 2;               /* 3x3 Gaussian */
+        }
+    }
+    setup = s->op_cycles + window / 32.0 + edges * 8.0;
+    s->cost_ns += setup * 1000.0 / mhz +
+                  MAX(pixels * fill * 1000.0 / mhz,
+                      pixels * bytes * 1000.0 / mbps);
+}
+
 /* ---- rectangle operation (clear / blit) ---- */
 
 static void vgl_rect_op(VsiVgliteState *s, const uint8_t *d)
@@ -1848,6 +1886,7 @@ static void vgl_rect_op(VsiVgliteState *s, const uint8_t *d)
     int x1 = MIN(x + w, (int)(size & 0xFFFF));
     int y1 = MIN(y + h, (int)(size >> 16));
     unsigned op = CTRL_OP(vgl_st(s, ST_CONTROL));
+    uint64_t px;
     VglJob job;
     VglPE pe;
 
@@ -1863,7 +1902,9 @@ static void vgl_rect_op(VsiVgliteState *s, const uint8_t *d)
         return;
     }
     job = (VglJob) { .pe = &pe, .x0 = x0, .x1 = x1, .y0 = y0, .y1 = y1 };
-    s->stat_pixels += vgl_par_rows(s, &job);
+    px = vgl_par_rows(s, &job);
+    s->stat_pixels += px;
+    vgl_cost(s, &pe, op == OP_CLEAR, px, 0, 0);
     vgl_pe_close(&pe);
 }
 
@@ -2539,8 +2580,12 @@ static void vgl_path_op(VsiVgliteState *s, hwaddr data, uint32_t bytes)
     s->stat_edges += fl.edges->len;
     if (fl.edges->len &&
         vgl_pe_open(s, &pe, ry0, ry1, (uint64_t)(rx1 - rx0) * (ry1 - ry0))) {
-        s->stat_pixels += vgl_raster(s, &pe, fl.edges, rx0, ry0, rx1, ry1,
-                                     pctrl & PATH_EVEN_ODD, pctrl & 3);
+        uint64_t px = vgl_raster(s, &pe, fl.edges, rx0, ry0, rx1, ry1,
+                                 pctrl & PATH_EVEN_ODD, pctrl & 3);
+
+        s->stat_pixels += px;
+        vgl_cost(s, &pe, false, px, (uint64_t)(rx1 - rx0) * (ry1 - ry0),
+                 fl.edges->len);
         vgl_pe_close(&pe);
     }
 }
@@ -2696,7 +2741,11 @@ static bool vgl_exec(VsiVgliteState *s, hwaddr addr, uint64_t bytes,
 
         switch (w0 >> 28) {
         case 0x0:                               /* END */
-            s->intr_status |= 1u << (w0 & 0x1F);
+            if (s->timing) {
+                s->pending_bits |= 1u << (w0 & 0x1F);
+            } else {
+                s->intr_status |= 1u << (w0 & 0x1F);
+            }
             return false;
         case 0x1:                               /* SEMAPHORE */
         case 0x2:                               /* STALL */
@@ -2752,6 +2801,49 @@ static bool vgl_exec(VsiVgliteState *s, hwaddr addr, uint64_t bytes,
     return true;
 }
 
+/* raises the END interrupts of the submits whose modelled time is over */
+static void vgl_done_cb(void *opaque)
+{
+    VsiVgliteState *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    unsigned i = 0, n;
+
+    while (i < s->done_n && s->done_q[i].at <= now) {
+        s->intr_status |= s->done_q[i].bits;
+        i++;
+    }
+    n = s->done_n - i;
+    memmove(s->done_q, s->done_q + i, n * sizeof(s->done_q[0]));
+    s->done_n = n;
+    if (n) {
+        timer_mod(s->done_timer, s->done_q[0].at);
+    }
+    vgl_update_irq(s);
+}
+
+/* the submit just executed completes after its modelled time */
+static void vgl_queue_done(VsiVgliteState *s)
+{
+    double mbps = s->mem_mbps ? s->mem_mbps : 400;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    /* fetching the command buffer, and the interrupt round trip */
+    double ns = s->cost_ns + s->cmdbuf_size * 8 * 1000.0 / mbps + 2000.0;
+    int64_t at = MAX(now, s->busy_until) + (int64_t)ns;
+
+    s->busy_until = at;
+    s->busy_ns += (uint64_t)ns;
+    if (s->done_n == ARRAY_SIZE(s->done_q)) {
+        /* more in flight than a driver keeps: merge into the last one */
+        s->done_q[s->done_n - 1].at = at;
+        s->done_q[s->done_n - 1].bits |= s->pending_bits;
+    } else {
+        s->done_q[s->done_n].at = at;
+        s->done_q[s->done_n].bits = s->pending_bits;
+        s->done_n++;
+    }
+    timer_mod(s->done_timer, s->done_q[0].at);
+}
+
 static void vgl_submit(VsiVgliteState *s)
 {
     bool stats = trace_event_get_state_backends(TRACE_VSI_VGLITE_STATS);
@@ -2765,7 +2857,12 @@ static void vgl_submit(VsiVgliteState *s)
         state = g_new(uint32_t, VGL_STATE_COUNT);
         vgl_dump_begin(s, state);
     }
+    s->cost_ns = 0;
+    s->pending_bits = 0;
     vgl_exec(s, s->cmdbuf_addr, (uint64_t)s->cmdbuf_size * 8, 0);
+    if (s->timing) {
+        vgl_queue_done(s);
+    }
     vgl_dump_end(s, state);
     if (stats) {
         trace_vsi_vglite_stats(s->stat_paths, s->stat_rects, s->stat_edges,
@@ -2785,6 +2882,10 @@ static uint64_t vgl_read(void *opaque, hwaddr offset, unsigned size)
     case VGL_CLOCK_CONTROL:
         return s->clock_control;
     case VGL_IDLE:
+        if (s->timing &&
+            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) < s->busy_until) {
+            return 0x7FFFFFFF & ~0x0B05u;   /* front end and engines busy */
+        }
         return 0x7FFFFFFF;          /* every module idle */
     case VGL_INTR_STATUS:
         v = s->intr_status;
@@ -2826,6 +2927,11 @@ static void vgl_write(void *opaque, hwaddr offset, uint64_t value,
         if (value & VGL_CLOCK_SOFT_RESET) {
             memset(s->state, 0, sizeof(s->state));
             s->intr_status = 0;
+            s->done_n = 0;
+            s->busy_until = 0;
+            if (s->done_timer) {
+                timer_del(s->done_timer);
+            }
         }
         s->clock_control = value;
         break;
@@ -2871,6 +2977,11 @@ static void vgl_reset(DeviceState *dev)
     s->cmdbuf_size = 0;
     memset(s->ext_regs, 0, sizeof(s->ext_regs));
     memset(s->state, 0, sizeof(s->state));
+    s->done_n = 0;
+    s->busy_until = 0;
+    if (s->done_timer) {
+        timer_del(s->done_timer);
+    }
 }
 
 static void vgl_realize(DeviceState *dev, Error **errp)
@@ -2883,6 +2994,9 @@ static void vgl_realize(DeviceState *dev, Error **errp)
         return;
     }
     address_space_init(&s->as, s->downstream, "vsi.vglite-as");
+    if (s->timing) {
+        s->done_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, vgl_done_cb, s);
+    }
     /* 0: half the host CPUs, up to four */
     s->nthreads = s->render_threads ? s->render_threads :
                   MIN(4, MAX(1, g_get_num_processors() / 2));
@@ -2912,6 +3026,9 @@ static void vgl_finalize(Object *obj)
     unsigned i;
 
     vgl_workers_stop(s);
+    if (s->done_timer) {
+        timer_free(s->done_timer);
+    }
     g_array_free(s->edges, true);
     g_free(s->scratch);
     g_free(s->band_scratch);
@@ -2932,6 +3049,10 @@ static const Property vgl_props[] = {
     DEFINE_PROP_UINT32("eco-id", VsiVgliteState, eco_id, 0),
     DEFINE_PROP_BOOL("unnormalized", VsiVgliteState, unnormalized, false),
     DEFINE_PROP_UINT32("render-threads", VsiVgliteState, render_threads, 0),
+    DEFINE_PROP_BOOL("timing", VsiVgliteState, timing, false),
+    DEFINE_PROP_UINT32("gpu-mhz", VsiVgliteState, gpu_mhz, 208),
+    DEFINE_PROP_UINT32("mem-mbps", VsiVgliteState, mem_mbps, 400),
+    DEFINE_PROP_UINT32("op-cycles", VsiVgliteState, op_cycles, 150),
 };
 
 static void vgl_class_init(ObjectClass *klass, const void *data)
