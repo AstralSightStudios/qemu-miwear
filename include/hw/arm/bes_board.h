@@ -199,4 +199,7 @@ DeviceState *bes_board_create_keys(const BesBoard *board);
  * battery-level / battery-charging (now and after every reset) */
 void bes_machine_attach_battery(MachineState *ms, const BesBatteryLinks *l);
 
+/* MIRAGE_PROFILE: guest-time PC sampling (mirage_profile.c) */
+void mirage_profile_start(void);
+
 #endif

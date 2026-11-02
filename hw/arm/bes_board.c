@@ -851,6 +851,7 @@ static void bes_machine_init(MachineState *ms)
     bms->soc = soc;
     bms->board = board;
     soc->init(ms, img, board);
+    mirage_profile_start();
 }
 
 static void bes_machine_reset(MachineState *ms, ResetType type)
